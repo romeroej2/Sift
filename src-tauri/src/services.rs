@@ -105,6 +105,8 @@ const CAPTURE_TIMEOUT_SECS: u64 = 480;
 const CAPTURE_IDLE_TIMEOUT_SECS: u64 = 90;
 const LM_BATCH_SIZE: usize = 6;
 const LM_BATCH_MAX_ATTEMPTS: usize = 3;
+const LM_STUDIO_REQUEST_TIMEOUT_SECS: u64 = 15;
+const LM_STUDIO_COMPLETION_TIMEOUT_SECS: u64 = 600;
 const MAX_DIGEST_ITEMS: usize = 12;
 
 #[derive(Debug, Clone)]
@@ -649,7 +651,7 @@ impl Default for LmStudioClient {
     fn default() -> Self {
         Self {
             http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(60))
+                .timeout(Duration::from_secs(LM_STUDIO_REQUEST_TIMEOUT_SECS))
                 .build()
                 .expect("lm studio client"),
         }
@@ -844,13 +846,23 @@ impl LmStudioClient {
             .http
             .post(url)
             .header(CONTENT_TYPE, "application/json")
+            .timeout(Duration::from_secs(LM_STUDIO_COMPLETION_TIMEOUT_SECS))
             .json(&body);
 
         if let Some(auth_token) = auth_token {
             request = request.header(AUTHORIZATION, bearer(auth_token));
         }
 
-        let response = request.send().await?;
+        let response = request.send().await.map_err(|error| {
+            if error.is_timeout() {
+                AppError::Message(format!(
+                    "LM Studio is still generating after {} seconds. Increase the batch timeout or use a faster local model.",
+                    LM_STUDIO_COMPLETION_TIMEOUT_SECS
+                ))
+            } else {
+                AppError::Reqwest(error)
+            }
+        })?;
         let status = response.status();
         let raw_body = response.text().await?;
         if !status.is_success() {
