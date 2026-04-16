@@ -1,6 +1,12 @@
+<p align="center">
+  <img src="public/sift-mark.png" alt="SIFT logo" width="160" />
+</p>
+
 # SIFT
 
 SIFT is a local-first desktop newsroom for your X home timeline. It turns the posts flowing through a dedicated SIFT-managed X session into a concise daily edition, ranks the most relevant stories with LM Studio, and keeps a searchable local archive on your machine.
+
+![SIFT app screenshot](docs/images/sift-screenshot.png)
 
 ## What SIFT does
 
@@ -74,7 +80,7 @@ SIFT expects a local LM Studio server and a loaded model before sync can complet
 npm run tauri:dev
 ```
 
-The Tauri wrapper script in [`scripts/run-tauri.mjs`](/Users/romeroej/Documents/repos/Sift/scripts/run-tauri.mjs) helps discover common Rust install paths if your shell has not picked up `cargo` yet.
+The Tauri wrapper script in [`scripts/run-tauri.mjs`](scripts/run-tauri.mjs) helps discover common Rust install paths if your shell has not picked up `cargo` yet.
 
 ## Useful commands
 
@@ -112,4 +118,4 @@ When cutting a release, keep the version in `package.json`, `src-tauri/tauri.con
 
 ## License
 
-MIT. See [LICENSE](/Users/romeroej/Documents/repos/Sift/LICENSE).
+MIT. See [LICENSE](LICENSE).
