@@ -1,0 +1,38 @@
+[package]
+name = "sift"
+version = "0.1.0"
+description = "A local-first X feed paper built with Tauri"
+authors = ["romeroej"]
+edition = "2024"
+
+[lib]
+name = "sift_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5", features = [] }
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+directories = "6"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.33", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tauri = { version = "2.10", features = ["tray-icon"] }
+tauri-plugin-autostart = "2.5"
+tauri-plugin-notification = "2.3"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+url = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
+webbrowser = "1"
+
+[dev-dependencies]
+httpmock = "0.7"
+tempfile = "3"
