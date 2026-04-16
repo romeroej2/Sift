@@ -109,3 +109,7 @@ This repo includes two GitHub Actions workflows:
 - `release.yml`: runs on version tags like `v0.1.0`, verifies the tag matches the app version, reruns tests, and publishes release assets to GitHub Releases.
 
 When cutting a release, keep the version in `package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml` aligned before pushing the `v*` tag.
+
+## License
+
+MIT. See [LICENSE](/Users/romeroej/Documents/repos/Sift/LICENSE).
