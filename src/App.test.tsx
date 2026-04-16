@@ -202,16 +202,39 @@ describe("App", () => {
     expect(screen.getByText(/SIFT is ready\./)).toBeInTheDocument();
   });
 
-  it("prevents manual refresh until the X session is open", async () => {
+  it("opens the X session before manual refresh and hides it again afterward", async () => {
+    const freshEdition = createEdition({
+      id: "edition-fresh-from-closed",
+      title: "Fresh from closed session",
+      frontPageSummary: "The refresh opened the session first."
+    });
+    runSyncMock.mockResolvedValue(
+      createBootstrapState({
+        editions: [freshEdition],
+        latestRun: {
+          id: "run-from-closed",
+          startedAt: "2026-04-16T13:00:00Z",
+          finishedAt: "2026-04-16T13:01:00Z",
+          status: "success",
+          itemCount: 8,
+          keptCount: 4,
+          errorMessage: null,
+          editionId: freshEdition.id
+        }
+      })
+    );
+
     await renderLoadedApp();
     fireEvent.click(screen.getByRole("button", { name: "Refresh edition" }));
 
-    expect(runSyncMock).not.toHaveBeenCalled();
-    expect(
-      await screen.findByText(
-        "Open X Session first. SIFT now pulls the feed straight from that native browser session."
-      )
-    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(openXSessionWindowMock).toHaveBeenCalledTimes(1);
+      expect(runSyncMock).toHaveBeenCalledWith("manual");
+      expect(hideXSessionWindowMock).toHaveBeenCalledTimes(1);
+    });
+
+    expect(await screen.findByRole("heading", { name: "Fresh from closed session" })).toBeInTheDocument();
+    expect(screen.getByText("Showing Fresh from closed session.")).toBeInTheDocument();
   });
 
   it("verifies LM Studio and saves the preferred model selection", async () => {
@@ -352,7 +375,7 @@ describe("App", () => {
     ).toBeInTheDocument();
   });
 
-  it("runs a manual sync when the X session is already open", async () => {
+  it("runs a manual sync when the X session is already open and hides it afterward", async () => {
     const freshEdition = createEdition({
       id: "edition-fresh",
       title: "Fresh issue",
@@ -386,7 +409,9 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Refresh edition" }));
 
     await waitFor(() => {
+      expect(openXSessionWindowMock).toHaveBeenCalledTimes(1);
       expect(runSyncMock).toHaveBeenCalledWith("manual");
+      expect(hideXSessionWindowMock).toHaveBeenCalledTimes(1);
     });
 
     expect(await screen.findByRole("heading", { name: "Fresh issue" })).toBeInTheDocument();

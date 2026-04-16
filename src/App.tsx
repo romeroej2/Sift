@@ -397,17 +397,20 @@ export default function App() {
   }
 
   async function handleRunSync() {
-    if (!xSession.isOpen) {
-      setMessage("Open X Session first. SIFT now pulls the feed straight from that native browser session.");
-      return;
-    }
-
     setIsRefreshing(true);
     setSyncProgress(null);
-    setMessage("Starting refresh. Checking the live X session...");
     console.info("[SIFT sync] Manual refresh requested.");
 
     try {
+      setMessage(
+        xSession.isOpen
+          ? "Bringing the X session to the foreground for refresh..."
+          : "Opening the X session before refresh..."
+      );
+      const session = await openXSessionWindow();
+      setXSession(session);
+
+      setMessage("Starting refresh. Checking the live X session...");
       const state = await runSync("manual");
       let freshEdition = pickFreshEdition(state);
       const noFreshMessage =
@@ -439,6 +442,13 @@ export default function App() {
       console.error("[SIFT sync] Manual refresh failed.", error);
       setMessage(detail);
     } finally {
+      try {
+        const session = await hideXSessionWindow();
+        setXSession(session);
+      } catch (hideError) {
+        console.error("[SIFT sync] Refresh finished but the X session could not be hidden.", hideError);
+      }
+
       setIsRefreshing(false);
     }
   }

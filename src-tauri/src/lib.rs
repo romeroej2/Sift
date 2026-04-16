@@ -20,6 +20,7 @@ use services::{
 };
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::utils::config::BackgroundThrottlingPolicy;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
@@ -606,11 +607,23 @@ if (
     return root;
   };
 
-  const siftWaitForFeedAdvance = async (selector, scroller, previousIds, previousHeight, timeoutMs) => {
+  const siftWaitForFeedAdvance = async (
+    selector,
+    scroller,
+    previousIds,
+    previousHeight,
+    timeoutMs,
+    onHeartbeat,
+  ) => {
     const startedAt = Date.now();
+    let lastHeartbeatAt = startedAt;
 
     while (Date.now() - startedAt < timeoutMs) {
       await siftWait(250);
+      if (typeof onHeartbeat === "function" && Date.now() - lastHeartbeatAt >= 1500) {
+        await onHeartbeat();
+        lastHeartbeatAt = Date.now();
+      }
       const metrics = siftReadScrollMetrics(scroller);
       if (metrics.height > previousHeight + 48) {
         return true;
@@ -698,6 +711,9 @@ if (
         return items.some((item) => siftDateKey(item.postedAt, timeZone) !== editionDate);
       };
 
+      const siftCountFreshItems = () =>
+        Array.from(collected.values()).filter((item) => siftIsFresh(item)).length;
+
       const siftReportProgress = async (pass, itemCount, freshCount) => {
         try {
           await window.__TAURI_INTERNALS__.invoke("submit_x_feed_capture_progress", {
@@ -756,6 +772,10 @@ if (
           await siftWait(300);
         }
 
+        const siftHeartbeat = async () => {
+          await siftReportProgress(pass + 1, collected.size, siftCountFreshItems());
+        };
+
         siftScrollFeedTo(scroller, metricsBefore.top + scrollStep);
         let advanced = await siftWaitForFeedAdvance(
           selector,
@@ -763,6 +783,7 @@ if (
           visibleIdsBefore,
           metricsBefore.height,
           waitForAdvanceMs,
+          siftHeartbeat,
         );
 
         if (!advanced) {
@@ -773,6 +794,7 @@ if (
             visibleIdsBefore,
             metricsBefore.height,
             waitForAdvanceMs,
+            siftHeartbeat,
           );
         }
 
@@ -894,6 +916,7 @@ fn build_x_session_window(
     .resizable(true)
     .visible(is_visible)
     .focused(focus_window)
+    .background_throttling(BackgroundThrottlingPolicy::Disabled)
     .center()
     .prevent_overflow()
     .initialization_script(X_SESSION_BRIDGE_SCRIPT)
