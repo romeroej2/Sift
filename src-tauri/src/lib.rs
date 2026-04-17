@@ -1090,15 +1090,40 @@ if (
           background: rgba(255, 255, 255, 0.08);
           color: inherit;
           cursor: pointer;
+          transition: background 140ms ease, transform 140ms ease, opacity 140ms ease;
+          pointer-events: auto;
+          touch-action: manipulation;
+        }
+        .sift-linkedin-session-controls__button:hover {
+          background: rgba(255, 255, 255, 0.16);
+          transform: translateY(-1px);
+        }
+        .sift-linkedin-session-controls__button:disabled {
+          opacity: 0.45;
+          cursor: wait;
+          transform: none;
         }
         .sift-linkedin-session-controls__button--danger {
           background: rgba(205, 76, 76, 0.18);
           color: #ffd7d7;
         }
+        .sift-linkedin-session-controls__button--danger:hover {
+          background: rgba(205, 76, 76, 0.3);
+        }
         .sift-linkedin-session-controls__button svg {
           width: 18px;
           height: 18px;
+          fill: none;
+          stroke: currentColor;
+          stroke-width: 1.9;
+          stroke-linecap: round;
+          stroke-linejoin: round;
           pointer-events: none;
+        }
+        .sift-linkedin-session-controls__button svg * {
+          fill: none;
+          stroke: currentColor;
+          vector-effect: non-scaling-stroke;
         }
       `;
       (document.head || document.documentElement).appendChild(style);
@@ -1127,25 +1152,58 @@ if (
         button.setAttribute("aria-label", label);
         button.setAttribute("title", label);
         button.innerHTML = icon;
-        button.addEventListener("click", async (event) => {
+
+        const stopEvent = (event) => {
           event.preventDefault();
           event.stopPropagation();
+          if (typeof event.stopImmediatePropagation === "function") {
+            event.stopImmediatePropagation();
+          }
+        };
+
+        const runCommand = async () => {
           if (requiresConfirm && !window.confirm("Log out of LinkedIn in SIFT and clear this browser session?")) {
             return;
           }
+
           if (command === "hide_linkedin_session_window") {
             try {
               window.close();
             } catch {
               // Ignore window.close() failures in browser sessions.
             }
+
+            window.setTimeout(() => {
+              void window.__TAURI_INTERNALS__.invoke(command, {}).catch((error) => {
+                console.error("[SIFT] LinkedIn session hide failed.", error);
+              });
+            }, 32);
+            return;
           }
+
+          button.disabled = true;
+
           try {
             await window.__TAURI_INTERNALS__.invoke(command, {});
           } catch (error) {
             console.error("[SIFT] LinkedIn session control failed.", error);
+            button.disabled = false;
           }
-        }, true);
+        };
+
+        button.addEventListener(
+          "pointerdown",
+          (event) => {
+            if ("button" in event && event.button !== 0) {
+              return;
+            }
+            stopEvent(event);
+            void runCommand();
+          },
+          true,
+        );
+        button.addEventListener("click", stopEvent, true);
+        button.addEventListener("mousedown", stopEvent, true);
         return button;
       };
 
