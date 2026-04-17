@@ -21,6 +21,7 @@ export interface LmStudioSettings {
   baseUrl: string;
   authToken: string | null;
   selectedModel: string | null;
+  includeImages: boolean;
 }
 
 export interface ScheduleSettings {
@@ -60,6 +61,14 @@ export interface EditionCard {
   headline: string;
   summary: string;
   whyItMatters: string;
+  leadImage?: EditionImage;
+}
+
+export interface EditionImage {
+  path: string;
+  sourceUrl: string;
+  mimeType: string;
+  alt: string;
 }
 
 export interface EditionSection {

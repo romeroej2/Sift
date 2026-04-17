@@ -17,6 +17,8 @@ pub struct LmStudioSettings {
     pub base_url: String,
     pub auth_token: Option<String>,
     pub selected_model: Option<String>,
+    #[serde(default)]
+    pub include_images: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +64,7 @@ impl Default for UserSettings {
                 base_url: "http://127.0.0.1:1234".into(),
                 auth_token: None,
                 selected_model: None,
+                include_images: false,
             },
         }
     }
@@ -79,6 +82,17 @@ pub struct EditionCard {
     pub headline: String,
     pub summary: String,
     pub why_it_matters: String,
+    #[serde(default)]
+    pub lead_image: Option<EditionImage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditionImage {
+    pub path: String,
+    pub source_url: String,
+    pub mime_type: String,
+    pub alt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

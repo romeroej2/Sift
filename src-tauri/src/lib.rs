@@ -259,6 +259,56 @@ if (
     return Array.from(urls);
   };
 
+  const siftTweetMedia = (article) => {
+    const media = [];
+    const seen = new Set();
+    const selectors = ['a[href*="/photo/"] img', '[data-testid="tweetPhoto"] img'];
+
+    Array.from(article.querySelectorAll(selectors.join(","))).forEach((img) => {
+      const src = img.currentSrc || img.getAttribute("src") || "";
+      if (!src) {
+        return;
+      }
+
+      try {
+        const url = new URL(src, window.location.origin);
+        if (!["http:", "https:"].includes(url.protocol)) {
+          return;
+        }
+        if (url.hostname !== "pbs.twimg.com") {
+          return;
+        }
+        if (
+          /profile_images|profile_banners|emoji|ext_tw_video_thumb|amplify_video_thumb|semantic_core_img/i.test(
+            url.pathname,
+          )
+        ) {
+          return;
+        }
+
+        const photoHref = img.closest('a[href*="/photo/"]')?.getAttribute("href") || "";
+        if (!photoHref.includes("/photo/") && !img.closest('[data-testid="tweetPhoto"]')) {
+          return;
+        }
+
+        url.hash = "";
+        const normalized = url.toString();
+        if (seen.has(normalized)) {
+          return;
+        }
+        seen.add(normalized);
+        media.push({
+          url: normalized,
+          kind: "photo",
+        });
+      } catch {
+        // Ignore malformed media URLs while scraping.
+      }
+    });
+
+    return media;
+  };
+
   const siftEnsureSessionControls = () => {
     if (!window.__TAURI_INTERNALS__?.invoke) {
       return;
@@ -502,6 +552,7 @@ if (
       isReply,
       socialContext: socialContext || null,
       sharedUrls: siftSharedUrls(article),
+      media: siftTweetMedia(article),
     };
   };
 

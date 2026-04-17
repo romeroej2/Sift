@@ -375,6 +375,45 @@ describe("App", () => {
     ).toBeInTheDocument();
   });
 
+  it("renders an important story image when the edition card has one", async () => {
+    await renderLoadedApp({
+      bootstrap: createBootstrapState({
+        editions: [
+          createEditionWithStories({
+            sections: [
+              {
+                id: "releases",
+                title: "Releases",
+                dek: "Worth your attention",
+                cards: [
+                  {
+                    itemId: "card-1",
+                    authorName: "Ada",
+                    authorHandle: "ada",
+                    sourceUrl: "https://x.com/ada/status/1",
+                    postedAt: "2026-04-16T12:00:00Z",
+                    category: "Releases",
+                    headline: "A fast local model shipped",
+                    summary: "A fast local model shipped with a better developer workflow.",
+                    whyItMatters: "It makes on-device experimentation easier.",
+                    leadImage: {
+                      path: "/tmp/sift-story.jpg",
+                      sourceUrl: "https://pbs.twimg.com/media/story.jpg",
+                      mimeType: "image/jpeg",
+                      alt: "Screenshot of the release UI"
+                    }
+                  }
+                ]
+              }
+            ]
+          })
+        ]
+      })
+    });
+
+    expect(screen.getByRole("img", { name: "Screenshot of the release UI" })).toBeInTheDocument();
+  });
+
   it("runs a manual sync when the X session is already open and hides it afterward", async () => {
     const freshEdition = createEdition({
       id: "edition-fresh",
@@ -542,6 +581,7 @@ describe("App", () => {
     fireEvent.change(screen.getByLabelText(/Auth token/), {
       target: { value: "secret-token" }
     });
+    fireEvent.click(screen.getByLabelText("Use attached post images during ranking"));
     fireEvent.click(screen.getByRole("button", { name: "Verify" }));
 
     await waitFor(() => {
@@ -556,7 +596,8 @@ describe("App", () => {
           lmStudio: {
             baseUrl: "http://127.0.0.1:4321",
             authToken: "secret-token",
-            selectedModel: DEFAULT_MODEL
+            selectedModel: DEFAULT_MODEL,
+            includeImages: true
           }
         })
       );

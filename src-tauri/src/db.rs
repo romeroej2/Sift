@@ -660,6 +660,28 @@ mod tests {
     }
 
     #[test]
+    fn settings_without_include_images_default_to_false() {
+        let temp_dir = tempdir().expect("temporary database directory");
+        let db = Database::new(temp_dir.path().join("sift.sqlite")).expect("database");
+        let conn =
+            Connection::open(temp_dir.path().join("sift.sqlite")).expect("sqlite connection");
+
+        conn.execute(
+            "INSERT INTO app_meta(key, value) VALUES('settings', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![r#"{"schedule":{"enabled":true,"timeOfDay":"07:30","timezone":"UTC"},"cleanup":{"hideReplies":true,"hideRetweets":true,"removeBait":true,"mutedKeywords":[],"mutedAuthors":[]},"lmStudio":{"baseUrl":"http://127.0.0.1:1234","authToken":null,"selectedModel":"vision-model"}}"#],
+        )
+        .expect("insert legacy settings");
+
+        let loaded = db.load_settings().expect("load legacy settings");
+        assert!(!loaded.lm_studio.include_images);
+        assert_eq!(
+            loaded.lm_studio.selected_model.as_deref(),
+            Some("vision-model")
+        );
+    }
+
+    #[test]
     fn processed_item_history_only_uses_successful_saved_runs() {
         let temp_dir = tempdir().expect("temporary database directory");
         let db = Database::new(temp_dir.path().join("sift.sqlite")).expect("database");

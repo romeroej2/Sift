@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "SIFT",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "identifier": "dev.sift.paper",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -22,6 +22,10 @@
       }
     ],
     "security": {
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$APPLOCALDATA/assets/**"]
+      },
       "csp": {
         "default-src": "'self' customprotocol: asset: http://asset.localhost",
         "connect-src": "ipc: http://ipc.localhost",

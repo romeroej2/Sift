@@ -18,6 +18,7 @@ export const DEFAULT_SETTINGS: UserSettings = {
   lmStudio: {
     baseUrl: "http://127.0.0.1:1234",
     authToken: null,
-    selectedModel: null
+    selectedModel: null,
+    includeImages: false
   }
 };

@@ -1,6 +1,8 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
+use std::fs;
 use std::net::TcpListener;
+use std::path::Path;
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
@@ -20,9 +22,9 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::models::{
-    CleanedItem, Edition, EditionCard, EditionSection, FeedItem, LmStudioHealth, ModelDescriptor,
-    OAuthSession, PollStatus, SyncReason, SyncRun, SyncStatus, UserSettings, XClientConfigDraft,
-    XConnectLaunch, XConnectPayload, XConnectPollResult,
+    CleanedItem, Edition, EditionCard, EditionImage, EditionSection, FeedItem, LmStudioHealth,
+    ModelDescriptor, OAuthSession, PollStatus, SyncReason, SyncRun, SyncStatus, UserSettings,
+    XClientConfigDraft, XConnectLaunch, XConnectPayload, XConnectPollResult,
 };
 use crate::{AppError, AppState, is_x_domain};
 
@@ -62,6 +64,16 @@ pub struct XSessionCaptureItem {
     pub is_reply: bool,
     pub social_context: Option<String>,
     pub shared_urls: Vec<String>,
+    #[serde(default)]
+    pub media: Vec<XSessionCaptureMedia>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct XSessionCaptureMedia {
+    pub url: String,
+    #[serde(default = "default_capture_media_kind")]
+    pub kind: String,
 }
 
 #[derive(Debug, Clone)]
@@ -107,7 +119,12 @@ const LM_BATCH_SIZE: usize = 6;
 const LM_BATCH_MAX_ATTEMPTS: usize = 3;
 const LM_STUDIO_REQUEST_TIMEOUT_SECS: u64 = 15;
 const LM_STUDIO_COMPLETION_TIMEOUT_SECS: u64 = 600;
+const LM_STUDIO_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
 const MAX_DIGEST_ITEMS: usize = 12;
+
+fn default_capture_media_kind() -> String {
+    "photo".into()
+}
 
 #[derive(Debug, Clone)]
 struct CaptureBoundary {
@@ -196,6 +213,60 @@ impl ClusterEditorialRecord {
     fn to_cleaned_item(&self) -> CleanedItem {
         self.decision.clone().into_cleaned(&self.cluster)
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct FeedMedia {
+    url: String,
+    kind: String,
+}
+
+#[derive(Debug, Clone)]
+struct DownloadedImage {
+    source_url: String,
+    mime_type: String,
+    bytes: Vec<u8>,
+    data_url: String,
+}
+
+impl DownloadedImage {
+    fn extension(&self) -> &'static str {
+        match self.mime_type.as_str() {
+            "image/png" => "png",
+            "image/webp" => "webp",
+            _ => "jpg",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SyncImageCache {
+    entries: HashMap<String, Result<DownloadedImage, String>>,
+}
+
+impl SyncImageCache {
+    async fn get_or_fetch(
+        &mut self,
+        client: &reqwest::Client,
+        url: &str,
+    ) -> Option<DownloadedImage> {
+        if let Some(entry) = self.entries.get(url) {
+            return entry.clone().ok();
+        }
+
+        let result = download_image_asset(client, url)
+            .await
+            .map_err(|error| error.to_string());
+        self.entries.insert(url.to_string(), result.clone());
+        result.ok()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct StructuredGenerationOutcome {
+    decisions: Vec<ClusterDecision>,
+    fell_back_to_text: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -346,13 +417,13 @@ pub(crate) fn emit_capture_progress(
 }
 
 #[async_trait]
-pub trait FeedSource {
+pub(crate) trait FeedSource {
     async fn connect(&self, _config: &XClientConfigDraft) -> Result<(), AppError>;
     async fn disconnect(&self) -> Result<(), AppError>;
 }
 
 #[async_trait]
-pub trait LocalModelProvider {
+pub(crate) trait LocalModelProvider {
     async fn health_check(
         &self,
         base_url: &str,
@@ -368,7 +439,8 @@ pub trait LocalModelProvider {
         settings: &UserSettings,
         auth_token: Option<&str>,
         clusters: &[TweetCluster],
-    ) -> Result<Vec<ClusterDecision>, AppError>;
+        image_cache: &mut SyncImageCache,
+    ) -> Result<StructuredGenerationOutcome, AppError>;
     async fn generate_text(
         &self,
         settings: &UserSettings,
@@ -707,57 +779,55 @@ impl LocalModelProvider for LmStudioClient {
         settings: &UserSettings,
         auth_token: Option<&str>,
         clusters: &[TweetCluster],
-    ) -> Result<Vec<ClusterDecision>, AppError> {
+        image_cache: &mut SyncImageCache,
+    ) -> Result<StructuredGenerationOutcome, AppError> {
         let model =
             settings.lm_studio.selected_model.clone().ok_or_else(|| {
                 AppError::Message("Select an LM Studio model before syncing.".into())
             })?;
 
-        let mut prompt = String::from(
-            "You are SIFT, a calm editor that turns repeated X chatter into a concise daily briefing.\n",
-        );
-        prompt.push_str("Return strict JSON with this shape: {\"items\":[{\"clusterId\":\"...\",\"keep\":true,\"category\":\"Releases|Tools|Infrastructure|Ideas|People\",\"headline\":\"...\",\"summary\":\"...\",\"whyItMatters\":\"...\",\"reasons\":[\"...\"]}]}\n");
-        prompt.push_str("Rules: keep only the most important clusters. Prefer repeated topics across independent authors, concrete releases, notable tools, useful ideas, and things that feel widely discussed for a reason. It is good to drop most clusters. Avoid outrage, bait, empty self-promotion, and duplicates.\n");
-        prompt.push_str("Use neutral headlines under 14 words and summaries under 42 words.\n");
-        prompt.push_str("Input clusters:\n");
-
-        for cluster in clusters {
-            let _ = writeln!(
-                prompt,
-                "- clusterId: {}\n  repeats: {}\n  uniqueAuthors: {}\n  sharedUrls: {}\n  keywords: {}\n  representative: {} (@{})\n  sampleTweets:\n{}",
-                cluster.id,
-                cluster.repeat_count(),
-                cluster.unique_author_count(),
-                if cluster.shared_urls.is_empty() {
-                    "none".into()
-                } else {
-                    cluster.shared_url_list().join(", ")
-                },
-                if cluster.keywords.is_empty() {
-                    "none".into()
-                } else {
-                    cluster.keyword_list().join(", ")
-                },
-                cluster.representative.author_name,
-                cluster.representative.author_handle,
-                cluster
-                    .members
-                    .iter()
-                    .take(4)
-                    .enumerate()
-                    .map(|(index, item)| {
-                        format!(
-                            "    {}. {} (@{}) [{}] {}",
-                            index + 1,
-                            item.author_name,
-                            item.author_handle,
-                            item.posted_at,
-                            truncate_chars(&item.text, 220)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            );
+        let prompt = build_structured_prompt(clusters);
+        if settings.lm_studio.include_images {
+            if let Some(parts) = self
+                .build_multimodal_user_content(clusters, &prompt, image_cache)
+                .await
+            {
+                match self
+                    .chat_completion_with_parts(
+                        &settings.lm_studio.base_url,
+                        auth_token,
+                        &model,
+                        parts,
+                        0.2,
+                    )
+                    .await
+                {
+                    Ok(content) => {
+                        return Ok(StructuredGenerationOutcome {
+                            decisions: parse_cluster_decisions(&content, clusters)?,
+                            fell_back_to_text: false,
+                        });
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[sift] LM Studio rejected multimodal ranking input; retrying text-only: {error}"
+                        );
+                        let fallback = self
+                            .chat_completion(
+                                &settings.lm_studio.base_url,
+                                auth_token,
+                                &model,
+                                &prompt,
+                                0.2,
+                            )
+                            .await?;
+                        return Ok(StructuredGenerationOutcome {
+                            decisions: parse_cluster_decisions(&fallback, clusters)?,
+                            fell_back_to_text: true,
+                        });
+                    }
+                }
+            }
         }
 
         let content = self
@@ -770,35 +840,10 @@ impl LocalModelProvider for LmStudioClient {
             )
             .await?;
 
-        let parsed = extract_json_segment(&content).map_err(|error| {
-            AppError::Message(format!(
-                "{error} Sample response: {}",
-                truncate_chars(&content, 240)
-            ))
-        })?;
-        let envelope = serde_json::from_str::<ClusterDecisionEnvelope>(&parsed)
-            .or_else(|_| {
-                serde_json::from_str::<Vec<ClusterDecision>>(&parsed)
-                    .map(|items| ClusterDecisionEnvelope { items })
-            })
-            .map_err(|error| {
-                AppError::Message(format!(
-                    "LM Studio returned unreadable ranking JSON: {error}. Sample: {}",
-                    truncate_chars(&parsed, 240)
-                ))
-            })?;
-
-        Ok(clusters
-            .iter()
-            .map(|cluster| {
-                envelope
-                    .items
-                    .iter()
-                    .find(|decision| decision.cluster_id == cluster.id)
-                    .cloned()
-                    .unwrap_or_else(|| fallback_decision(cluster))
-            })
-            .collect())
+        Ok(StructuredGenerationOutcome {
+            decisions: parse_cluster_decisions(&content, clusters)?,
+            fell_back_to_text: false,
+        })
     }
 
     async fn generate_text(
@@ -824,6 +869,51 @@ impl LocalModelProvider for LmStudioClient {
 }
 
 impl LmStudioClient {
+    async fn build_multimodal_user_content(
+        &self,
+        clusters: &[TweetCluster],
+        prompt: &str,
+        image_cache: &mut SyncImageCache,
+    ) -> Option<Vec<serde_json::Value>> {
+        let mut parts = vec![serde_json::json!({
+            "type": "text",
+            "text": prompt,
+        })];
+        let mut attached_images = 0usize;
+
+        for cluster in clusters {
+            let Some(media_url) = first_photo_url(&cluster.representative) else {
+                continue;
+            };
+            let Some(image) = image_cache.get_or_fetch(&self.http, &media_url).await else {
+                continue;
+            };
+
+            attached_images += 1;
+            parts.push(serde_json::json!({
+                "type": "text",
+                "text": format!(
+                    "Attached image for {} from {} (@{}). Use it only if it materially improves editorial judgment.",
+                    cluster.id,
+                    cluster.representative.author_name,
+                    cluster.representative.author_handle,
+                ),
+            }));
+            parts.push(serde_json::json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": image.data_url,
+                },
+            }));
+        }
+
+        if attached_images == 0 {
+            None
+        } else {
+            Some(parts)
+        }
+    }
+
     async fn chat_completion(
         &self,
         base_url: &str,
@@ -832,16 +922,51 @@ impl LmStudioClient {
         prompt: &str,
         temperature: f32,
     ) -> Result<String, AppError> {
-        let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-        let body = serde_json::json!({
-          "model": model,
-          "temperature": temperature,
-          "messages": [
-            { "role": "system", "content": "You are a meticulous editor. Reply with exactly what was requested." },
-            { "role": "user", "content": prompt }
-          ]
-        });
+        self.chat_completion_request(
+            base_url,
+            auth_token,
+            serde_json::json!({
+              "model": model,
+              "temperature": temperature,
+              "messages": [
+                { "role": "system", "content": "You are a meticulous editor. Reply with exactly what was requested." },
+                { "role": "user", "content": prompt }
+              ]
+            }),
+        )
+        .await
+    }
 
+    async fn chat_completion_with_parts(
+        &self,
+        base_url: &str,
+        auth_token: Option<&str>,
+        model: &str,
+        parts: Vec<serde_json::Value>,
+        temperature: f32,
+    ) -> Result<String, AppError> {
+        self.chat_completion_request(
+            base_url,
+            auth_token,
+            serde_json::json!({
+              "model": model,
+              "temperature": temperature,
+              "messages": [
+                { "role": "system", "content": "You are a meticulous editor. Reply with exactly what was requested." },
+                { "role": "user", "content": parts }
+              ]
+            }),
+        )
+        .await
+    }
+
+    async fn chat_completion_request(
+        &self,
+        base_url: &str,
+        auth_token: Option<&str>,
+        body: serde_json::Value,
+    ) -> Result<String, AppError> {
+        let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
         let mut request = self
             .http
             .post(url)
@@ -971,6 +1096,7 @@ pub async fn generate_paper(
         );
 
         let provider = LmStudioClient::default();
+        let mut image_cache = SyncImageCache::default();
         let decisions = batch_decide(
             state,
             &run.id,
@@ -979,13 +1105,10 @@ pub async fn generate_paper(
             &settings,
             lm_studio_auth_token.as_deref(),
             &clusters,
+            &mut image_cache,
         )
         .await?;
         let kept = keep_useful(&decisions);
-        let kept_items = kept
-            .iter()
-            .map(ClusterEditorialRecord::to_cleaned_item)
-            .collect::<Vec<_>>();
         emit_sync_progress(
             state,
             &run.id,
@@ -1005,7 +1128,8 @@ pub async fn generate_paper(
             &provider,
             &settings,
             lm_studio_auth_token.as_deref(),
-            &kept_items,
+            &kept,
+            &mut image_cache,
         )
         .await?;
         emit_sync_progress(
@@ -1144,6 +1268,7 @@ async fn batch_decide(
     settings: &UserSettings,
     auth_token: Option<&str>,
     clusters: &[TweetCluster],
+    image_cache: &mut SyncImageCache,
 ) -> Result<Vec<ClusterEditorialRecord>, AppError> {
     let mut decisions = Vec::new();
     let total_batches = clusters.chunks(LM_BATCH_SIZE).len();
@@ -1170,14 +1295,31 @@ async fn batch_decide(
         loop {
             attempt += 1;
             match provider
-                .generate_structured(settings, auth_token, batch)
+                .generate_structured(settings, auth_token, batch, image_cache)
                 .await
             {
-                Ok(mut result) => {
+                Ok(mut outcome) => {
                     println!(
                         "[sift-sync:{run_id}] ranking batch {batch_number}/{total_batches} succeeded on attempt {attempt}"
                     );
-                    decisions.extend(result.drain(..).filter_map(|decision| {
+                    if outcome.fell_back_to_text {
+                        emit_sync_progress(
+                            state,
+                            run_id,
+                            reason,
+                            SyncStatus::Running,
+                            "ranking-items",
+                            format!(
+                                "LM Studio refused image input for batch {batch_number}/{total_batches}. Continued with text-only ranking for these {} topic clusters.",
+                                batch.len()
+                            ),
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
+                    }
+                    decisions.extend(outcome.decisions.drain(..).filter_map(|decision| {
                         batch
                             .iter()
                             .find(|cluster| cluster.id == decision.cluster_id)
@@ -1265,40 +1407,46 @@ async fn build_edition(
     provider: &LmStudioClient,
     settings: &UserSettings,
     auth_token: Option<&str>,
-    items: &[CleanedItem],
+    records: &[ClusterEditorialRecord],
+    image_cache: &mut SyncImageCache,
 ) -> Result<(String, Edition), AppError> {
     let edition_date = current_edition_date(settings)?;
-    let mut sections = BTreeMap::<String, Vec<CleanedItem>>::new();
+    let edition_id = Uuid::new_v4().to_string();
+    let mut sections = BTreeMap::<String, Vec<EditionCard>>::new();
+    let mut cleaned_items = Vec::with_capacity(records.len());
 
-    for item in items {
+    for record in records {
+        let item = record.to_cleaned_item();
+        let lead_image =
+            maybe_persist_important_image(state, &edition_id, provider, image_cache, record)
+                .await?;
         sections
             .entry(normalize_category(&item.category))
             .or_default()
-            .push(item.clone());
+            .push(EditionCard {
+                item_id: item.item_id.clone(),
+                author_name: item.author_name.clone(),
+                author_handle: item.author_handle.clone(),
+                source_url: item.source_url.clone(),
+                posted_at: item.posted_at.clone(),
+                category: item.category.clone(),
+                headline: item.headline.clone(),
+                summary: item.summary.clone(),
+                why_it_matters: item.why_it_matters.clone(),
+                lead_image,
+            });
+        cleaned_items.push(item);
     }
 
     let section_list = sections
         .into_iter()
-        .map(|(title, mut items)| {
-            items.sort_by(|left, right| right.posted_at.cmp(&left.posted_at));
+        .map(|(title, mut cards)| {
+            cards.sort_by(|left, right| right.posted_at.cmp(&left.posted_at));
             EditionSection {
                 id: title.to_lowercase().replace(' ', "-"),
                 dek: format!("{} worth your attention", title),
                 title: title.clone(),
-                cards: items
-                    .into_iter()
-                    .map(|item| EditionCard {
-                        item_id: item.item_id,
-                        author_name: item.author_name,
-                        author_handle: item.author_handle,
-                        source_url: item.source_url,
-                        posted_at: item.posted_at,
-                        category: item.category,
-                        headline: item.headline,
-                        summary: item.summary,
-                        why_it_matters: item.why_it_matters,
-                    })
-                    .collect(),
+                cards,
             }
         })
         .collect::<Vec<_>>();
@@ -1311,18 +1459,18 @@ async fn build_edition(
         "building-edition",
         format!(
             "Organized {} kept posts into {} sections. Drafting the front page.",
-            items.len(),
+            records.len(),
             section_list.len()
         ),
         None,
         None,
-        Some(items.len()),
+        Some(records.len()),
         None,
     );
 
     let front_page_prompt = format!(
         "Write a calm front-page summary in 2 sentences for this SIFT edition. Focus on launches, tools, and notable ideas.\n{}",
-        items
+        cleaned_items
             .iter()
             .take(8)
             .map(|item| format!("{}: {}", item.headline, item.summary))
@@ -1346,10 +1494,10 @@ async fn build_edition(
                 "LM Studio could not draft the front page. Using a local fallback summary.",
                 None,
                 None,
-                Some(items.len()),
+                Some(records.len()),
                 None,
             );
-            items
+            cleaned_items
                 .iter()
                 .take(3)
                 .map(|item| item.summary.clone())
@@ -1362,7 +1510,7 @@ async fn build_edition(
     Ok((
         edition_date.clone(),
         Edition {
-            id: Uuid::new_v4().to_string(),
+            id: edition_id,
             edition_date,
             title,
             front_page_summary,
@@ -1788,26 +1936,30 @@ fn normalize_session_capture(
         .filter(|item| !item.text.trim().is_empty())
         .filter(|item| !(settings.cleanup.hide_retweets && item.is_repost))
         .filter(|item| !(settings.cleanup.hide_replies && item.is_reply))
-        .map(|item| FeedItem {
-            id: item.id.clone(),
-            source: "x-session".into(),
-            author_name: item.author_name.trim().to_string(),
-            author_handle: item
-                .author_handle
-                .trim_start_matches('@')
-                .trim()
-                .to_string(),
-            text: item.text.trim().to_string(),
-            source_url: item.source_url.clone(),
-            posted_at: item.posted_at.clone(),
-            raw_json: serde_json::json!({
-              "captureMode": "live-session",
-              "isRepost": item.is_repost,
-              "isReply": item.is_reply,
-              "socialContext": item.social_context,
-              "sharedUrls": item.shared_urls,
-            }),
-            fingerprint: fingerprint(&item.text),
+        .map(|item| {
+            let media = normalize_capture_media(&item.media);
+            FeedItem {
+                id: item.id.clone(),
+                source: "x-session".into(),
+                author_name: item.author_name.trim().to_string(),
+                author_handle: item
+                    .author_handle
+                    .trim_start_matches('@')
+                    .trim()
+                    .to_string(),
+                text: item.text.trim().to_string(),
+                source_url: item.source_url.clone(),
+                posted_at: item.posted_at.clone(),
+                raw_json: serde_json::json!({
+                  "captureMode": "live-session",
+                  "isRepost": item.is_repost,
+                  "isReply": item.is_reply,
+                  "socialContext": item.social_context,
+                  "sharedUrls": item.shared_urls,
+                  "media": media,
+                }),
+                fingerprint: fingerprint(&item.text),
+            }
         })
         .collect::<Vec<_>>();
 
@@ -1879,6 +2031,47 @@ fn timestamp_is_after(value: &str, boundary: &str) -> Option<bool> {
     )
 }
 
+fn normalize_capture_media(media: &[XSessionCaptureMedia]) -> Vec<FeedMedia> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+
+    for item in media {
+        let kind = item.kind.trim().to_lowercase();
+        if kind != "photo" {
+            continue;
+        }
+        let Some(url) = normalize_media_url(&item.url) else {
+            continue;
+        };
+        if !is_story_photo_url(&url) {
+            continue;
+        }
+        if seen.insert(url.clone()) {
+            normalized.push(FeedMedia {
+                url,
+                kind: kind.clone(),
+            });
+        }
+    }
+
+    normalized
+}
+
+fn media_from_item(item: &FeedItem) -> Vec<FeedMedia> {
+    item.raw_json
+        .get("media")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<FeedMedia>>(value).ok())
+        .unwrap_or_default()
+}
+
+fn first_photo_url(item: &FeedItem) -> Option<String> {
+    media_from_item(item)
+        .into_iter()
+        .find(|media| media.kind == "photo")
+        .map(|media| media.url)
+}
+
 fn shared_urls_from_item(item: &FeedItem) -> HashSet<String> {
     item.raw_json
         .get("sharedUrls")
@@ -1888,6 +2081,36 @@ fn shared_urls_from_item(item: &FeedItem) -> HashSet<String> {
         .filter_map(|value| value.as_str())
         .filter_map(normalize_shared_url)
         .collect()
+}
+
+fn normalize_media_url(value: &str) -> Option<String> {
+    let mut parsed = Url::parse(value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+
+    parsed.set_fragment(None);
+    Some(parsed.to_string())
+}
+
+fn is_story_photo_url(value: &str) -> bool {
+    let Ok(parsed) = Url::parse(value) else {
+        return false;
+    };
+    if parsed.host_str() != Some("pbs.twimg.com") {
+        return false;
+    }
+
+    ![
+        "profile_images",
+        "profile_banners",
+        "ext_tw_video_thumb",
+        "amplify_video_thumb",
+        "media_emoji",
+        "semantic_core_img",
+    ]
+    .iter()
+    .any(|fragment| parsed.path().contains(fragment))
 }
 
 fn normalize_shared_url(value: &str) -> Option<String> {
@@ -2050,6 +2273,12 @@ fn should_replace_representative(current: &FeedItem, candidate: &FeedItem) -> bo
         return candidate_url_count > current_url_count;
     }
 
+    let current_media_count = media_from_item(current).len();
+    let candidate_media_count = media_from_item(candidate).len();
+    if candidate_media_count != current_media_count {
+        return candidate_media_count > current_media_count;
+    }
+
     candidate.posted_at > current.posted_at
 }
 
@@ -2141,7 +2370,139 @@ fn fallback_decision(cluster: &TweetCluster) -> ClusterDecision {
             "Useful update surfaced from your feed.".into()
         },
         reasons: vec!["Fallback editorial pass".into()],
+        image_important: false,
+        image_alt: None,
     }
+}
+
+fn build_structured_prompt(clusters: &[TweetCluster]) -> String {
+    let mut prompt = String::from(
+        "You are SIFT, a calm editor that turns repeated X chatter into a concise daily briefing.\n",
+    );
+    prompt.push_str("Return strict JSON with this shape: {\"items\":[{\"clusterId\":\"...\",\"keep\":true,\"category\":\"Releases|Tools|Infrastructure|Ideas|People\",\"headline\":\"...\",\"summary\":\"...\",\"whyItMatters\":\"...\",\"reasons\":[\"...\"],\"imageImportant\":false,\"imageAlt\":null}]}\n");
+    prompt.push_str("Rules: keep only the most important clusters. Prefer repeated topics across independent authors, concrete releases, notable tools, useful ideas, and things that feel widely discussed for a reason. It is good to drop most clusters. Avoid outrage, bait, empty self-promotion, and duplicates.\n");
+    prompt.push_str("Use neutral headlines under 14 words and summaries under 42 words. Set imageImportant to true only when an attached image genuinely adds important context to the digest. When imageImportant is true, provide concise factual alt text in imageAlt. Otherwise set imageImportant to false and imageAlt to null.\n");
+    prompt.push_str("Input clusters:\n");
+
+    for cluster in clusters {
+        let _ = writeln!(
+            prompt,
+            "- clusterId: {}\n  repeats: {}\n  uniqueAuthors: {}\n  sharedUrls: {}\n  keywords: {}\n  attachedPhoto: {}\n  representative: {} (@{})\n  sampleTweets:\n{}",
+            cluster.id,
+            cluster.repeat_count(),
+            cluster.unique_author_count(),
+            if cluster.shared_urls.is_empty() {
+                "none".into()
+            } else {
+                cluster.shared_url_list().join(", ")
+            },
+            if cluster.keywords.is_empty() {
+                "none".into()
+            } else {
+                cluster.keyword_list().join(", ")
+            },
+            if first_photo_url(&cluster.representative).is_some() {
+                "yes"
+            } else {
+                "no"
+            },
+            cluster.representative.author_name,
+            cluster.representative.author_handle,
+            cluster
+                .members
+                .iter()
+                .take(4)
+                .enumerate()
+                .map(|(index, item)| {
+                    format!(
+                        "    {}. {} (@{}) [{}] {}",
+                        index + 1,
+                        item.author_name,
+                        item.author_handle,
+                        item.posted_at,
+                        truncate_chars(&item.text, 220)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    prompt
+}
+
+fn parse_cluster_decisions(
+    content: &str,
+    clusters: &[TweetCluster],
+) -> Result<Vec<ClusterDecision>, AppError> {
+    let parsed = extract_json_segment(content).map_err(|error| {
+        AppError::Message(format!(
+            "{error} Sample response: {}",
+            truncate_chars(content, 240)
+        ))
+    })?;
+    let envelope = serde_json::from_str::<ClusterDecisionEnvelope>(&parsed)
+        .or_else(|_| {
+            serde_json::from_str::<Vec<ClusterDecision>>(&parsed)
+                .map(|items| ClusterDecisionEnvelope { items })
+        })
+        .map_err(|error| {
+            AppError::Message(format!(
+                "LM Studio returned unreadable ranking JSON: {error}. Sample: {}",
+                truncate_chars(&parsed, 240)
+            ))
+        })?;
+
+    Ok(clusters
+        .iter()
+        .map(|cluster| {
+            envelope
+                .items
+                .iter()
+                .find(|decision| decision.cluster_id == cluster.id)
+                .cloned()
+                .unwrap_or_else(|| fallback_decision(cluster))
+        })
+        .collect())
+}
+
+async fn maybe_persist_important_image(
+    state: &AppState,
+    edition_id: &str,
+    provider: &LmStudioClient,
+    image_cache: &mut SyncImageCache,
+    record: &ClusterEditorialRecord,
+) -> Result<Option<EditionImage>, AppError> {
+    if !record.decision.image_important {
+        return Ok(None);
+    }
+
+    let Some(media_url) = first_photo_url(&record.cluster.representative) else {
+        return Ok(None);
+    };
+    let Some(image) = image_cache.get_or_fetch(&provider.http, &media_url).await else {
+        return Ok(None);
+    };
+
+    let base_dir = state
+        .app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| AppError::Message(error.to_string()))?;
+    let alt = record
+        .decision
+        .image_alt
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| record.decision.headline.clone());
+
+    Ok(Some(persist_downloaded_image(
+        &base_dir,
+        edition_id,
+        &record.cluster.representative.id,
+        &image,
+        &alt,
+    )?))
 }
 
 fn truncate_words(text: &str, limit: usize) -> String {
@@ -2173,6 +2534,145 @@ fn truncate_chars(text: &str, limit: usize) -> String {
 
     value = value.chars().take(limit).collect::<String>();
     format!("{value}...")
+}
+
+fn persist_downloaded_image(
+    base_dir: &Path,
+    edition_id: &str,
+    item_id: &str,
+    image: &DownloadedImage,
+    alt: &str,
+) -> Result<EditionImage, AppError> {
+    let asset_dir = base_dir.join("assets").join("editions").join(edition_id);
+    fs::create_dir_all(&asset_dir)?;
+
+    let asset_path = asset_dir.join(format!(
+        "{}-{}.{}",
+        sanitize_filename_fragment(item_id),
+        short_hash(&image.source_url),
+        image.extension()
+    ));
+    fs::write(&asset_path, &image.bytes)?;
+
+    Ok(EditionImage {
+        path: asset_path.to_string_lossy().to_string(),
+        source_url: image.source_url.clone(),
+        mime_type: image.mime_type.clone(),
+        alt: alt.to_string(),
+    })
+}
+
+async fn download_image_asset(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<DownloadedImage, AppError> {
+    let response = client.get(url).send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(AppError::Message(format!(
+            "Image download failed with {status} for {url}"
+        )));
+    }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let bytes = response.bytes().await?.to_vec();
+    if bytes.is_empty() {
+        return Err(AppError::Message(format!(
+            "Image download returned an empty body for {url}"
+        )));
+    }
+    if bytes.len() > LM_STUDIO_IMAGE_MAX_BYTES {
+        return Err(AppError::Message(format!(
+            "Image download exceeded the {} byte limit for {url}",
+            LM_STUDIO_IMAGE_MAX_BYTES
+        )));
+    }
+
+    let mime_type = normalize_image_mime_type(content_type.as_deref(), url).ok_or_else(|| {
+        AppError::Message(format!(
+            "Unsupported image type for multimodal request: {url}"
+        ))
+    })?;
+    let data_url = format!(
+        "data:{};base64,{}",
+        mime_type,
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    );
+
+    Ok(DownloadedImage {
+        source_url: url.to_string(),
+        mime_type,
+        bytes,
+        data_url,
+    })
+}
+
+fn normalize_image_mime_type(header: Option<&str>, url: &str) -> Option<String> {
+    let from_header = header
+        .and_then(|value| value.split(';').next())
+        .map(|value| value.trim().to_ascii_lowercase());
+    if let Some(mime_type) = from_header {
+        if matches!(
+            mime_type.as_str(),
+            "image/jpeg" | "image/jpg" | "image/png" | "image/webp"
+        ) {
+            return Some(if mime_type == "image/jpg" {
+                "image/jpeg".into()
+            } else {
+                mime_type
+            });
+        }
+    }
+
+    let parsed = Url::parse(url).ok()?;
+    if let Some((_, format)) = parsed.query_pairs().find(|(key, _)| key == "format") {
+        return match format.as_ref().to_ascii_lowercase().as_str() {
+            "jpg" | "jpeg" => Some("image/jpeg".into()),
+            "png" => Some("image/png".into()),
+            "webp" => Some("image/webp".into()),
+            _ => None,
+        };
+    }
+
+    parsed
+        .path_segments()
+        .and_then(|segments| segments.last())
+        .and_then(|last| last.rsplit('.').next())
+        .and_then(|extension| match extension.to_ascii_lowercase().as_str() {
+            "jpg" | "jpeg" => Some("image/jpeg".into()),
+            "png" => Some("image/png".into()),
+            "webp" => Some("image/webp".into()),
+            _ => None,
+        })
+}
+
+fn short_hash(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    format!("{:x}", digest)[..10].to_string()
+}
+
+fn sanitize_filename_fragment(value: &str) -> String {
+    let cleaned = value
+        .chars()
+        .map(|char| {
+            if char.is_ascii_alphanumeric() || char == '-' || char == '_' {
+                char
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if cleaned.is_empty() {
+        "image".into()
+    } else {
+        cleaned
+    }
 }
 
 fn bearer(token: &str) -> String {
@@ -2271,6 +2771,10 @@ pub(crate) struct ClusterDecision {
     summary: String,
     why_it_matters: String,
     reasons: Vec<String>,
+    #[serde(default)]
+    image_important: bool,
+    #[serde(default)]
+    image_alt: Option<String>,
 }
 
 impl ClusterDecision {
@@ -2304,6 +2808,42 @@ impl ClusterDecision {
 mod tests {
     use super::*;
     use crate::models::CleanupSettings;
+    use httpmock::prelude::*;
+    use tempfile::tempdir;
+
+    fn sample_settings(include_images: bool, base_url: String) -> UserSettings {
+        let mut settings = UserSettings::default();
+        settings.lm_studio.base_url = base_url;
+        settings.lm_studio.selected_model = Some("vision-model".into());
+        settings.lm_studio.include_images = include_images;
+        settings
+    }
+
+    fn sample_cluster(media: Vec<FeedMedia>) -> TweetCluster {
+        let item = FeedItem {
+            id: "post-1".into(),
+            source: "x-session".into(),
+            author_name: "Builder".into(),
+            author_handle: "builder".into(),
+            text: "Shipped a local-first release with screenshots".into(),
+            source_url: "https://x.com/builder/status/1".into(),
+            posted_at: "2026-04-16T12:00:00Z".into(),
+            raw_json: serde_json::json!({
+                "media": media,
+                "sharedUrls": ["https://example.com/release"]
+            }),
+            fingerprint: fingerprint("Shipped a local-first release with screenshots"),
+        };
+        TweetCluster {
+            id: "cluster-1".into(),
+            representative: item.clone(),
+            members: vec![item],
+            shared_urls: ["https://example.com/release".into()].into_iter().collect(),
+            keywords: ["release".into(), "screenshot".into()]
+                .into_iter()
+                .collect(),
+        }
+    }
 
     #[test]
     fn engagement_bait_patterns_are_detected() {
@@ -2493,6 +3033,7 @@ mod tests {
                 is_reply: false,
                 social_context: Some("Ada reposted".into()),
                 shared_urls: Vec::new(),
+                media: Vec::new(),
             },
             XSessionCaptureItem {
                 id: "2".into(),
@@ -2505,6 +3046,7 @@ mod tests {
                 is_reply: true,
                 social_context: None,
                 shared_urls: Vec::new(),
+                media: Vec::new(),
             },
             XSessionCaptureItem {
                 id: "3".into(),
@@ -2517,6 +3059,20 @@ mod tests {
                 is_reply: false,
                 social_context: None,
                 shared_urls: vec!["https://example.com/release".into()],
+                media: vec![
+                    XSessionCaptureMedia {
+                        url: "https://pbs.twimg.com/media/story-photo?format=jpg&name=small".into(),
+                        kind: "photo".into(),
+                    },
+                    XSessionCaptureMedia {
+                        url: "https://pbs.twimg.com/profile_images/avatar.jpg".into(),
+                        kind: "photo".into(),
+                    },
+                    XSessionCaptureMedia {
+                        url: "https://pbs.twimg.com/media/video-thumb.jpg".into(),
+                        kind: "video".into(),
+                    },
+                ],
             },
         ];
 
@@ -2532,6 +3088,17 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(
+            cleaned[0].raw_json["media"]
+                .as_array()
+                .expect("media array")
+                .len(),
+            1
+        );
+        assert_eq!(
+            first_photo_url(&cleaned[0]).as_deref(),
+            Some("https://pbs.twimg.com/media/story-photo?format=jpg&name=small")
+        );
     }
 
     #[test]
@@ -2545,6 +3112,178 @@ mod tests {
 
         assert!(is_home_timeline_url(&url));
         assert!(!refresh_nonce.is_empty());
+    }
+
+    #[tokio::test]
+    async fn generate_structured_stays_text_only_when_images_are_disabled() {
+        let server = MockServer::start();
+        let image = server.mock(|when, then| {
+            when.method(GET).path("/media/story.jpg");
+            then.status(200)
+                .header("content-type", "image/jpeg")
+                .body(vec![1_u8, 2, 3]);
+        });
+        let completion = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"content\":\"You are SIFT, a calm editor");
+            then.status(200).json_body(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": "{\"items\":[{\"clusterId\":\"cluster-1\",\"keep\":true,\"category\":\"Tools\",\"headline\":\"Text only result\",\"summary\":\"Summary\",\"whyItMatters\":\"Why\",\"reasons\":[\"reason\"],\"imageImportant\":false,\"imageAlt\":null}]}"
+                    }
+                }]
+            }));
+        });
+
+        let settings = sample_settings(false, server.base_url());
+        let cluster = sample_cluster(vec![FeedMedia {
+            url: format!("{}/media/story.jpg", server.base_url()),
+            kind: "photo".into(),
+        }]);
+        let provider = LmStudioClient::default();
+        let mut image_cache = SyncImageCache::default();
+
+        let outcome = provider
+            .generate_structured(&settings, None, &[cluster], &mut image_cache)
+            .await
+            .expect("structured output");
+
+        assert!(!outcome.fell_back_to_text);
+        assert_eq!(image.hits(), 0);
+        assert_eq!(completion.hits(), 1);
+        assert_eq!(outcome.decisions[0].headline, "Text only result");
+    }
+
+    #[tokio::test]
+    async fn generate_structured_includes_image_parts_when_enabled() {
+        let server = MockServer::start();
+        let image = server.mock(|when, then| {
+            when.method(GET).path("/media/story.jpg");
+            then.status(200)
+                .header("content-type", "image/jpeg")
+                .body(vec![1_u8, 2, 3]);
+        });
+        let completion = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"image_url\"");
+            then.status(200).json_body(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": "{\"items\":[{\"clusterId\":\"cluster-1\",\"keep\":true,\"category\":\"Tools\",\"headline\":\"Image aware result\",\"summary\":\"Summary\",\"whyItMatters\":\"Why\",\"reasons\":[\"reason\"],\"imageImportant\":true,\"imageAlt\":\"Screenshot of the release UI\"}]}"
+                    }
+                }]
+            }));
+        });
+
+        let settings = sample_settings(true, server.base_url());
+        let cluster = sample_cluster(vec![FeedMedia {
+            url: format!("{}/media/story.jpg", server.base_url()),
+            kind: "photo".into(),
+        }]);
+        let provider = LmStudioClient::default();
+        let mut image_cache = SyncImageCache::default();
+
+        let outcome = provider
+            .generate_structured(&settings, None, &[cluster], &mut image_cache)
+            .await
+            .expect("structured output");
+
+        assert_eq!(image.hits(), 1);
+        assert_eq!(completion.hits(), 1);
+        assert!(outcome.decisions[0].image_important);
+        assert_eq!(
+            outcome.decisions[0].image_alt.as_deref(),
+            Some("Screenshot of the release UI")
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_structured_falls_back_to_text_when_multimodal_request_is_rejected() {
+        let server = MockServer::start();
+        let image = server.mock(|when, then| {
+            when.method(GET).path("/media/story.jpg");
+            then.status(200)
+                .header("content-type", "image/jpeg")
+                .body(vec![1_u8, 2, 3]);
+        });
+        let multimodal_failure = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"image_url\"");
+            then.status(400).body("vision not supported");
+        });
+        let text_completion = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"content\":\"You are SIFT, a calm editor");
+            then.status(200).json_body(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": "{\"items\":[{\"clusterId\":\"cluster-1\",\"keep\":true,\"category\":\"Tools\",\"headline\":\"Fallback result\",\"summary\":\"Summary\",\"whyItMatters\":\"Why\",\"reasons\":[\"reason\"],\"imageImportant\":false,\"imageAlt\":null}]}"
+                    }
+                }]
+            }));
+        });
+
+        let settings = sample_settings(true, server.base_url());
+        let cluster = sample_cluster(vec![FeedMedia {
+            url: format!("{}/media/story.jpg", server.base_url()),
+            kind: "photo".into(),
+        }]);
+        let provider = LmStudioClient::default();
+        let mut image_cache = SyncImageCache::default();
+
+        let outcome = provider
+            .generate_structured(&settings, None, &[cluster], &mut image_cache)
+            .await
+            .expect("structured output");
+
+        assert!(outcome.fell_back_to_text);
+        assert_eq!(image.hits(), 1);
+        assert_eq!(multimodal_failure.hits(), 1);
+        assert_eq!(text_completion.hits(), 1);
+        assert_eq!(outcome.decisions[0].headline, "Fallback result");
+    }
+
+    #[tokio::test]
+    async fn generate_structured_skips_multimodal_when_image_download_fails() {
+        let server = MockServer::start();
+        let image = server.mock(|when, then| {
+            when.method(GET).path("/media/story.jpg");
+            then.status(500);
+        });
+        let text_completion = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"content\":\"You are SIFT, a calm editor");
+            then.status(200).json_body(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": "{\"items\":[{\"clusterId\":\"cluster-1\",\"keep\":true,\"category\":\"Tools\",\"headline\":\"Download fallback\",\"summary\":\"Summary\",\"whyItMatters\":\"Why\",\"reasons\":[\"reason\"],\"imageImportant\":false,\"imageAlt\":null}]}"
+                    }
+                }]
+            }));
+        });
+
+        let settings = sample_settings(true, server.base_url());
+        let cluster = sample_cluster(vec![FeedMedia {
+            url: format!("{}/media/story.jpg", server.base_url()),
+            kind: "photo".into(),
+        }]);
+        let provider = LmStudioClient::default();
+        let mut image_cache = SyncImageCache::default();
+
+        let outcome = provider
+            .generate_structured(&settings, None, &[cluster], &mut image_cache)
+            .await
+            .expect("structured output");
+
+        assert!(!outcome.fell_back_to_text);
+        assert_eq!(image.hits(), 1);
+        assert_eq!(text_completion.hits(), 1);
+        assert_eq!(outcome.decisions[0].headline, "Download fallback");
     }
 
     #[test]
@@ -2596,5 +3335,30 @@ mod tests {
         let clusters = group_tweets(&items);
         assert_eq!(clusters.len(), 2);
         assert_eq!(clusters[0].repeat_count(), 2);
+    }
+
+    #[test]
+    fn persist_downloaded_image_writes_asset_metadata() {
+        let temp_dir = tempdir().expect("temporary dir");
+        let image = DownloadedImage {
+            source_url: "https://pbs.twimg.com/media/story.jpg?format=jpg&name=large".into(),
+            mime_type: "image/jpeg".into(),
+            bytes: vec![1_u8, 2, 3, 4],
+            data_url: "data:image/jpeg;base64,AQIDBA==".into(),
+        };
+
+        let persisted = persist_downloaded_image(
+            temp_dir.path(),
+            "edition-1",
+            "item-1",
+            &image,
+            "Screenshot of the release UI",
+        )
+        .expect("persisted image");
+
+        assert!(Path::new(&persisted.path).exists());
+        assert_eq!(persisted.source_url, image.source_url);
+        assert_eq!(persisted.mime_type, "image/jpeg");
+        assert_eq!(persisted.alt, "Screenshot of the release UI");
     }
 }

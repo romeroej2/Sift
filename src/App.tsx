@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { enable as enableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
 import {
@@ -97,6 +98,18 @@ function LogoutIcon() {
       <path d="M21 12H9" />
     </svg>
   );
+}
+
+function getEditionImageSrc(path: string) {
+  if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+    try {
+      return convertFileSrc(path);
+    } catch {
+      return path;
+    }
+  }
+
+  return path;
 }
 
 export default function App() {
@@ -731,6 +744,23 @@ alt="SIFT"
                       </span>
                     ) : null}
                   </div>
+
+                  <label className="field field--checkbox">
+                    <input
+                      type="checkbox"
+                      checked={lmStudioDraft.includeImages}
+                      onChange={(event) =>
+                        setLmStudioDraft((current) => ({
+                          ...current,
+                          includeImages: event.target.checked
+                        }))
+                      }
+                    />
+                    <span>Use attached post images during ranking</span>
+                  </label>
+                  <p className="field-help">
+                    Enable this only for vision-capable local models. SIFT will download attached post photos and send them to LM Studio when ranking digest topics.
+                  </p>
                 </div>
               </div>
             ) : null}
@@ -1025,6 +1055,14 @@ function EditionPanel({
                   aria-label={`Open source post for ${card.headline}`}
                   title={card.sourceUrl}
                 >
+                  {card.leadImage ? (
+                    <img
+                      className="story-card__image"
+                      src={getEditionImageSrc(card.leadImage.path)}
+                      alt={card.leadImage.alt}
+                      loading="lazy"
+                    />
+                  ) : null}
                   <span className="story-card__meta">
                     {card.authorName} · @{card.authorHandle}
                   </span>
