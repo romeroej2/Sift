@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { enable as enableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
@@ -52,6 +52,7 @@ import {
 } from "./lib/api";
 
 type Screen = "today" | "archive" | "settings";
+const SETTINGS_AUTOSAVE_DELAY_MS = 900;
 
 function SessionControlButton({
   label,
@@ -247,6 +248,8 @@ export default function App() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [syncProgress, setSyncProgress] = useState<SyncProgressEvent | null>(null);
   const [clockNow, setClockNow] = useState(() => Date.now());
+  const [isSettingsDirty, setIsSettingsDirty] = useState(false);
+  const settingsAutosaveTimeoutRef = useRef<number | null>(null);
   const availableModels = lmHealth?.models ?? [];
   const xSession = sessionStates.x;
   const linkedinSession = sessionStates.linkedin;
@@ -313,6 +316,7 @@ export default function App() {
 
   function applyBootstrapState(state: BootstrapState, preferredEditionId: string | null = null) {
     setBootstrap(state);
+    setIsSettingsDirty(false);
     setSelectedView((currentView) => {
       const nextView = getAvailableEditionViews(state.editions).includes(currentView)
         ? currentView
@@ -414,6 +418,31 @@ export default function App() {
       window.clearInterval(interval);
     };
   }, []);
+
+  useEffect(() => {
+    if (!isSettingsDirty || screen !== "settings") {
+      return;
+    }
+
+    if (!bootstrap.settings.capture.sources.x && !bootstrap.settings.capture.sources.linkedin) {
+      return;
+    }
+
+    if (settingsAutosaveTimeoutRef.current !== null) {
+      window.clearTimeout(settingsAutosaveTimeoutRef.current);
+    }
+
+    settingsAutosaveTimeoutRef.current = window.setTimeout(() => {
+      void persistNewsroomSettings(bootstrap.settings, "Settings autosaved.");
+    }, SETTINGS_AUTOSAVE_DELAY_MS);
+
+    return () => {
+      if (settingsAutosaveTimeoutRef.current !== null) {
+        window.clearTimeout(settingsAutosaveTimeoutRef.current);
+        settingsAutosaveTimeoutRef.current = null;
+      }
+    };
+  }, [bootstrap.settings, isSettingsDirty, screen]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) {
@@ -562,6 +591,15 @@ export default function App() {
   }
 
   async function handleSaveSettings() {
+    await persistModelDeskSettings("Settings saved locally.");
+  }
+
+  async function persistModelDeskSettings(successMessage: string) {
+    if (settingsAutosaveTimeoutRef.current !== null) {
+      window.clearTimeout(settingsAutosaveTimeoutRef.current);
+      settingsAutosaveTimeoutRef.current = null;
+    }
+
     if (!bootstrap.settings.capture.sources.x && !bootstrap.settings.capture.sources.linkedin) {
       setMessage("Pick at least one source before saving newsroom settings.");
       return;
@@ -577,6 +615,7 @@ export default function App() {
         ...saved.lmStudio,
         authToken: current.authToken
       }));
+      setIsSettingsDirty(false);
       void hydrateSavedLmStudio({
         ...saved,
         lmStudio: {
@@ -585,7 +624,38 @@ export default function App() {
         }
       });
       setIsModelDeskExpanded(false);
-      setMessage("Settings saved locally.");
+      setMessage(successMessage);
+    } catch (error) {
+      setMessage(getErrorMessage(error, "Unable to save settings."));
+    }
+  }
+
+  async function persistNewsroomSettings(settings: UserSettings, successMessage: string) {
+    if (settingsAutosaveTimeoutRef.current !== null) {
+      window.clearTimeout(settingsAutosaveTimeoutRef.current);
+      settingsAutosaveTimeoutRef.current = null;
+    }
+
+    if (!settings.capture.sources.x && !settings.capture.sources.linkedin) {
+      setMessage("Pick at least one source before saving newsroom settings.");
+      return;
+    }
+
+    try {
+      const saved = await saveSettings({
+        ...settings,
+        schedule: {
+          ...settings.schedule,
+          timezone: getMachineTimeZone()
+        },
+        lmStudio: {
+          ...settings.lmStudio,
+          authToken: lmStudioDraft.authToken
+        }
+      });
+      setBootstrap((current) => ({ ...current, settings: saved }));
+      setIsSettingsDirty(false);
+      setMessage(successMessage);
     } catch (error) {
       setMessage(getErrorMessage(error, "Unable to save settings."));
     }
@@ -598,10 +668,13 @@ export default function App() {
     const enabledSources = (Object.entries(bootstrap.settings.capture.sources) as Array<[BrowserSource, boolean]>)
       .filter(([, enabled]) => enabled)
       .map(([source]) => source);
+    const temporarilyShownSources = enabledSources.filter((source) => !sessionStates[source].isVisible);
 
     try {
-      setMessage("Opening the enabled source sessions before refresh...");
-      for (const source of enabledSources) {
+      if (temporarilyShownSources.length > 0) {
+        setMessage("Opening the enabled source sessions before refresh...");
+      }
+      for (const source of temporarilyShownSources) {
         await openSourceSession(source);
       }
 
@@ -637,7 +710,7 @@ export default function App() {
       console.error("[SIFT sync] Manual refresh failed.", error);
       setMessage(detail);
     } finally {
-      for (const source of enabledSources) {
+      for (const source of temporarilyShownSources) {
         try {
           await hideSourceSession(source);
         } catch (hideError) {
@@ -979,26 +1052,11 @@ alt="SIFT"
             <SettingsPanel
               settings={bootstrap.settings}
               scheduleSummary={scheduleSummary}
-              onChange={(next) => setBootstrap((current) => ({ ...current, settings: next }))}
-              onSave={async (settings) => {
-                if (!settings.capture.sources.x && !settings.capture.sources.linkedin) {
-                  setMessage("Pick at least one source before saving newsroom settings.");
-                  return;
-                }
-                const saved = await saveSettings({
-                  ...settings,
-                  schedule: {
-                    ...settings.schedule,
-                    timezone: getMachineTimeZone()
-                  },
-                  lmStudio: {
-                    ...settings.lmStudio,
-                    authToken: lmStudioDraft.authToken
-                  }
-                });
-                setBootstrap((current) => ({ ...current, settings: saved }));
-                setMessage("Paper rules updated.");
+              onChange={(next) => {
+                setBootstrap((current) => ({ ...current, settings: next }));
+                setIsSettingsDirty(true);
               }}
+              onSave={(settings) => persistNewsroomSettings(settings, "Paper rules updated.")}
             />
           ) : screen === "archive" ? (
             <ArchivePanel
@@ -1061,8 +1119,17 @@ function SettingsPanel({
   return (
     <section className="panel content-panel">
       <div className="section-header">
-        <p className="kicker">Settings</p>
-        <h2>Shape the paper.</h2>
+        <div>
+          <p className="kicker">Settings</p>
+          <h2>Shape the paper.</h2>
+        </div>
+        <button
+          className="primary-button"
+          onClick={() => void onSave(settings)}
+          disabled={!hasEnabledSources}
+        >
+          Save newsroom settings
+        </button>
       </div>
 
       <div className="settings-stack">
@@ -1324,13 +1391,6 @@ function SettingsPanel({
         </section>
       </div>
 
-      <button
-        className="primary-button"
-        onClick={() => void onSave(settings)}
-        disabled={!hasEnabledSources}
-      >
-        Save newsroom settings
-      </button>
     </section>
   );
 }

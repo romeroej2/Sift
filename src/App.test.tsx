@@ -149,14 +149,16 @@ function createSessionState(overrides: Partial<BrowserSessionState> = {}): Brows
 
 async function renderLoadedApp({
   bootstrap = createBootstrapState(),
-  session = createSessionState()
+  session = createSessionState(),
+  linkedinSession = createSessionState()
 }: {
   bootstrap?: BootstrapState;
   session?: BrowserSessionState;
+  linkedinSession?: BrowserSessionState;
 } = {}) {
   getBootstrapStateMock.mockResolvedValue(bootstrap);
   getXSessionStateMock.mockResolvedValue(session);
-  getLinkedInSessionStateMock.mockResolvedValue(createSessionState());
+  getLinkedInSessionStateMock.mockResolvedValue(linkedinSession);
 
   render(<App />);
 
@@ -343,6 +345,28 @@ describe("App", () => {
     expect(await screen.findByText("Paper rules updated.")).toBeInTheDocument();
   });
 
+  it("autosaves newsroom settings after they change", async () => {
+    await renderLoadedApp();
+
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    fireEvent.change(screen.getByLabelText("Morning publish time"), {
+      target: { value: "09:15" }
+    });
+
+    await waitFor(() => {
+      expect(saveSettingsMock).toHaveBeenCalledWith({
+        ...DEFAULT_SETTINGS,
+        schedule: {
+          enabled: true,
+          timeOfDay: "09:15",
+          timezone: expect.any(String)
+        }
+      });
+    }, { timeout: 2000 });
+
+    expect(await screen.findByText("Settings autosaved.")).toBeInTheDocument();
+  });
+
   it("shows an empty archive state when there are no saved editions", async () => {
     await renderLoadedApp();
 
@@ -442,7 +466,7 @@ describe("App", () => {
     expect(screen.getByRole("img", { name: "Screenshot of the release UI" })).toBeInTheDocument();
   });
 
-  it("runs a manual sync when the X session is already open and hides it afterward", async () => {
+  it("runs a manual sync when the X session is already visible without re-hiding it", async () => {
     const freshEdition = createEdition({
       id: "edition-fresh",
       title: "Fresh issue",
@@ -476,13 +500,78 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Refresh edition" }));
 
     await waitFor(() => {
-      expect(openXSessionWindowMock).toHaveBeenCalledTimes(1);
       expect(runSyncMock).toHaveBeenCalledWith("manual");
-      expect(hideXSessionWindowMock).toHaveBeenCalledTimes(1);
     });
+
+    expect(openXSessionWindowMock).not.toHaveBeenCalled();
+    expect(hideXSessionWindowMock).not.toHaveBeenCalled();
 
     expect(await screen.findByRole("heading", { name: "Fresh issue" })).toBeInTheDocument();
     expect(screen.getByText("Showing Fresh issue.")).toBeInTheDocument();
+  });
+
+  it("only hides session windows that refresh temporarily opened", async () => {
+    const freshEdition = createEdition({
+      id: "edition-mixed-source-visibility",
+      title: "Mixed source visibility",
+      frontPageSummary: "Only the hidden session should be toggled."
+    });
+    const dualSourceSettings: UserSettings = {
+      ...DEFAULT_SETTINGS,
+      capture: {
+        ...DEFAULT_SETTINGS.capture,
+        sources: {
+          x: true,
+          linkedin: true
+        }
+      }
+    };
+
+    runSyncMock.mockResolvedValue(
+      createBootstrapState({
+        settings: dualSourceSettings,
+        editions: [freshEdition],
+        latestRun: {
+          id: "run-mixed-source-visibility",
+          startedAt: "2026-04-16T13:00:00Z",
+          finishedAt: "2026-04-16T13:01:00Z",
+          status: "success",
+          itemCount: 8,
+          keptCount: 4,
+          errorMessage: null,
+          editionId: freshEdition.id
+        }
+      })
+    );
+
+    await renderLoadedApp({
+      bootstrap: createBootstrapState({
+        settings: dualSourceSettings
+      }),
+      session: createSessionState({
+        isOpen: true,
+        isVisible: true,
+        isAuthenticated: true,
+        lastKnownUrl: "https://x.com/home"
+      }),
+      linkedinSession: createSessionState({
+        isOpen: true,
+        isVisible: false,
+        isAuthenticated: true,
+        lastKnownUrl: "https://www.linkedin.com/feed/"
+      })
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh edition" }));
+
+    await waitFor(() => {
+      expect(runSyncMock).toHaveBeenCalledWith("manual");
+    });
+
+    expect(openXSessionWindowMock).not.toHaveBeenCalled();
+    expect(hideXSessionWindowMock).not.toHaveBeenCalled();
+    expect(openLinkedInSessionWindowMock).toHaveBeenCalledTimes(1);
+    expect(hideLinkedInSessionWindowMock).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the current edition visible when a refresh finds no newer posts", async () => {
