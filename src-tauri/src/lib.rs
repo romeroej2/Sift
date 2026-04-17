@@ -4,14 +4,15 @@ mod services;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::panic;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::Utc;
 use db::Database;
 use models::{
-    BootstrapState, OAuthSession, PersistedXSession, PollStatus, UserSettings, XClientConfigDraft,
-    XConnectLaunch, XConnectPayload, XConnectPollResult, XSessionState,
+    BootstrapState, BrowserSessionState, OAuthSession, PersistedBrowserSession, PollStatus,
+    UserSettings, XClientConfigDraft, XConnectLaunch, XConnectPayload, XConnectPollResult,
 };
 use services::{
     FeedSource, LmStudioClient, LocalModelProvider, XClient, XSessionCapturePayload,
@@ -54,6 +55,9 @@ pub struct AppState {
     pub x_session_authenticated: Arc<RwLock<bool>>,
     pub x_session_last_known_url: Arc<RwLock<Option<String>>>,
     pub x_session_force_close: Arc<AtomicBool>,
+    pub linkedin_session_authenticated: Arc<RwLock<bool>>,
+    pub linkedin_session_last_known_url: Arc<RwLock<Option<String>>>,
+    pub linkedin_session_force_close: Arc<AtomicBool>,
     pub x_session_capture_requests: Arc<Mutex<HashMap<String, XSessionCaptureRequest>>>,
     pub sync_guard: Arc<Mutex<()>>,
     pub quit_requested: Arc<AtomicBool>,
@@ -69,6 +73,9 @@ impl AppState {
             x_session_authenticated: Arc::new(RwLock::new(false)),
             x_session_last_known_url: Arc::new(RwLock::new(None)),
             x_session_force_close: Arc::new(AtomicBool::new(false)),
+            linkedin_session_authenticated: Arc::new(RwLock::new(false)),
+            linkedin_session_last_known_url: Arc::new(RwLock::new(None)),
+            linkedin_session_force_close: Arc::new(AtomicBool::new(false)),
             x_session_capture_requests: Arc::new(Mutex::new(HashMap::new())),
             sync_guard: Arc::new(Mutex::new(())),
             quit_requested: Arc::new(AtomicBool::new(false)),
@@ -124,31 +131,54 @@ impl AppState {
         self.lm_studio_auth_token.read().await.clone()
     }
 
-    async fn x_session_state(&self) -> XSessionState {
-        let window = self.app.get_webview_window(X_SESSION_WINDOW_LABEL);
+    async fn browser_session_state(
+        &self,
+        window_label: &str,
+        authenticated: &RwLock<bool>,
+        last_known_url: &RwLock<Option<String>>,
+    ) -> BrowserSessionState {
+        let window = self.app.get_webview_window(window_label);
         let is_open = window.is_some();
         let is_visible = window
             .as_ref()
             .and_then(|window| window.is_visible().ok())
             .unwrap_or(false);
         let is_authenticated = if is_open {
-            *self.x_session_authenticated.read().await
+            *authenticated.read().await
         } else {
             false
         };
         let last_known_url = if is_open {
-            self.x_session_last_known_url.read().await.clone()
+            last_known_url.read().await.clone()
         } else {
             None
         };
 
-        XSessionState {
+        BrowserSessionState {
             is_open,
             is_visible,
             is_authenticated,
             last_known_url,
             mode: "native-webview".into(),
         }
+    }
+
+    async fn x_session_state(&self) -> BrowserSessionState {
+        self.browser_session_state(
+            X_SESSION_WINDOW_LABEL,
+            &self.x_session_authenticated,
+            &self.x_session_last_known_url,
+        )
+        .await
+    }
+
+    async fn linkedin_session_state(&self) -> BrowserSessionState {
+        self.browser_session_state(
+            LINKEDIN_SESSION_WINDOW_LABEL,
+            &self.linkedin_session_authenticated,
+            &self.linkedin_session_last_known_url,
+        )
+        .await
     }
 
     async fn remember_x_session(
@@ -158,7 +188,7 @@ impl AppState {
     ) -> Result<(), AppError> {
         *self.x_session_last_known_url.write().await = Some(last_known_url.clone());
         *self.x_session_authenticated.write().await = is_authenticated;
-        self.db.save_persisted_x_session(&PersistedXSession {
+        self.db.save_persisted_x_session(&PersistedBrowserSession {
             last_known_url,
             is_authenticated,
         })
@@ -173,6 +203,30 @@ impl AppState {
         self.clear_x_session_runtime().await;
         self.db.clear_persisted_x_session()
     }
+
+    async fn remember_linkedin_session(
+        &self,
+        last_known_url: String,
+        is_authenticated: bool,
+    ) -> Result<(), AppError> {
+        *self.linkedin_session_last_known_url.write().await = Some(last_known_url.clone());
+        *self.linkedin_session_authenticated.write().await = is_authenticated;
+        self.db
+            .save_persisted_linkedin_session(&PersistedBrowserSession {
+                last_known_url,
+                is_authenticated,
+            })
+    }
+
+    async fn clear_linkedin_session_runtime(&self) {
+        *self.linkedin_session_last_known_url.write().await = None;
+        *self.linkedin_session_authenticated.write().await = false;
+    }
+
+    async fn forget_linkedin_session(&self) -> Result<(), AppError> {
+        self.clear_linkedin_session_runtime().await;
+        self.db.clear_persisted_linkedin_session()
+    }
 }
 
 const X_SESSION_WINDOW_LABEL: &str = "x-session";
@@ -180,6 +234,10 @@ const X_SESSION_POPUP_LABEL_PREFIX: &str = "x-session-popup";
 const X_AUTH_POPUP_LABEL_PREFIX: &str = "x-auth-popup";
 const X_SESSION_HOME_URL: &str = "https://x.com/home";
 const X_SESSION_DATA_STORE_ID: [u8; 16] = *b"SIFTXSESSION0001";
+const LINKEDIN_SESSION_WINDOW_LABEL: &str = "linkedin-session";
+const LINKEDIN_SESSION_POPUP_LABEL_PREFIX: &str = "linkedin-session-popup";
+const LINKEDIN_SESSION_HOME_URL: &str = "https://www.linkedin.com/feed/";
+const LINKEDIN_SESSION_DATA_STORE_ID: [u8; 16] = *b"SIFTLINKEDIN0001";
 const X_SESSION_BRIDGE_SCRIPT: &str = r#"
 if (
   ["x.com", "www.x.com", "twitter.com", "www.twitter.com"].includes(window.location.hostname)
@@ -643,10 +701,9 @@ if (
     let lastTop = metricsBefore.top;
 
     for (let segment = 0; segment < segments; segment += 1) {
-      const remainingSegments = segments - segment;
       lastTop = await siftAnimateScrollTo(
         scroller,
-        lastTop + (perSegment * remainingSegments),
+        lastTop + perSegment,
         durationMs,
       );
       if (settleMs > 0 && segment < segments - 1) {
@@ -774,7 +831,7 @@ if (
         Math.max(Number(options.targetFreshItems) || 200, 80),
         maxItems,
       );
-      const maxPasses = Math.max(Number(options.maxPasses) || 120, 40);
+      const maxPasses = Math.max(Number(options.maxPasses) || 12, 1);
       const stableLimit = Math.max(Number(options.stablePasses) || 10, 4);
       const exhaustedLimit = Math.max(Number(options.exhaustedPasses) || 18, stableLimit + 4);
       const waitForAdvanceMs = Math.max(Number(options.waitForAdvanceMs) || 5000, 1500);
@@ -951,11 +1008,840 @@ if (
 }
 "#;
 
+const LINKEDIN_SESSION_BRIDGE_SCRIPT: &str = r#"
+if (
+  ["linkedin.com", "www.linkedin.com"].includes(window.location.hostname)
+  && !window.__SIFT_COLLECT_LINKEDIN_FEED__
+) {
+  const siftReadText = (node) =>
+    (node?.innerText || "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const siftWait = (ms) =>
+    new Promise((resolve) => window.setTimeout(resolve, ms));
+
+  const siftDateKey = (value, timeZone) => {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+      return null;
+    }
+
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(date);
+    const year = parts.find((part) => part.type === "year")?.value;
+    const month = parts.find((part) => part.type === "month")?.value;
+    const day = parts.find((part) => part.type === "day")?.value;
+    return year && month && day ? `${year}-${month}-${day}` : null;
+  };
+
+  const siftControlIcons = {
+    hide:
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3l18 18"></path><path d="M10.58 10.58A3 3 0 0 0 9 12a3 3 0 0 0 5.33 1.82"></path><path d="M9.88 5.09A10.94 10.94 0 0 1 12 4.91c5 0 9.27 3.11 11 7.5a11.8 11.8 0 0 1-3.29 4.68"></path><path d="M6.61 6.61A11.81 11.81 0 0 0 1 12.41a11.84 11.84 0 0 0 4.26 5.1"></path></svg>',
+    logout:
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><path d="M16 17l5-5-5-5"></path><path d="M21 12H9"></path></svg>',
+  };
+
+  const siftEnsureSessionControls = () => {
+    if (!window.__TAURI_INTERNALS__?.invoke) {
+      return;
+    }
+
+    if (!document.getElementById("sift-linkedin-session-controls-style")) {
+      const style = document.createElement("style");
+      style.id = "sift-linkedin-session-controls-style";
+      style.textContent = `
+        #sift-linkedin-session-controls {
+          position: fixed;
+          right: max(16px, env(safe-area-inset-right));
+          bottom: max(16px, env(safe-area-inset-bottom));
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          padding: 10px;
+          border-radius: 999px;
+          background: rgba(14, 25, 44, 0.88);
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          box-shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
+          backdrop-filter: blur(18px);
+          z-index: 2147483647;
+          color: #f5f7fa;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+        .sift-linkedin-session-controls__badge {
+          font-size: 11px;
+          letter-spacing: 0.18em;
+          text-transform: uppercase;
+          color: rgba(245, 247, 250, 0.72);
+          padding-inline: 4px 2px;
+        }
+        .sift-linkedin-session-controls__button {
+          width: 36px;
+          height: 36px;
+          border: 0;
+          border-radius: 999px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          background: rgba(255, 255, 255, 0.08);
+          color: inherit;
+          cursor: pointer;
+        }
+        .sift-linkedin-session-controls__button--danger {
+          background: rgba(205, 76, 76, 0.18);
+          color: #ffd7d7;
+        }
+        .sift-linkedin-session-controls__button svg {
+          width: 18px;
+          height: 18px;
+          pointer-events: none;
+        }
+      `;
+      (document.head || document.documentElement).appendChild(style);
+    }
+
+    const attach = () => {
+      if (!document.body || document.getElementById("sift-linkedin-session-controls")) {
+        return;
+      }
+
+      const dock = document.createElement("div");
+      dock.id = "sift-linkedin-session-controls";
+
+      const badge = document.createElement("span");
+      badge.className = "sift-linkedin-session-controls__badge";
+      badge.textContent = "SIFT";
+      dock.appendChild(badge);
+
+      const buildButton = (command, label, icon, requiresConfirm = false) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "sift-linkedin-session-controls__button";
+        if (requiresConfirm) {
+          button.classList.add("sift-linkedin-session-controls__button--danger");
+        }
+        button.setAttribute("aria-label", label);
+        button.setAttribute("title", label);
+        button.innerHTML = icon;
+        button.addEventListener("click", async (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (requiresConfirm && !window.confirm("Log out of LinkedIn in SIFT and clear this browser session?")) {
+            return;
+          }
+          if (command === "hide_linkedin_session_window") {
+            try {
+              window.close();
+            } catch {
+              // Ignore window.close() failures in browser sessions.
+            }
+          }
+          try {
+            await window.__TAURI_INTERNALS__.invoke(command, {});
+          } catch (error) {
+            console.error("[SIFT] LinkedIn session control failed.", error);
+          }
+        }, true);
+        return button;
+      };
+
+      dock.appendChild(buildButton("hide_linkedin_session_window", "Hide this LinkedIn window", siftControlIcons.hide));
+      dock.appendChild(buildButton("logout_linkedin_session_window", "Log out of LinkedIn in SIFT", siftControlIcons.logout, true));
+      document.body.appendChild(dock);
+    };
+
+    if (document.body) {
+      attach();
+    } else {
+      window.setTimeout(attach, 200);
+    }
+  };
+
+  const siftFeedSelector = "main article";
+  const siftFallbackFeedSelectors = [
+    "main article",
+    'main [data-id^="urn:li:activity:"]',
+    'main [data-urn^="urn:li:activity:"]',
+    "main .occludable-update",
+    "main .feed-shared-update-v2",
+    "main [data-finite-scroll-hotkey-item]",
+    'main a[href*="/feed/update/"]',
+    'main a[href*="/posts/"]',
+    'main a[href*="/activity-"]',
+  ];
+  const siftFeedSurfaceSelectors = [
+    "main .scaffold-finite-scroll",
+    "main [data-finite-scroll-hotkey-context]",
+    "main .share-box-feed-entry__trigger",
+    'main button[aria-label*="Start a post"]',
+    "main .feed-sort-dropdown",
+  ];
+  const siftFeedSurfaceTextSignals = [
+    "Start a post",
+    "Sort by: Top",
+    "Sort by Top",
+    "New posts",
+  ];
+
+  const siftFeedElements = (selector = siftFeedSelector) => {
+    const directMatches = Array.from(document.querySelectorAll(selector)).filter(
+      (node) => node instanceof Element,
+    );
+    if (directMatches.length > 0) {
+      return directMatches;
+    }
+
+    const fallbackMatches = [];
+    const seen = new Set();
+    const siftRememberCandidate = (node) => {
+      if (!(node instanceof Element)) {
+        return;
+      }
+
+      const container =
+        siftFindPostContainer(node)
+        || node.closest(
+          'article, .occludable-update, .feed-shared-update-v2, [data-id^="urn:li:activity:"], [data-urn^="urn:li:activity:"], [data-finite-scroll-hotkey-item]',
+        )
+        || node;
+      if (!(container instanceof Element) || seen.has(container)) {
+        return;
+      }
+
+      seen.add(container);
+      fallbackMatches.push(container);
+    };
+
+    for (const fallbackSelector of siftFallbackFeedSelectors) {
+      document.querySelectorAll(fallbackSelector).forEach((node) => {
+        siftRememberCandidate(node);
+      });
+    }
+
+    if (fallbackMatches.length === 0) {
+      Array.from(document.querySelectorAll("main div, main section, main li")).slice(0, 800).forEach((node) => {
+        const text = siftReadText(node);
+        if (!text || text.length < 40) {
+          return;
+        }
+        if (!/Like/i.test(text) || !/Comment/i.test(text)) {
+          return;
+        }
+        siftRememberCandidate(node);
+      });
+    }
+
+    return fallbackMatches;
+  };
+
+  const siftFeedSurfaceReady = (selector = siftFeedSelector) =>
+    siftFeedElements(selector).length > 0
+    || siftFeedSurfaceSelectors.some((surfaceSelector) => document.querySelector(surfaceSelector))
+    || siftFeedSurfaceTextSignals.some((signal) => siftReadText(document.body).includes(signal));
+
+  const siftSharedUrls = (article) => {
+    const urls = new Set();
+    Array.from(article.querySelectorAll("a[href]")).forEach((link) => {
+      const href = link.getAttribute("href") || "";
+      try {
+        const url = new URL(href, window.location.origin);
+        if (!["http:", "https:"].includes(url.protocol)) {
+          return;
+        }
+        if (["linkedin.com", "www.linkedin.com"].includes(url.hostname)) {
+          return;
+        }
+        url.hash = "";
+        urls.add(url.toString());
+      } catch {
+        // Ignore malformed DOM hrefs while scraping.
+      }
+    });
+    return Array.from(urls);
+  };
+
+  const siftLinkedInActivityId = (value) => {
+    if (!value) {
+      return null;
+    }
+
+    return (
+      value.match(/urn:li:activity:(\d+)/)?.[1]
+      || value.match(/activity-(\d+)/)?.[1]
+      || value.match(/posts\/[^/]+-(\d+)/)?.[1]
+      || null
+    );
+  };
+
+  const siftPostUrl = (article) => {
+    const selectors = [
+      'a[href*="/feed/update/"]',
+      'a[href*="/posts/"]',
+      'a[href*="/activity-"]',
+    ];
+    for (const selector of selectors) {
+      const link = article.querySelector(selector);
+      const href = link?.getAttribute("href") || "";
+      if (href) {
+        try {
+          return new URL(href, window.location.origin).toString();
+        } catch {
+          // Ignore malformed post URLs while scraping.
+        }
+      }
+    }
+
+    const hrefs = Array.from(article.querySelectorAll("a[href]"))
+      .map((link) => link.getAttribute("href") || "")
+      .filter(Boolean);
+    for (const href of hrefs) {
+      try {
+        const url = new URL(href, window.location.origin);
+        const decoded = decodeURIComponent(url.toString());
+        if (siftLinkedInActivityId(decoded)) {
+          url.hash = "";
+          return url.toString();
+        }
+      } catch {
+        // Ignore malformed post URLs while scraping.
+      }
+    }
+
+    const activityId =
+      siftLinkedInActivityId(article.getAttribute("data-id") || "")
+      || siftLinkedInActivityId(article.getAttribute("data-urn") || "")
+      || siftLinkedInActivityId(article.querySelector("[data-id]")?.getAttribute("data-id") || "")
+      || siftLinkedInActivityId(article.querySelector("[data-urn]")?.getAttribute("data-urn") || "");
+    if (activityId) {
+      return `https://www.linkedin.com/feed/update/urn:li:activity:${activityId}/`;
+    }
+
+    return null;
+  };
+
+  const siftLooksLikeLinkedInUiNoise = (value, authorName) => {
+    if (!value) {
+      return true;
+    }
+
+    const normalized = value.replace(/\s+/g, " ").trim();
+    if (!normalized) {
+      return true;
+    }
+
+    if (authorName && normalized === authorName) {
+      return true;
+    }
+
+    return (
+      /^(Like|Comment|Repost|Send|Follow|Message|Messaging|Reactivate|Home|My Network|Jobs|Notifications|Me|For Business|Premium|Search|Show translation|Start a post|Sort by:? Top|Video|Photo|Write article)$/i.test(normalized)
+      || /^\d+\s+(comments?|reposts?|likes?)\b/i.test(normalized)
+      || /\bcomments?\b\s*[•·]\s*\d+\s+reposts?\b/i.test(normalized)
+      || /^view all recommendations/i.test(normalized)
+      || /^about accessibility help center/i.test(normalized)
+      || /^privacy\s*&\s*terms/i.test(normalized)
+      || /^get the linkedin app/i.test(normalized)
+    );
+  };
+
+  const siftFallbackPostText = (article, authorName, minimumLength = 40) => {
+    const candidates = [];
+    Array.from(article.querySelectorAll("span, p, div")).forEach((node) => {
+      const text = siftReadText(node);
+      if (!text || text.length < minimumLength || siftLooksLikeLinkedInUiNoise(text, authorName)) {
+        return;
+      }
+      candidates.push(text);
+    });
+
+    const articleText = siftReadText(article);
+    if (articleText && articleText.length >= minimumLength && !siftLooksLikeLinkedInUiNoise(articleText, authorName)) {
+      candidates.push(articleText);
+    }
+
+    candidates.sort((left, right) => right.length - left.length);
+    return candidates[0] || "";
+  };
+
+  const siftLooksLikePostContainer = (element) => {
+    if (!(element instanceof Element) || element.matches("main")) {
+      return false;
+    }
+
+    const text = siftReadText(element);
+    if (!text || text.length < 40 || text.length > 6000) {
+      return false;
+    }
+
+    const hasActionText = /Like/i.test(text) && /Comment/i.test(text);
+    const hasPostLink = !!element.querySelector('a[href*="/feed/update/"], a[href*="/posts/"], a[href*="/activity-"]');
+    const hasIdentity =
+      !!element.querySelector(".update-components-actor__name, .feed-shared-actor__name, a[href*=\"/in/\"], a[href*=\"/company/\"]")
+      || !!element.querySelector("time");
+
+    return (hasActionText || hasPostLink) && (hasIdentity || hasPostLink);
+  };
+
+  const siftFindPostContainer = (node) => {
+    let current = node instanceof Element ? node : null;
+    let best = null;
+
+    while (current instanceof Element && !current.matches("main")) {
+      if (siftLooksLikePostContainer(current)) {
+        best = current;
+      }
+      current = current.parentElement;
+    }
+
+    return best;
+  };
+
+  const siftLinkedInPostCandidates = (article) => {
+    const candidates = [];
+    let node = article;
+
+    while (node instanceof Element && candidates.length < 8) {
+      candidates.push(node);
+      if (node.matches("main")) {
+        break;
+      }
+      node = node.parentElement;
+    }
+
+    return candidates;
+  };
+
+  const siftParseLinkedInPost = (article) => {
+    let target = article;
+    let sourceUrl = null;
+    let authorName = "LinkedIn author";
+    let text = "";
+    const fallbackKey = siftFeedElementKey(article);
+
+    for (const candidate of siftLinkedInPostCandidates(article)) {
+      const candidateAuthorName =
+        siftReadText(
+          candidate.querySelector(".update-components-actor__name")
+          || candidate.querySelector(".feed-shared-actor__name")
+        )
+        || authorName;
+      const textNode =
+        candidate.querySelector('[data-test-id="main-feed-activity-card__commentary"]')
+        || candidate.querySelector(".update-components-text")
+        || candidate.querySelector(".feed-shared-update-v2__description")
+        || candidate.querySelector(".feed-shared-inline-show-more-text")
+        || candidate.querySelector(".update-components-update-v2__commentary");
+      const candidateText = siftReadText(textNode) || siftFallbackPostText(candidate, candidateAuthorName);
+      const candidateSourceUrl = siftPostUrl(candidate);
+
+      if (!authorName || authorName === "LinkedIn author") {
+        authorName = candidateAuthorName;
+      }
+      if (!text && candidateText) {
+        text = candidateText;
+      }
+      if (!sourceUrl && candidateSourceUrl) {
+        sourceUrl = candidateSourceUrl;
+        target = candidate;
+      }
+
+      if (candidateSourceUrl && candidateText) {
+        sourceUrl = candidateSourceUrl;
+        authorName = candidateAuthorName;
+        text = candidateText;
+        target = candidate;
+        break;
+      }
+    }
+
+    if (!text) {
+      text = siftFallbackPostText(target, authorName, 12);
+    }
+    if (!sourceUrl && fallbackKey) {
+      const fallbackActivityId = siftLinkedInActivityId(fallbackKey);
+      sourceUrl = fallbackActivityId
+        ? `https://www.linkedin.com/feed/update/urn:li:activity:${fallbackActivityId}/`
+        : `${window.location.origin}/feed/#${encodeURIComponent(fallbackKey.slice(0, 120))}`;
+    }
+    if (!sourceUrl || !text) {
+      return null;
+    }
+
+    const idMatch = siftLinkedInActivityId(sourceUrl);
+    const handleSource =
+      target.querySelector('a[href*="/in/"]')?.getAttribute("href")
+      || target.querySelector('a[href*="/company/"]')?.getAttribute("href")
+      || "";
+    const handleMatch = handleSource.match(/\/(?:in|company)\/([^/?#]+)/);
+    const socialContext =
+      siftReadText(
+        target.querySelector(".update-components-header__text-view")
+        || target.querySelector(".feed-shared-social-action-bar__text-view")
+        || target.querySelector(".feed-shared-social-action-bar")
+      )
+      || null;
+    const postedAt =
+      target.querySelector("time")?.getAttribute("datetime")
+      || new Date().toISOString();
+    return {
+      id: idMatch || sourceUrl,
+      authorName,
+      authorHandle: handleMatch?.[1] || authorName.toLowerCase().replace(/[^a-z0-9]+/g, "-"),
+      text,
+      sourceUrl,
+      postedAt,
+      isRepost: /\breposted this\b/i.test(socialContext || ""),
+      isReply: false,
+      socialContext,
+      sharedUrls: siftSharedUrls(target),
+      media: [],
+    };
+  };
+
+  const siftCollectVisiblePosts = (selector, collected) => {
+    siftFeedElements(selector).forEach((article) => {
+      const parsed = siftParseLinkedInPost(article);
+      if (parsed) {
+        collected.set(parsed.id, parsed);
+      }
+    });
+  };
+
+  const siftFeedElementKey = (article) => {
+    if (!(article instanceof Element)) {
+      return null;
+    }
+
+    const attributeKey =
+      article.getAttribute("data-id")
+      || article.getAttribute("data-urn")
+      || article.querySelector("[data-id]")?.getAttribute("data-id")
+      || article.querySelector("[data-urn]")?.getAttribute("data-urn");
+    if (attributeKey) {
+      return attributeKey;
+    }
+
+    const sourceUrl = siftPostUrl(article);
+    if (sourceUrl) {
+      return sourceUrl;
+    }
+
+    const publishedAt = article.querySelector("time")?.getAttribute("datetime");
+    if (publishedAt) {
+      return `time:${publishedAt}`;
+    }
+
+    const preview = siftReadText(article).slice(0, 160);
+    return preview ? `text:${preview}` : null;
+  };
+
+  const siftVisiblePostIds = (selector) => {
+    const ids = new Set();
+    siftFeedElements(selector).forEach((article) => {
+      const key = siftFeedElementKey(article);
+      if (key) {
+        ids.add(key);
+      }
+    });
+    return ids;
+  };
+
+  const siftReadScrollMetrics = (scroller) => {
+    const root = document.scrollingElement || document.documentElement;
+    if (!scroller || scroller === root || scroller === document.documentElement || scroller === document.body) {
+      return {
+        top: window.scrollY || root.scrollTop || 0,
+        height: root.scrollHeight || document.documentElement.scrollHeight || 0,
+        clientHeight: window.innerHeight || root.clientHeight || document.documentElement.clientHeight || 0,
+      };
+    }
+
+    return {
+      top: scroller.scrollTop,
+      height: scroller.scrollHeight,
+      clientHeight: scroller.clientHeight || window.innerHeight || 0,
+    };
+  };
+
+  const siftScrollFeedTo = (scroller, top) => {
+    const root = document.scrollingElement || document.documentElement;
+    if (!scroller || scroller === root || scroller === document.documentElement || scroller === document.body) {
+      window.scrollTo(0, top);
+      return;
+    }
+
+    if (typeof scroller.scrollTo === "function") {
+      scroller.scrollTo({ top, behavior: "auto" });
+      return;
+    }
+
+    scroller.scrollTop = top;
+  };
+
+  const siftMaxScrollTop = (scroller) => {
+    const metrics = siftReadScrollMetrics(scroller);
+    return Math.max(metrics.height - metrics.clientHeight, 0);
+  };
+
+  const siftClampScrollTop = (scroller, top) =>
+    Math.max(0, Math.min(Number(top) || 0, siftMaxScrollTop(scroller)));
+
+  const siftAnimateScrollTo = async (scroller, top, durationMs = 280) => {
+    const startTop = siftReadScrollMetrics(scroller).top;
+    const targetTop = siftClampScrollTop(scroller, top);
+    const distance = targetTop - startTop;
+    if (Math.abs(distance) < 4) {
+      siftScrollFeedTo(scroller, targetTop);
+      return targetTop;
+    }
+
+    const startedAt = Date.now();
+    const totalDuration = Math.max(durationMs, 120);
+    while (true) {
+      const elapsed = Date.now() - startedAt;
+      const progress = Math.min(elapsed / totalDuration, 1);
+      const eased = 1 - Math.pow(1 - progress, 3);
+      siftScrollFeedTo(scroller, startTop + (distance * eased));
+      if (progress >= 1) {
+        break;
+      }
+      await siftWait(16);
+    }
+
+    siftScrollFeedTo(scroller, targetTop);
+    return targetTop;
+  };
+
+  const siftAdvanceFeed = async (selector, scroller, distance, options = {}) => {
+    const segments = Math.max(Number(options.segments) || 2, 1);
+    const durationMs = Math.max(Number(options.durationMs) || 280, 120);
+    const settleMs = Math.max(Number(options.settleMs) || 140, 0);
+    const visibleIdsBefore = siftVisiblePostIds(selector);
+    const metricsBefore = siftReadScrollMetrics(scroller);
+    const perSegment = distance / segments;
+    let lastTop = metricsBefore.top;
+
+    for (let segment = 0; segment < segments; segment += 1) {
+      lastTop = await siftAnimateScrollTo(
+        scroller,
+        lastTop + perSegment,
+        durationMs,
+      );
+      if (settleMs > 0 && segment < segments - 1) {
+        await siftWait(settleMs);
+      }
+    }
+
+    return {
+      previousHeight: metricsBefore.height,
+      previousIds: visibleIdsBefore,
+      top: lastTop,
+    };
+  };
+
+  const siftFindFeedScroller = (selector) => {
+    const root = document.scrollingElement || document.documentElement;
+    const firstPost = siftFeedElements(selector)[0] || null;
+    const candidates = [];
+    const seen = new Set();
+
+    let node = firstPost;
+    while (node instanceof Element) {
+      candidates.push(node);
+      node = node.parentElement;
+    }
+
+    [
+      firstPost instanceof Element ? firstPost.closest(".scaffold-finite-scroll") : null,
+      firstPost instanceof Element ? firstPost.closest('[data-finite-scroll-hotkey-context]') : null,
+      firstPost instanceof Element ? firstPost.closest(".scaffold-layout__main") : null,
+      firstPost instanceof Element ? firstPost.closest("main") : null,
+      document.querySelector(".scaffold-finite-scroll"),
+      document.querySelector('[data-finite-scroll-hotkey-context]'),
+      document.querySelector(".scaffold-layout__main"),
+      document.querySelector("main"),
+      root,
+      document.documentElement,
+    ].forEach((candidate) => {
+      if (candidate) {
+        candidates.push(candidate);
+      }
+    });
+
+    for (const candidate of candidates) {
+      if (!candidate || seen.has(candidate)) {
+        continue;
+      }
+      seen.add(candidate);
+
+      const metrics = siftReadScrollMetrics(candidate);
+      const isRootCandidate =
+        candidate === root || candidate === document.documentElement || candidate === document.body;
+      const overflowY =
+        candidate instanceof Element
+          ? window.getComputedStyle(candidate).overflowY || ""
+          : "";
+      if ((isRootCandidate || /(auto|scroll|overlay)/.test(overflowY)) && metrics.height > metrics.clientHeight + 240) {
+        return candidate;
+      }
+    }
+
+    return root;
+  };
+
+  const siftWaitForFeedAdvance = async (selector, scroller, previousIds, previousHeight, timeoutMs) => {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      await siftWait(250);
+      const metrics = siftReadScrollMetrics(scroller);
+      if (metrics.height > previousHeight + 48) {
+        return true;
+      }
+
+      const currentIds = siftVisiblePostIds(selector);
+      for (const id of currentIds) {
+        if (!previousIds.has(id)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  siftEnsureSessionControls();
+
+  window.__SIFT_COLLECT_LINKEDIN_FEED__ = async (requestId, options = {}) => {
+    try {
+      if (!/^\/feed(?:$|[/?#])/.test(window.location.pathname)) {
+        throw new Error("LinkedIn session is not on the home feed yet.");
+      }
+
+      const timeZone = options.timeZone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+      const editionDate = options.editionDate || siftDateKey(new Date().toISOString(), timeZone);
+      const sinceTimestamp = options.sinceTimestamp ? new Date(options.sinceTimestamp) : null;
+      const hasSinceTimestamp = sinceTimestamp instanceof Date && !Number.isNaN(sinceTimestamp.getTime());
+      const maxItems = Math.min(Math.max(Number(options.maxItems) || 400, 100), 800);
+      const maxPasses = Math.max(Number(options.maxPasses) || 8, 1);
+      const waitForAdvanceMs = Math.max(Number(options.waitForAdvanceMs) || 4000, 1200);
+      const deadline = Date.now() + 20000;
+      while (Date.now() < deadline && !siftFeedSurfaceReady(siftFeedSelector)) {
+        await siftWait(250);
+      }
+
+      if (!siftFeedSurfaceReady(siftFeedSelector)) {
+        throw new Error("Timed out waiting for the LinkedIn home feed to render.");
+      }
+
+      const collected = new Map();
+      let scroller = siftFindFeedScroller(siftFeedSelector);
+      siftScrollFeedTo(scroller, 0);
+      await siftWait(750);
+      for (let attempt = 0; attempt < 3 && siftFeedElements(siftFeedSelector).length === 0; attempt += 1) {
+        await siftAdvanceFeed(
+          siftFeedSelector,
+          scroller,
+          Math.max(siftReadScrollMetrics(scroller).clientHeight * (0.42 + (attempt * 0.12)), 320 + (attempt * 120)),
+          {
+            segments: 1,
+            durationMs: 220,
+            settleMs: 0,
+          },
+        );
+        await siftWait(400);
+        scroller = siftFindFeedScroller(siftFeedSelector);
+      }
+      const siftIsFresh = (item) => {
+        if (hasSinceTimestamp) {
+          const posted = new Date(item.postedAt);
+          if (Number.isNaN(posted.getTime())) {
+            return true;
+          }
+          return posted > sinceTimestamp;
+        }
+        if (!editionDate) {
+          return true;
+        }
+        return siftDateKey(item.postedAt, timeZone) === editionDate;
+      };
+
+      for (let pass = 0; pass < maxPasses; pass += 1) {
+        siftCollectVisiblePosts(siftFeedSelector, collected);
+        const itemCount = collected.size;
+        const freshCount = Array.from(collected.values()).filter((item) => siftIsFresh(item)).length;
+        await window.__TAURI_INTERNALS__.invoke("submit_linkedin_feed_capture_progress", {
+          progress: {
+            requestId,
+            currentUrl: window.location.href,
+            pass: pass + 1,
+            totalPasses: maxPasses,
+            itemCount,
+            freshCount,
+            stablePasses: 0,
+            exhaustedPasses: 0,
+            boundaryPasses: 0,
+          },
+        }).catch(() => undefined);
+
+        if (itemCount >= maxItems) {
+          break;
+        }
+
+        const baseScrollStep = Math.max(siftReadScrollMetrics(scroller).clientHeight * 0.92, 720);
+        const advance = await siftAdvanceFeed(siftFeedSelector, scroller, baseScrollStep, {
+          segments: 3,
+          durationMs: 320,
+          settleMs: 120,
+        });
+        const advanced = await siftWaitForFeedAdvance(
+          siftFeedSelector,
+          scroller,
+          advance.previousIds,
+          advance.previousHeight,
+          waitForAdvanceMs,
+        );
+        if (!advanced) {
+          break;
+        }
+
+        scroller = siftFindFeedScroller(siftFeedSelector);
+      }
+
+      siftScrollFeedTo(scroller, 0);
+      await window.__TAURI_INTERNALS__.invoke("submit_linkedin_feed_capture", {
+        capture: {
+          requestId,
+          currentUrl: window.location.href,
+          items: Array.from(collected.values()),
+          error: null,
+        },
+      });
+    } catch (error) {
+      await window.__TAURI_INTERNALS__.invoke("submit_linkedin_feed_capture", {
+        capture: {
+          requestId,
+          currentUrl: window.location.href,
+          items: [],
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
+    }
+  };
+}
+"#;
+
 fn is_x_domain(url: &Url) -> bool {
     matches!(
         url.host_str(),
         Some("x.com" | "www.x.com" | "twitter.com" | "www.twitter.com")
     )
+}
+
+fn is_linkedin_domain(url: &Url) -> bool {
+    matches!(url.host_str(), Some("linkedin.com" | "www.linkedin.com"))
 }
 
 fn is_google_auth_url(url: &Url) -> bool {
@@ -968,6 +1854,10 @@ fn is_x_session_related_label(label: &str) -> bool {
         || label.starts_with(X_AUTH_POPUP_LABEL_PREFIX)
 }
 
+fn is_linkedin_session_related_label(label: &str) -> bool {
+    label == LINKEDIN_SESSION_WINDOW_LABEL || label.starts_with(LINKEDIN_SESSION_POPUP_LABEL_PREFIX)
+}
+
 fn x_session_window_labels(app: &tauri::AppHandle) -> Vec<String> {
     app.webview_windows()
         .into_keys()
@@ -975,8 +1865,25 @@ fn x_session_window_labels(app: &tauri::AppHandle) -> Vec<String> {
         .collect()
 }
 
+fn linkedin_session_window_labels(app: &tauri::AppHandle) -> Vec<String> {
+    app.webview_windows()
+        .into_keys()
+        .filter(|label| is_linkedin_session_related_label(label))
+        .collect()
+}
+
 fn close_x_session_windows(app: &tauri::AppHandle) -> Result<(), String> {
     for label in x_session_window_labels(app) {
+        if let Some(window) = app.get_webview_window(&label) {
+            window.close().map_err(|error| error.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
+fn close_linkedin_session_windows(app: &tauri::AppHandle) -> Result<(), String> {
+    for label in linkedin_session_window_labels(app) {
         if let Some(window) = app.get_webview_window(&label) {
             window.close().map_err(|error| error.to_string())?;
         }
@@ -1000,11 +1907,22 @@ fn default_x_session_url() -> Url {
     Url::parse(X_SESSION_HOME_URL).expect("valid x home url")
 }
 
+fn default_linkedin_session_url() -> Url {
+    Url::parse(LINKEDIN_SESSION_HOME_URL).expect("valid linkedin home url")
+}
+
 fn resolve_x_session_launch_url(saved_url: Option<&str>) -> Url {
     saved_url
         .and_then(|raw| Url::parse(raw).ok())
         .filter(is_x_domain)
         .unwrap_or_else(default_x_session_url)
+}
+
+fn resolve_linkedin_session_launch_url(saved_url: Option<&str>) -> Url {
+    saved_url
+        .and_then(|raw| Url::parse(raw).ok())
+        .filter(is_linkedin_domain)
+        .unwrap_or_else(default_linkedin_session_url)
 }
 
 fn build_x_session_window(
@@ -1101,6 +2019,82 @@ fn build_x_session_window(
     .map_err(|error| error.to_string())
 }
 
+fn is_completed_linkedin_session_url(url: &Url) -> bool {
+    if !is_linkedin_domain(url) {
+        return false;
+    }
+
+    !url.path().starts_with("/login")
+        && !url.path().starts_with("/checkpoint")
+        && !url.path().starts_with("/signup")
+}
+
+fn build_linkedin_session_window(
+    app: &tauri::AppHandle,
+    state: AppState,
+    initial_url: Url,
+    is_visible: bool,
+    focus_window: bool,
+) -> Result<tauri::WebviewWindow, String> {
+    let popup_app = app.clone();
+    let page_state = state.clone();
+
+    WebviewWindowBuilder::new(
+        app,
+        LINKEDIN_SESSION_WINDOW_LABEL,
+        WebviewUrl::External(initial_url),
+    )
+    .data_store_identifier(LINKEDIN_SESSION_DATA_STORE_ID)
+    .title("SIFT LinkedIn Session")
+    .inner_size(1320.0, 900.0)
+    .min_inner_size(980.0, 700.0)
+    .resizable(true)
+    .visible(is_visible)
+    .focused(focus_window)
+    .background_throttling(BackgroundThrottlingPolicy::Disabled)
+    .center()
+    .prevent_overflow()
+    .initialization_script(LINKEDIN_SESSION_BRIDGE_SCRIPT)
+    .on_new_window(move |url, features| {
+        let popup_label = format!("{LINKEDIN_SESSION_POPUP_LABEL_PREFIX}-{}", Uuid::new_v4());
+
+        let popup_window = WebviewWindowBuilder::new(
+            &popup_app,
+            popup_label,
+            WebviewUrl::External(Url::parse("about:blank").expect("valid popup url")),
+        )
+        .data_store_identifier(LINKEDIN_SESSION_DATA_STORE_ID)
+        .window_features(features)
+        .title(url.as_str())
+        .on_document_title_changed(|window, title| {
+            let _ = window.set_title(&title);
+        })
+        .build()
+        .expect("linkedin session popup window");
+
+        tauri::webview::NewWindowResponse::Create {
+            window: popup_window,
+        }
+    })
+    .on_page_load(move |_window, payload| {
+        if payload.event() == tauri::webview::PageLoadEvent::Finished {
+            let page_state = page_state.clone();
+            let url = payload.url().to_string();
+            let is_authenticated = is_completed_linkedin_session_url(payload.url());
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = page_state
+                    .remember_linkedin_session(url, is_authenticated)
+                    .await
+                {
+                    eprintln!("failed to persist LinkedIn session page state: {error}");
+                }
+            });
+        }
+    })
+    .build()
+    .map_err(|error| error.to_string())
+}
+
 fn restore_x_session_window(state: &AppState) -> Result<(), AppError> {
     let Some(saved_session) = state.db.load_persisted_x_session()? else {
         return Ok(());
@@ -1118,11 +2112,40 @@ fn restore_x_session_window(state: &AppState) -> Result<(), AppError> {
     let initial_url_string = initial_url.to_string();
     *state.x_session_last_known_url.blocking_write() = Some(initial_url_string.clone());
     *state.x_session_authenticated.blocking_write() = saved_session.is_authenticated;
-    state.db.save_persisted_x_session(&PersistedXSession {
+    state.db.save_persisted_x_session(&PersistedBrowserSession {
         last_known_url: initial_url_string,
         is_authenticated: saved_session.is_authenticated,
     })?;
     build_x_session_window(&state.app, state.clone(), initial_url, false, false)
+        .map_err(AppError::Message)?;
+    Ok(())
+}
+
+fn restore_linkedin_session_window(state: &AppState) -> Result<(), AppError> {
+    let Some(saved_session) = state.db.load_persisted_linkedin_session()? else {
+        return Ok(());
+    };
+
+    if state
+        .app
+        .get_webview_window(LINKEDIN_SESSION_WINDOW_LABEL)
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let initial_url =
+        resolve_linkedin_session_launch_url(Some(saved_session.last_known_url.as_str()));
+    let initial_url_string = initial_url.to_string();
+    *state.linkedin_session_last_known_url.blocking_write() = Some(initial_url_string.clone());
+    *state.linkedin_session_authenticated.blocking_write() = saved_session.is_authenticated;
+    state
+        .db
+        .save_persisted_linkedin_session(&PersistedBrowserSession {
+            last_known_url: initial_url_string,
+            is_authenticated: saved_session.is_authenticated,
+        })?;
+    build_linkedin_session_window(&state.app, state.clone(), initial_url, false, false)
         .map_err(AppError::Message)?;
     Ok(())
 }
@@ -1147,12 +2170,23 @@ async fn save_settings(
 }
 
 #[tauri::command]
-async fn get_x_session_state(state: tauri::State<'_, AppState>) -> Result<XSessionState, String> {
+async fn get_x_session_state(
+    state: tauri::State<'_, AppState>,
+) -> Result<BrowserSessionState, String> {
     Ok(state.x_session_state().await)
 }
 
 #[tauri::command]
-async fn open_x_session_window(state: tauri::State<'_, AppState>) -> Result<XSessionState, String> {
+async fn get_linkedin_session_state(
+    state: tauri::State<'_, AppState>,
+) -> Result<BrowserSessionState, String> {
+    Ok(state.linkedin_session_state().await)
+}
+
+#[tauri::command]
+async fn open_x_session_window(
+    state: tauri::State<'_, AppState>,
+) -> Result<BrowserSessionState, String> {
     if let Some(window) = state.app.get_webview_window(X_SESSION_WINDOW_LABEL) {
         let _ = window.show();
         let _ = window.set_focus();
@@ -1187,9 +2221,51 @@ async fn open_x_session_window(state: tauri::State<'_, AppState>) -> Result<XSes
 }
 
 #[tauri::command]
+async fn open_linkedin_session_window(
+    state: tauri::State<'_, AppState>,
+) -> Result<BrowserSessionState, String> {
+    if let Some(window) = state.app.get_webview_window(LINKEDIN_SESSION_WINDOW_LABEL) {
+        let _ = window.show();
+        let _ = window.set_focus();
+        return Ok(state.linkedin_session_state().await);
+    }
+
+    let saved_session = state
+        .db
+        .load_persisted_linkedin_session()
+        .map_err(|error| error.to_string())?;
+    let initial_url = resolve_linkedin_session_launch_url(
+        saved_session
+            .as_ref()
+            .map(|session| session.last_known_url.as_str()),
+    );
+    let is_authenticated = saved_session
+        .as_ref()
+        .is_some_and(|session| session.is_authenticated);
+
+    state
+        .remember_linkedin_session(initial_url.to_string(), is_authenticated)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let window = build_linkedin_session_window(
+        &state.app,
+        state.inner().clone(),
+        initial_url,
+        true,
+        true,
+    )?;
+
+    let _ = window.show();
+    let _ = window.set_focus();
+
+    Ok(state.linkedin_session_state().await)
+}
+
+#[tauri::command]
 async fn close_x_session_window(
     state: tauri::State<'_, AppState>,
-) -> Result<XSessionState, String> {
+) -> Result<BrowserSessionState, String> {
     logout_x_session(state.inner()).await?;
     Ok(state.x_session_state().await)
 }
@@ -1228,8 +2304,58 @@ async fn logout_x_session(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
+async fn logout_linkedin_session(state: &AppState) -> Result<(), String> {
+    state
+        .linkedin_session_force_close
+        .store(true, Ordering::SeqCst);
+
+    let result = (|| -> Result<(), String> {
+        if let Some(window) = state.app.get_webview_window(LINKEDIN_SESSION_WINDOW_LABEL) {
+            window
+                .clear_all_browsing_data()
+                .map_err(|error| error.to_string())?;
+        }
+
+        close_linkedin_session_windows(&state.app)
+    })();
+
+    if let Err(error) = result {
+        state
+            .linkedin_session_force_close
+            .store(false, Ordering::SeqCst);
+        return Err(error);
+    }
+
+    state
+        .forget_linkedin_session()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if state
+        .app
+        .get_webview_window(LINKEDIN_SESSION_WINDOW_LABEL)
+        .is_none()
+    {
+        state
+            .linkedin_session_force_close
+            .store(false, Ordering::SeqCst);
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
-async fn hide_x_session_window(state: tauri::State<'_, AppState>) -> Result<XSessionState, String> {
+async fn close_linkedin_session_window(
+    state: tauri::State<'_, AppState>,
+) -> Result<BrowserSessionState, String> {
+    logout_linkedin_session(state.inner()).await?;
+    Ok(state.linkedin_session_state().await)
+}
+
+#[tauri::command]
+async fn hide_x_session_window(
+    state: tauri::State<'_, AppState>,
+) -> Result<BrowserSessionState, String> {
     if let Some(window) = state.app.get_webview_window(X_SESSION_WINDOW_LABEL) {
         window.hide().map_err(|error| error.to_string())?;
     }
@@ -1238,11 +2364,30 @@ async fn hide_x_session_window(state: tauri::State<'_, AppState>) -> Result<XSes
 }
 
 #[tauri::command]
+async fn hide_linkedin_session_window(
+    state: tauri::State<'_, AppState>,
+) -> Result<BrowserSessionState, String> {
+    if let Some(window) = state.app.get_webview_window(LINKEDIN_SESSION_WINDOW_LABEL) {
+        window.hide().map_err(|error| error.to_string())?;
+    }
+
+    Ok(state.linkedin_session_state().await)
+}
+
+#[tauri::command]
 async fn logout_x_session_window(
     state: tauri::State<'_, AppState>,
-) -> Result<XSessionState, String> {
+) -> Result<BrowserSessionState, String> {
     logout_x_session(state.inner()).await?;
     Ok(state.x_session_state().await)
+}
+
+#[tauri::command]
+async fn logout_linkedin_session_window(
+    state: tauri::State<'_, AppState>,
+) -> Result<BrowserSessionState, String> {
+    logout_linkedin_session(state.inner()).await?;
+    Ok(state.linkedin_session_state().await)
 }
 
 #[tauri::command]
@@ -1338,6 +2483,14 @@ async fn submit_x_feed_capture(
 }
 
 #[tauri::command]
+async fn submit_linkedin_feed_capture(
+    state: tauri::State<'_, AppState>,
+    capture: XSessionCapturePayload,
+) -> Result<(), String> {
+    submit_x_feed_capture(state, capture).await
+}
+
+#[tauri::command]
 async fn submit_x_feed_capture_progress(
     state: tauri::State<'_, AppState>,
     progress: XSessionCaptureProgressPayload,
@@ -1354,6 +2507,14 @@ async fn submit_x_feed_capture_progress(
 
     emit_capture_progress(state.inner(), &run_id, &reason, &progress);
     Ok(())
+}
+
+#[tauri::command]
+async fn submit_linkedin_feed_capture_progress(
+    state: tauri::State<'_, AppState>,
+    progress: XSessionCaptureProgressPayload,
+) -> Result<(), String> {
+    submit_x_feed_capture_progress(state, progress).await
 }
 
 #[tauri::command]
@@ -1399,6 +2560,29 @@ fn data_dir(app: &tauri::AppHandle) -> Result<PathBuf, AppError> {
     app.path()
         .app_local_data_dir()
         .map_err(|error| AppError::Message(error.to_string()))
+}
+
+fn install_panic_hook() {
+    let default_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |panic_info| {
+        let location = panic_info
+            .location()
+            .map(|location| format!("{}:{}:{}", location.file(), location.line(), location.column()))
+            .unwrap_or_else(|| "unknown location".into());
+
+        let payload = if let Some(message) = panic_info.payload().downcast_ref::<&str>() {
+            (*message).to_string()
+        } else if let Some(message) = panic_info.payload().downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "non-string panic payload".into()
+        };
+
+        let message = format!("Unhandled panic at {location}: {payload}");
+        eprintln!("{message}");
+        log::error!("{message}");
+        default_hook(panic_info);
+    }));
 }
 
 fn build_tray(app: &tauri::AppHandle, state: &AppState) -> Result<(), AppError> {
@@ -1469,6 +2653,21 @@ fn build_tray(app: &tauri::AppHandle, state: &AppState) -> Result<(), AppError> 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .clear_targets()
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("sift".into()),
+                    },
+                ))
+                .level(tauri_plugin_log::log::LevelFilter::Info)
+                .filter(|metadata| metadata.target().starts_with("sift"))
+                .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
+                .max_file_size(512 * 1024)
+                .build(),
+        )
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -1479,10 +2678,17 @@ pub fn run() {
             let base_dir = data_dir(&app_handle)?;
             let db = Database::new(base_dir.join("data").join("sift.sqlite"))?;
             let state = AppState::new(app_handle.clone(), db);
+            install_panic_hook();
+            log::info!("SIFT starting up");
             build_tray(&app_handle, &state)?;
             app.manage(state.clone());
             if let Err(error) = restore_x_session_window(&state) {
                 eprintln!("failed to restore X session window: {error}");
+                log::error!("failed to restore X session window: {error}");
+            }
+            if let Err(error) = restore_linkedin_session_window(&state) {
+                eprintln!("failed to restore LinkedIn session window: {error}");
+                log::error!("failed to restore LinkedIn session window: {error}");
             }
 
             tauri::async_runtime::spawn(run_scheduler(state.clone()));
@@ -1506,6 +2712,12 @@ pub fn run() {
                     {
                         api.prevent_close();
                         let _ = window.hide();
+                    } else if window.label() == LINKEDIN_SESSION_WINDOW_LABEL
+                        && !state.quit_requested.load(Ordering::SeqCst)
+                        && !state.linkedin_session_force_close.load(Ordering::SeqCst)
+                    {
+                        api.prevent_close();
+                        let _ = window.hide();
                     }
                 }
             }
@@ -1518,6 +2730,16 @@ pub fn run() {
                             state.clear_x_session_runtime().await;
                         });
                     }
+                } else if window.label() == LINKEDIN_SESSION_WINDOW_LABEL {
+                    if let Some(state) = window.try_state::<AppState>() {
+                        let state = state.inner().clone();
+                        state
+                            .linkedin_session_force_close
+                            .store(false, Ordering::SeqCst);
+                        tauri::async_runtime::spawn(async move {
+                            state.clear_linkedin_session_runtime().await;
+                        });
+                    }
                 }
             }
             _ => {}
@@ -1526,15 +2748,22 @@ pub fn run() {
             get_bootstrap_state,
             save_settings,
             get_x_session_state,
+            get_linkedin_session_state,
             open_x_session_window,
+            open_linkedin_session_window,
             close_x_session_window,
+            close_linkedin_session_window,
             hide_x_session_window,
+            hide_linkedin_session_window,
             logout_x_session_window,
+            logout_linkedin_session_window,
             verify_lm_studio,
             start_x_connect,
             poll_x_connect,
             submit_x_feed_capture,
+            submit_linkedin_feed_capture,
             submit_x_feed_capture_progress,
+            submit_linkedin_feed_capture_progress,
             run_sync,
             disconnect_x,
             open_external_url

@@ -22,11 +22,18 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::models::{
-    CleanedItem, Edition, EditionCard, EditionImage, EditionSection, FeedItem, LmStudioHealth,
-    ModelDescriptor, OAuthSession, PollStatus, SyncReason, SyncRun, SyncStatus, UserSettings,
-    XClientConfigDraft, XConnectLaunch, XConnectPayload, XConnectPollResult,
+    CleanedItem, Edition, EditionCard, EditionImage, EditionSection, EditionView, FeedItem,
+    LmStudioHealth, ModelDescriptor, OAuthSession, PollStatus, SyncReason, SyncRun, SyncStatus,
+    UserSettings, XClientConfigDraft, XConnectLaunch, XConnectPayload, XConnectPollResult,
 };
-use crate::{AppError, AppState, is_x_domain};
+use crate::{AppError, AppState, is_linkedin_domain, is_x_domain};
+
+fn machine_timezone() -> Tz {
+    iana_time_zone::get_timezone()
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(chrono_tz::UTC)
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,7 +116,6 @@ impl XSessionCaptureProgressPayload {
 const SYNC_PROGRESS_EVENT: &str = "sync-progress";
 const CAPTURE_MAX_ITEMS: usize = 400;
 const CAPTURE_TARGET_FRESH_ITEMS: usize = 200;
-const CAPTURE_MAX_PASSES: usize = 120;
 const CAPTURE_STABLE_PASSES: usize = 10;
 const CAPTURE_EXHAUSTED_PASSES: usize = 18;
 const CAPTURE_WAIT_FOR_ADVANCE_MS: u64 = 5_000;
@@ -139,6 +145,27 @@ struct CaptureOutcome {
     resurfaced_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureSourceKind {
+    X,
+    Linkedin,
+}
+
+#[derive(Debug, Clone)]
+struct MultiCaptureOutcome {
+    items: Vec<FeedItem>,
+    brand_new_count: usize,
+    resurfaced_count: usize,
+    enabled_sources: Vec<CaptureSourceKind>,
+}
+
+#[derive(Debug, Clone)]
+struct ViewBuildSpec {
+    view: EditionView,
+    label: &'static str,
+    items: Vec<FeedItem>,
+}
+
 impl CaptureBoundary {
     fn collector_label(&self) -> &'static str {
         if self.since_timestamp.is_some() {
@@ -153,6 +180,22 @@ impl CaptureBoundary {
             "since the last saved edition"
         } else {
             "for today"
+        }
+    }
+}
+
+impl CaptureSourceKind {
+    fn as_feed_source(self) -> &'static str {
+        match self {
+            Self::X => "x-session",
+            Self::Linkedin => "linkedin-session",
+        }
+    }
+
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::X => "X",
+            Self::Linkedin => "LinkedIn",
         }
     }
 }
@@ -1019,11 +1062,7 @@ pub async fn generate_paper(
     let _sync_guard = state.sync_guard.lock().await;
     let settings = state.db.load_settings()?;
     let lm_studio_auth_token = state.lm_studio_auth_token().await;
-    let edition_date = current_edition_date(&settings)?;
-
-    if matches!(reason, SyncReason::Scheduled) && state.db.has_edition_for_date(&edition_date)? {
-        return state.db.load_bootstrap();
-    }
+    let _edition_date = current_edition_date(&settings)?;
 
     let mut run = SyncRun {
         id: Uuid::new_v4().to_string(),
@@ -1042,7 +1081,7 @@ pub async fn generate_paper(
         &reason,
         SyncStatus::Running,
         "starting",
-        "Refresh started. Checking the live X session.",
+        "Refresh started. Checking the enabled live sessions.",
         None,
         None,
         None,
@@ -1050,7 +1089,8 @@ pub async fn generate_paper(
     );
 
     let sync_result = async {
-        let capture = match collect_items_from_live_session(state, &settings, &run.id, &reason).await {
+        let capture =
+            match collect_items_from_enabled_sources(state, &settings, &run.id, &reason).await {
             Ok(capture) => capture,
             Err(AppError::NoFreshItems { message }) => {
                 run.status = SyncStatus::Success;
@@ -1073,91 +1113,99 @@ pub async fn generate_paper(
             }
             Err(error) => return Err(error),
         };
-        let brand_new_count = capture.brand_new_count;
-        let resurfaced_count = capture.resurfaced_count;
-        let fresh_breakdown =
-            format_fresh_tweet_breakdown(capture.items.len(), brand_new_count, resurfaced_count);
-        let items = capture.items;
-        let clusters = group_tweets(&items);
-        emit_sync_progress(
-            state,
-            &run.id,
-            &reason,
-            SyncStatus::Running,
-            "ranking-items",
-            format!(
-                "Prepared {fresh_breakdown} into {} topic clusters. Sending them to LM Studio for ranking.",
-                clusters.len()
-            ),
-            Some(items.len()),
-            Some(brand_new_count),
-            None,
-            None,
-        );
-
         let provider = LmStudioClient::default();
         let mut image_cache = SyncImageCache::default();
-        let decisions = batch_decide(
-            state,
-            &run.id,
-            &reason,
-            &provider,
-            &settings,
-            lm_studio_auth_token.as_deref(),
-            &clusters,
-            &mut image_cache,
-        )
-        .await?;
-        let kept = keep_useful(&decisions);
-        emit_sync_progress(
-            state,
-            &run.id,
-            &reason,
-            SyncStatus::Running,
-            "building-edition",
-            format!("Kept {} digest topics. Writing the edition.", kept.len()),
-            Some(items.len()),
-            Some(brand_new_count),
-            Some(kept.len()),
-            None,
-        );
-        let (_edition_date, edition) = build_edition(
-            state,
-            &run.id,
-            &reason,
-            &provider,
-            &settings,
-            lm_studio_auth_token.as_deref(),
-            &kept,
-            &mut image_cache,
-        )
-        .await?;
+        let view_specs = build_view_specs(&capture);
+        let mut saved_editions = Vec::new();
+        let mut consolidated_kept_count = 0usize;
+
+        for spec in &view_specs {
+            let fresh_breakdown = format_fresh_post_breakdown(
+                spec.items.len(),
+                capture.brand_new_count.min(spec.items.len()),
+                capture.resurfaced_count.min(spec.items.len()),
+            );
+            let clusters = group_tweets(&spec.items);
+            emit_sync_progress(
+                state,
+                &run.id,
+                &reason,
+                SyncStatus::Running,
+                "ranking-items",
+                format!(
+                    "Prepared {fresh_breakdown} in the {} view into {} topic clusters. Sending them to LM Studio for ranking.",
+                    spec.label,
+                    clusters.len()
+                ),
+                Some(capture.items.len()),
+                Some(capture.brand_new_count),
+                None,
+                None,
+            );
+
+            let decisions = batch_decide(
+                state,
+                &run.id,
+                &reason,
+                &provider,
+                &settings,
+                lm_studio_auth_token.as_deref(),
+                &clusters,
+                &mut image_cache,
+            )
+            .await?;
+            let kept = keep_useful(&decisions);
+            let (_edition_date, edition) = build_edition(
+                state,
+                &run.id,
+                &reason,
+                &provider,
+                &settings,
+                lm_studio_auth_token.as_deref(),
+                &kept,
+                &mut image_cache,
+                spec.view,
+            )
+            .await?;
+            let decision_items = decisions
+                .iter()
+                .map(ClusterEditorialRecord::to_cleaned_item)
+                .collect::<Vec<_>>();
+            state.db.save_edition(&edition, &decision_items, &run)?;
+            if spec.view == EditionView::Consolidated
+                || (view_specs.len() == 1 && run.edition_id.is_none())
+            {
+                consolidated_kept_count = kept.len();
+                run.edition_id = Some(edition.id.clone());
+            }
+            saved_editions.push(edition);
+        }
+
         emit_sync_progress(
             state,
             &run.id,
             &reason,
             SyncStatus::Running,
             "saving-edition",
-            "Saving the edition locally and updating the desk.",
-            Some(items.len()),
-            Some(brand_new_count),
-            Some(kept.len()),
-            Some(&edition.id),
+            "Saving the edition views locally and updating the desk.",
+            Some(capture.items.len()),
+            Some(capture.brand_new_count),
+            Some(consolidated_kept_count),
+            run.edition_id.as_deref(),
         );
 
-        run.item_count = items.len();
-        run.kept_count = kept.len();
-        run.edition_id = Some(edition.id.clone());
+        run.item_count = capture.items.len();
+        run.kept_count = consolidated_kept_count;
         run.status = SyncStatus::Success;
         run.finished_at = Some(Utc::now().to_rfc3339());
-
-        let decision_items = decisions
-            .iter()
-            .map(ClusterEditorialRecord::to_cleaned_item)
-            .collect::<Vec<_>>();
-        state.db.save_edition(&edition, &decision_items, &run)?;
         state.db.insert_sync_run(&run)?;
-        notify_sync(state, &reason, &edition.title).await;
+        let primary_title = saved_editions
+            .iter()
+            .find(|edition| run.edition_id.as_deref() == Some(edition.id.as_str()))
+            .or_else(|| saved_editions.first())
+            .map(|edition| edition.title.as_str())
+            .unwrap_or("Your SIFT");
+        notify_sync(state, &reason, primary_title).await;
         emit_sync_progress(
             state,
             &run.id,
@@ -1165,11 +1213,18 @@ pub async fn generate_paper(
             SyncStatus::Success,
             "complete",
             format!(
-                "Fresh edition generated: {}. {fresh_breakdown}; kept {} digest topics.",
-                edition.title, run.kept_count
+                "Fresh edition views generated for {}. Captured {} posts and kept {} digest topics in the primary desk view.",
+                capture
+                    .enabled_sources
+                    .iter()
+                    .map(|source| source.as_label())
+                    .collect::<Vec<_>>()
+                    .join(" + "),
+                run.item_count,
+                run.kept_count
             ),
             Some(run.item_count),
-            Some(brand_new_count),
+            Some(capture.brand_new_count),
             Some(run.kept_count),
             run.edition_id.as_deref(),
         );
@@ -1232,20 +1287,33 @@ pub async fn maybe_run_scheduled_sync(state: &AppState) -> Result<(), AppError> 
         return Ok(());
     }
 
-    if state
-        .db
-        .has_edition_for_date(&current_edition_date(&settings)?)?
-    {
+    let edition_date = current_edition_date(&settings)?;
+    if state.db.has_edition_for_date(&edition_date)? {
         return Ok(());
     }
 
-    let session_window_open = state
-        .app
-        .get_webview_window(crate::X_SESSION_WINDOW_LABEL)
-        .is_some();
-    let session_authenticated = *state.x_session_authenticated.read().await;
-    if !session_window_open || !session_authenticated {
-        return Ok(());
+    if settings.capture.sources.x {
+        let session_window = state.app.get_webview_window(crate::X_SESSION_WINDOW_LABEL);
+        if let Some(window) = &session_window {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+        if session_window.is_none() || !*state.x_session_authenticated.read().await {
+            return Ok(());
+        }
+    }
+
+    if settings.capture.sources.linkedin {
+        let session_window = state
+            .app
+            .get_webview_window(crate::LINKEDIN_SESSION_WINDOW_LABEL);
+        if let Some(window) = &session_window {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+        if session_window.is_none() || !*state.linkedin_session_authenticated.read().await {
+            return Ok(());
+        }
     }
 
     let _ = generate_paper(state, SyncReason::Scheduled).await?;
@@ -1409,6 +1477,7 @@ async fn build_edition(
     auth_token: Option<&str>,
     records: &[ClusterEditorialRecord],
     image_cache: &mut SyncImageCache,
+    view: EditionView,
 ) -> Result<(String, Edition), AppError> {
     let edition_date = current_edition_date(settings)?;
     let edition_id = Uuid::new_v4().to_string();
@@ -1506,7 +1575,11 @@ async fn build_edition(
         }
     };
 
-    let title = format!("Your SIFT for {}", edition_date);
+    let title = match view {
+        EditionView::Consolidated => format!("Your SIFT for {}", edition_date),
+        EditionView::X => format!("Your SIFT for {} · X", edition_date),
+        EditionView::Linkedin => format!("Your SIFT for {} · LinkedIn", edition_date),
+    };
     Ok((
         edition_date.clone(),
         Edition {
@@ -1515,13 +1588,14 @@ async fn build_edition(
             title,
             front_page_summary,
             created_at: Utc::now().to_rfc3339(),
+            view,
             sections: section_list,
         },
     ))
 }
 
 pub fn should_run_now(settings: &UserSettings) -> Result<bool, AppError> {
-    let timezone: Tz = settings.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
+    let timezone = machine_timezone();
     let now = Utc::now().with_timezone(&timezone);
     let schedule_time = NaiveTime::parse_from_str(&settings.schedule.time_of_day, "%H:%M")
         .unwrap_or_else(|_| NaiveTime::from_hms_opt(7, 30, 0).expect("default time"));
@@ -1529,8 +1603,8 @@ pub fn should_run_now(settings: &UserSettings) -> Result<bool, AppError> {
     Ok(now.time() >= schedule_time)
 }
 
-pub fn current_edition_date(settings: &UserSettings) -> Result<String, AppError> {
-    let timezone: Tz = settings.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
+pub fn current_edition_date(_settings: &UserSettings) -> Result<String, AppError> {
+    let timezone = machine_timezone();
     Ok(Utc::now().with_timezone(&timezone).date_naive().to_string())
 }
 
@@ -1594,7 +1668,7 @@ fn is_engagement_bait(text: &str) -> bool {
         .any(|pattern| pattern.is_match(&text.to_lowercase()))
 }
 
-fn format_fresh_tweet_breakdown(
+fn format_fresh_post_breakdown(
     fresh_count: usize,
     brand_new_count: usize,
     resurfaced_count: usize,
@@ -1604,15 +1678,95 @@ fn format_fresh_tweet_breakdown(
         parts.push(format!("{resurfaced_count} resurfaced"));
     }
 
-    format!("{fresh_count} fresh tweets ({})", parts.join(", "))
+    format!("{fresh_count} fresh posts ({})", parts.join(", "))
 }
 
-async fn collect_items_from_live_session(
+fn enabled_capture_sources(settings: &UserSettings) -> Vec<CaptureSourceKind> {
+    let mut sources = Vec::new();
+    if settings.capture.sources.x {
+        sources.push(CaptureSourceKind::X);
+    }
+    if settings.capture.sources.linkedin {
+        sources.push(CaptureSourceKind::Linkedin);
+    }
+    sources
+}
+
+fn build_view_specs(capture: &MultiCaptureOutcome) -> Vec<ViewBuildSpec> {
+    let has_x = capture
+        .enabled_sources
+        .iter()
+        .any(|source| *source == CaptureSourceKind::X);
+    let has_linkedin = capture
+        .enabled_sources
+        .iter()
+        .any(|source| *source == CaptureSourceKind::Linkedin);
+
+    if has_x && has_linkedin {
+        return vec![
+            ViewBuildSpec {
+                view: EditionView::Consolidated,
+                label: "Consolidated",
+                items: capture.items.clone(),
+            },
+            ViewBuildSpec {
+                view: EditionView::X,
+                label: "X",
+                items: capture
+                    .items
+                    .iter()
+                    .filter(|item| item.source == CaptureSourceKind::X.as_feed_source())
+                    .cloned()
+                    .collect(),
+            },
+            ViewBuildSpec {
+                view: EditionView::Linkedin,
+                label: "LinkedIn",
+                items: capture
+                    .items
+                    .iter()
+                    .filter(|item| item.source == CaptureSourceKind::Linkedin.as_feed_source())
+                    .cloned()
+                    .collect(),
+            },
+        ];
+    }
+
+    if has_linkedin {
+        return vec![ViewBuildSpec {
+            view: EditionView::Linkedin,
+            label: "LinkedIn",
+            items: capture.items.clone(),
+        }];
+    }
+
+    vec![ViewBuildSpec {
+        view: EditionView::X,
+        label: "X",
+        items: capture.items.clone(),
+    }]
+}
+
+fn browse_page_count_for_source(settings: &UserSettings, source: CaptureSourceKind) -> usize {
+    match source {
+        CaptureSourceKind::X => settings.capture.browse_page_count.x.max(1),
+        CaptureSourceKind::Linkedin => settings.capture.browse_page_count.linkedin.max(1),
+    }
+}
+
+async fn collect_items_from_enabled_sources(
     state: &AppState,
     settings: &UserSettings,
     run_id: &str,
     reason: &SyncReason,
-) -> Result<CaptureOutcome, AppError> {
+) -> Result<MultiCaptureOutcome, AppError> {
+    let enabled_sources = enabled_capture_sources(settings);
+    if enabled_sources.is_empty() {
+        return Err(AppError::Message(
+            "Enable at least one source in Settings before refreshing the edition.".into(),
+        ));
+    }
+
     let boundary = CaptureBoundary {
         edition_date: current_edition_date(settings)?,
         since_timestamp: state
@@ -1620,8 +1774,62 @@ async fn collect_items_from_live_session(
             .load_latest_edition()?
             .map(|edition| edition.created_at),
     };
-    let timezone = settings.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
-    let window = ensure_live_x_session_on_home(state, run_id, reason).await?;
+    let mut all_items = Vec::new();
+    let mut total_brand_new_count = 0usize;
+    let mut total_resurfaced_count = 0usize;
+
+    for source in &enabled_sources {
+        let capture = collect_items_from_source_live_session(
+            state,
+            settings,
+            run_id,
+            reason,
+            &boundary,
+            *source,
+        )
+        .await?;
+        total_brand_new_count += capture.brand_new_count;
+        total_resurfaced_count += capture.resurfaced_count;
+        all_items.extend(capture.items);
+    }
+
+    if all_items.is_empty() {
+        return Err(AppError::NoFreshItems {
+            message: format!(
+                "SIFT checked {}, but none of the posts were fresh {}.",
+                enabled_sources
+                    .iter()
+                    .map(|source| source.as_label())
+                    .collect::<Vec<_>>()
+                    .join(" + "),
+                boundary.digest_label()
+            ),
+        });
+    }
+
+    Ok(MultiCaptureOutcome {
+        items: all_items,
+        brand_new_count: total_brand_new_count,
+        resurfaced_count: total_resurfaced_count,
+        enabled_sources,
+    })
+}
+
+async fn collect_items_from_source_live_session(
+    state: &AppState,
+    settings: &UserSettings,
+    run_id: &str,
+    reason: &SyncReason,
+    boundary: &CaptureBoundary,
+    source: CaptureSourceKind,
+) -> Result<CaptureOutcome, AppError> {
+    let timezone = machine_timezone();
+    let window = match source {
+        CaptureSourceKind::X => ensure_live_x_session_on_home(state, run_id, reason).await?,
+        CaptureSourceKind::Linkedin => {
+            ensure_live_linkedin_session_on_home(state, run_id, reason).await?
+        }
+    };
     let request_id = Uuid::new_v4().to_string();
     let (sender, receiver) = oneshot::channel::<Result<XSessionCapturePayload, String>>();
     state.x_session_capture_requests.lock().await.insert(
@@ -1640,7 +1848,7 @@ async fn collect_items_from_live_session(
         reason,
         SyncStatus::Running,
         "capturing-feed",
-        "Collecting posts from the live X session.",
+        format!("Collecting posts from the live {} session.", source.as_label()),
         None,
         None,
         None,
@@ -1648,15 +1856,19 @@ async fn collect_items_from_live_session(
     );
 
     let capture_script = format!(
-        "window.__SIFT_COLLECT_FEED__({request_id}, {options});",
+        "{collector}({request_id}, {options});",
+        collector = match source {
+            CaptureSourceKind::X => "window.__SIFT_COLLECT_FEED__",
+            CaptureSourceKind::Linkedin => "window.__SIFT_COLLECT_LINKEDIN_FEED__",
+        },
         request_id = serde_json::to_string(&request_id)?,
         options = serde_json::to_string(&serde_json::json!({
             "editionDate": boundary.edition_date.clone(),
             "sinceTimestamp": boundary.since_timestamp,
-            "timeZone": settings.schedule.timezone,
+            "timeZone": timezone.name(),
             "maxItems": CAPTURE_MAX_ITEMS,
             "targetFreshItems": CAPTURE_TARGET_FRESH_ITEMS,
-            "maxPasses": CAPTURE_MAX_PASSES,
+            "maxPasses": browse_page_count_for_source(settings, source),
             "stablePasses": CAPTURE_STABLE_PASSES,
             "exhaustedPasses": CAPTURE_EXHAUSTED_PASSES,
             "waitForAdvanceMs": CAPTURE_WAIT_FOR_ADVANCE_MS,
@@ -1670,7 +1882,8 @@ async fn collect_items_from_live_session(
             .await
             .remove(&request_id);
         return Err(AppError::Message(format!(
-            "SIFT could not start the live X capture: {error}"
+            "SIFT could not start the live {} capture: {error}",
+            source.as_label()
         )));
     }
 
@@ -1681,7 +1894,10 @@ async fn collect_items_from_live_session(
             let requests = state.x_session_capture_requests.lock().await;
             let request = requests.get(&request_id).ok_or_else(|| {
                 AppError::Message(
-                    "The live X capture request disappeared before the page responded.".into(),
+                    format!(
+                        "The live {} capture request disappeared before the page responded.",
+                        source.as_label()
+                    ),
                 )
             })?;
             (request.last_progress_at, request.latest_progress.clone())
@@ -1741,7 +1957,10 @@ async fn collect_items_from_live_session(
                     .await
                     .remove(&request_id);
                 return Err(AppError::Message(
-                    "The live X capture finished before SIFT could receive the results.".into(),
+                    format!(
+                        "The live {} capture finished before SIFT could receive the results.",
+                        source.as_label()
+                    ),
                 ));
             }
             Err(_) => continue,
@@ -1749,7 +1968,7 @@ async fn collect_items_from_live_session(
     };
 
     let raw_count = capture.items.len();
-    let cleaned_items = normalize_session_capture(capture.items, settings);
+    let cleaned_items = normalize_session_capture(capture.items, settings, source);
     let cleaned_count = cleaned_items.len();
     let filtered_out_count = raw_count.saturating_sub(cleaned_count);
     let known_entries = state.db.load_tweetdb_entries(
@@ -1774,7 +1993,7 @@ async fn collect_items_from_live_session(
     let seen_at = Utc::now().to_rfc3339();
     state.db.insert_feed_items(&fresh_items)?;
     state.db.upsert_tweets(&fresh_items, &seen_at, run_id)?;
-    let fresh_breakdown = format_fresh_tweet_breakdown(
+    let fresh_breakdown = format_fresh_post_breakdown(
         fresh_items.len(),
         fresh_brand_new_count,
         fresh_seen_again_count,
@@ -1787,7 +2006,8 @@ async fn collect_items_from_live_session(
         SyncStatus::Running,
         "capturing-feed",
         format!(
-            "Captured {raw_count} posts from X. {fresh_breakdown} remain {} after cleanup.{}{}",
+            "Captured {raw_count} posts from {}. {fresh_breakdown} remain {} after cleanup.{}{}",
+            source.as_label(),
             boundary.collector_label(),
             if filtered_out_count > 0 {
                 format!(" {filtered_out_count} posts were filtered out by cleanup.")
@@ -1808,14 +2028,16 @@ async fn collect_items_from_live_session(
 
     if cleaned_count == 0 {
         return Err(AppError::Message(format!(
-            "SIFT captured {raw_count} posts, but none of them survived your cleanup filters. Keep doomscrolling a bit longer and try again."
+            "SIFT captured {raw_count} posts from {}, but none of them survived your cleanup filters. Keep browsing a bit longer and try again.",
+            source.as_label()
         )));
     }
 
     if fresh_items.is_empty() {
         return Err(AppError::NoFreshItems {
             message: format!(
-                "SIFT cleaned {cleaned_count} tweets, but none of them were fresh {}.",
+                "SIFT cleaned {cleaned_count} {} posts, but none of them were fresh {}.",
+                source.as_label(),
                 boundary.digest_label()
             ),
         });
@@ -1884,6 +2106,69 @@ async fn ensure_live_x_session_on_home(
     Ok(window)
 }
 
+async fn ensure_live_linkedin_session_on_home(
+    state: &AppState,
+    run_id: &str,
+    reason: &SyncReason,
+) -> Result<tauri::WebviewWindow, AppError> {
+    let window = state
+        .app
+        .get_webview_window(crate::LINKEDIN_SESSION_WINDOW_LABEL)
+        .ok_or_else(|| {
+            AppError::Message(
+                "Open LinkedIn Session first so SIFT has a live browser session to collect from."
+                    .into(),
+            )
+        })?;
+
+    if !*state.linkedin_session_authenticated.read().await {
+        return Err(AppError::Message(
+            "Sign in to LinkedIn inside the native SIFT session before refreshing the edition."
+                .into(),
+        ));
+    }
+
+    let already_home = state
+        .linkedin_session_last_known_url
+        .read()
+        .await
+        .clone()
+        .and_then(|value| Url::parse(&value).ok())
+        .is_some_and(|url| is_linkedin_home_feed_url(&url));
+
+    emit_sync_progress(
+        state,
+        run_id,
+        reason,
+        SyncStatus::Running,
+        "navigating-home",
+        if already_home {
+            "Refreshing the LinkedIn home feed before capture."
+        } else {
+            "Opening the LinkedIn home feed and forcing a refresh."
+        },
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let previous_url = state.linkedin_session_last_known_url.read().await.clone();
+    *state.linkedin_session_last_known_url.write().await = None;
+    if let Err(error) = window.navigate(build_linkedin_home_feed_refresh_url()) {
+        *state.linkedin_session_last_known_url.write().await = previous_url;
+        return Err(AppError::Message(error.to_string()));
+    }
+    wait_for_linkedin_session_url(
+        state,
+        is_linkedin_home_feed_url,
+        Duration::from_secs(15),
+    )
+    .await?;
+
+    Ok(window)
+}
+
 async fn wait_for_session_url<F>(
     state: &AppState,
     predicate: F,
@@ -1926,9 +2211,50 @@ fn build_home_timeline_refresh_url() -> Url {
     url
 }
 
+async fn wait_for_linkedin_session_url<F>(
+    state: &AppState,
+    predicate: F,
+    timeout_after: Duration,
+) -> Result<String, AppError>
+where
+    F: Fn(&Url) -> bool,
+{
+    let started_at = Instant::now();
+
+    while started_at.elapsed() < timeout_after {
+        let current = state.linkedin_session_last_known_url.read().await.clone();
+        if let Some(current) = current {
+            if let Ok(url) = Url::parse(&current) {
+                if predicate(&url) {
+                    return Ok(current);
+                }
+            }
+        }
+
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(AppError::Message(
+        "Timed out waiting for the live LinkedIn session to reach the home feed.".into(),
+    ))
+}
+
+fn is_linkedin_home_feed_url(url: &Url) -> bool {
+    is_linkedin_domain(url) && url.path().starts_with("/feed")
+}
+
+fn build_linkedin_home_feed_refresh_url() -> Url {
+    let mut url =
+        Url::parse("https://www.linkedin.com/feed/").expect("valid linkedin feed url");
+    url.query_pairs_mut()
+        .append_pair("sift_refresh", &Uuid::new_v4().to_string());
+    url
+}
+
 fn normalize_session_capture(
     captured_items: Vec<XSessionCaptureItem>,
     settings: &UserSettings,
+    source: CaptureSourceKind,
 ) -> Vec<FeedItem> {
     let captured = captured_items
         .into_iter()
@@ -1939,8 +2265,8 @@ fn normalize_session_capture(
         .map(|item| {
             let media = normalize_capture_media(&item.media);
             FeedItem {
-                id: item.id.clone(),
-                source: "x-session".into(),
+                id: format!("{}:{}", source.as_feed_source(), item.id.trim()),
+                source: source.as_feed_source().into(),
                 author_name: item.author_name.trim().to_string(),
                 author_handle: item
                     .author_handle
@@ -1952,6 +2278,7 @@ fn normalize_session_capture(
                 posted_at: item.posted_at.clone(),
                 raw_json: serde_json::json!({
                   "captureMode": "live-session",
+                  "source": source.as_feed_source(),
                   "isRepost": item.is_repost,
                   "isReply": item.is_reply,
                   "socialContext": item.social_context,
@@ -3076,9 +3403,9 @@ mod tests {
             },
         ];
 
-        let cleaned = normalize_session_capture(items, &settings);
+        let cleaned = normalize_session_capture(items, &settings, CaptureSourceKind::X);
         assert_eq!(cleaned.len(), 1);
-        assert_eq!(cleaned[0].id, "3");
+        assert_eq!(cleaned[0].id, "x-session:3");
         assert_eq!(cleaned[0].author_handle, "builder");
         assert_eq!(cleaned[0].source, "x-session");
         assert_eq!(

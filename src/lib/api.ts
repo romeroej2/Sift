@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { BootstrapState, LmStudioHealth, UserSettings, XSessionState } from "./types";
+import type { BootstrapState, BrowserSessionState, LmStudioHealth, UserSettings } from "./types";
 
 export function getBootstrapState() {
   return invoke<BootstrapState>("get_bootstrap_state");
@@ -10,19 +10,35 @@ export function saveSettings(settings: UserSettings) {
 }
 
 export function getXSessionState() {
-  return invoke<XSessionState>("get_x_session_state");
+  return invoke<BrowserSessionState>("get_x_session_state");
+}
+
+export function getLinkedInSessionState() {
+  return invoke<BrowserSessionState>("get_linkedin_session_state");
 }
 
 export function openXSessionWindow() {
-  return invoke<XSessionState>("open_x_session_window");
+  return invoke<BrowserSessionState>("open_x_session_window");
+}
+
+export function openLinkedInSessionWindow() {
+  return invoke<BrowserSessionState>("open_linkedin_session_window");
 }
 
 export function hideXSessionWindow() {
-  return invoke<XSessionState>("hide_x_session_window");
+  return invoke<BrowserSessionState>("hide_x_session_window");
+}
+
+export function hideLinkedInSessionWindow() {
+  return invoke<BrowserSessionState>("hide_linkedin_session_window");
 }
 
 export function logoutXSessionWindow() {
-  return invoke<XSessionState>("logout_x_session_window");
+  return invoke<BrowserSessionState>("logout_x_session_window");
+}
+
+export function logoutLinkedInSessionWindow() {
+  return invoke<BrowserSessionState>("logout_linkedin_session_window");
 }
 
 export function verifyLmStudio(baseUrl: string, authToken: string | null) {

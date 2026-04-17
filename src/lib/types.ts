@@ -1,4 +1,6 @@
 export type SyncStatus = "idle" | "running" | "success" | "error";
+export type BrowserSource = "x" | "linkedin";
+export type EditionView = "consolidated" | "x" | "linkedin";
 export type SyncProgressStage =
   | "starting"
   | "navigating-home"
@@ -24,6 +26,16 @@ export interface LmStudioSettings {
   includeImages: boolean;
 }
 
+export interface CaptureSourcesSettings {
+  x: boolean;
+  linkedin: boolean;
+}
+
+export interface CaptureSettings {
+  sources: CaptureSourcesSettings;
+  browsePageCount: Record<BrowserSource, number>;
+}
+
 export interface ScheduleSettings {
   enabled: boolean;
   timeOfDay: string;
@@ -37,7 +49,7 @@ export interface XConnectionSummary {
   connectedAt: string;
 }
 
-export interface XSessionState {
+export interface BrowserSessionState {
   isOpen: boolean;
   isVisible: boolean;
   isAuthenticated: boolean;
@@ -49,6 +61,7 @@ export interface UserSettings {
   schedule: ScheduleSettings;
   cleanup: CleanupSettings;
   lmStudio: LmStudioSettings;
+  capture: CaptureSettings;
 }
 
 export interface EditionCard {
@@ -84,6 +97,7 @@ export interface Edition {
   title: string;
   frontPageSummary: string;
   createdAt: string;
+  view: EditionView;
   sections: EditionSection[];
 }
 

@@ -2,23 +2,27 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_MODEL, DEFAULT_SETTINGS } from "./lib/defaults";
 import type {
+  BrowserSessionState,
   BootstrapState,
   Edition,
   LmStudioHealth,
   SyncProgressEvent,
-  UserSettings,
-  XSessionState
+  UserSettings
 } from "./lib/types";
 
 const {
   getBootstrapStateMock,
   getXSessionStateMock,
+  getLinkedInSessionStateMock,
   verifyLmStudioMock,
   saveSettingsMock,
   runSyncMock,
   openXSessionWindowMock,
+  openLinkedInSessionWindowMock,
   hideXSessionWindowMock,
+  hideLinkedInSessionWindowMock,
   logoutXSessionWindowMock,
+  logoutLinkedInSessionWindowMock,
   disconnectXMock,
   openExternalUrlMock,
   listenMock,
@@ -28,15 +32,19 @@ const {
   requestNotificationPermissionMock
 } = vi.hoisted(() => ({
   getBootstrapStateMock: vi.fn<() => Promise<BootstrapState>>(),
-  getXSessionStateMock: vi.fn<() => Promise<XSessionState>>(),
+  getXSessionStateMock: vi.fn<() => Promise<BrowserSessionState>>(),
+  getLinkedInSessionStateMock: vi.fn<() => Promise<BrowserSessionState>>(),
   verifyLmStudioMock: vi.fn<
     (baseUrl: string, authToken: string | null) => Promise<LmStudioHealth>
   >(),
   saveSettingsMock: vi.fn<(settings: UserSettings) => Promise<UserSettings>>(),
   runSyncMock: vi.fn(),
   openXSessionWindowMock: vi.fn(),
+  openLinkedInSessionWindowMock: vi.fn(),
   hideXSessionWindowMock: vi.fn(),
+  hideLinkedInSessionWindowMock: vi.fn(),
   logoutXSessionWindowMock: vi.fn(),
+  logoutLinkedInSessionWindowMock: vi.fn(),
   disconnectXMock: vi.fn(),
   openExternalUrlMock: vi.fn(),
   listenMock: vi.fn(),
@@ -49,10 +57,14 @@ const {
 vi.mock("./lib/api", () => ({
   disconnectX: disconnectXMock,
   getBootstrapState: getBootstrapStateMock,
+  getLinkedInSessionState: getLinkedInSessionStateMock,
   getXSessionState: getXSessionStateMock,
+  hideLinkedInSessionWindow: hideLinkedInSessionWindowMock,
   hideXSessionWindow: hideXSessionWindowMock,
+  logoutLinkedInSessionWindow: logoutLinkedInSessionWindowMock,
   logoutXSessionWindow: logoutXSessionWindowMock,
   openExternalUrl: openExternalUrlMock,
+  openLinkedInSessionWindow: openLinkedInSessionWindowMock,
   openXSessionWindow: openXSessionWindowMock,
   runSync: runSyncMock,
   saveSettings: saveSettingsMock,
@@ -82,6 +94,7 @@ function createEdition(overrides: Partial<Edition> = {}): Edition {
     title: "Your SIFT for 2026-04-16",
     frontPageSummary: "A good local-first shipping day.",
     createdAt: "2026-04-16T12:00:00Z",
+    view: "x",
     sections: [],
     ...overrides
   };
@@ -123,7 +136,7 @@ function createBootstrapState(overrides: Partial<BootstrapState> = {}): Bootstra
   };
 }
 
-function createSessionState(overrides: Partial<XSessionState> = {}): XSessionState {
+function createSessionState(overrides: Partial<BrowserSessionState> = {}): BrowserSessionState {
   return {
     isOpen: false,
     isVisible: false,
@@ -139,10 +152,11 @@ async function renderLoadedApp({
   session = createSessionState()
 }: {
   bootstrap?: BootstrapState;
-  session?: XSessionState;
+  session?: BrowserSessionState;
 } = {}) {
   getBootstrapStateMock.mockResolvedValue(bootstrap);
   getXSessionStateMock.mockResolvedValue(session);
+  getLinkedInSessionStateMock.mockResolvedValue(createSessionState());
 
   render(<App />);
 
@@ -165,8 +179,12 @@ beforeEach(() => {
   }));
   runSyncMock.mockResolvedValue(createBootstrapState());
   openXSessionWindowMock.mockResolvedValue(createSessionState({ isOpen: true, isVisible: true }));
+  getLinkedInSessionStateMock.mockResolvedValue(createSessionState());
+  openLinkedInSessionWindowMock.mockResolvedValue(createSessionState({ isOpen: true, isVisible: true }));
   hideXSessionWindowMock.mockResolvedValue(createSessionState({ isOpen: true, isVisible: false }));
+  hideLinkedInSessionWindowMock.mockResolvedValue(createSessionState({ isOpen: true, isVisible: false }));
   logoutXSessionWindowMock.mockResolvedValue(createSessionState());
+  logoutLinkedInSessionWindowMock.mockResolvedValue(createSessionState());
   disconnectXMock.mockResolvedValue(createBootstrapState());
   openExternalUrlMock.mockResolvedValue(undefined);
   vi.spyOn(console, "info").mockImplementation(() => undefined);
@@ -200,6 +218,19 @@ describe("App", () => {
     expect(screen.getByRole("heading", { name: edition.title })).toBeInTheDocument();
     expect(screen.getByText("A good local-first shipping day.")).toBeInTheDocument();
     expect(screen.getByText(/SIFT is ready\./)).toBeInTheDocument();
+  });
+
+  it("shows when the next auto-run is blocked", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(new Date("2026-04-16T08:30:00").valueOf());
+
+    await renderLoadedApp();
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+
+    expect(screen.getByText("Morning auto-run")).toBeInTheDocument();
+    expect(screen.getByText("Run is due now")).toBeInTheDocument();
+    expect(
+      screen.getByText("The schedule time has passed, but SIFT is waiting for you to open X Session.")
+    ).toBeInTheDocument();
   });
 
   it("opens the X session before manual refresh and hides it again afterward", async () => {
@@ -279,9 +310,6 @@ describe("App", () => {
     fireEvent.change(screen.getByLabelText("Morning publish time"), {
       target: { value: "09:15" }
     });
-    fireEvent.change(screen.getByLabelText("Timezone"), {
-      target: { value: "America/New_York" }
-    });
     fireEvent.click(screen.getByLabelText("Enable morning auto-run"));
     fireEvent.click(screen.getByLabelText("Drop replies"));
     fireEvent.click(screen.getByLabelText("Drop reposts"));
@@ -300,7 +328,7 @@ describe("App", () => {
         schedule: {
           enabled: false,
           timeOfDay: "09:15",
-          timezone: "America/New_York"
+          timezone: expect.any(String)
         },
         cleanup: {
           hideReplies: false,

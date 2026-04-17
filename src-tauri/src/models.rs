@@ -1,6 +1,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+fn local_timezone_name() -> String {
+    iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".into())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CleanupSettings {
@@ -23,6 +27,72 @@ pub struct LmStudioSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CaptureSourcesSettings {
+    #[serde(default = "default_true")]
+    pub x: bool,
+    #[serde(default)]
+    pub linkedin: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureSettings {
+    #[serde(default)]
+    pub sources: CaptureSourcesSettings,
+    #[serde(default)]
+    pub browse_page_count: CaptureBrowsePageCount,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureBrowsePageCount {
+    #[serde(default = "default_x_browse_page_count")]
+    pub x: usize,
+    #[serde(default = "default_linkedin_browse_page_count")]
+    pub linkedin: usize,
+}
+
+fn default_x_browse_page_count() -> usize {
+    12
+}
+
+fn default_linkedin_browse_page_count() -> usize {
+    8
+}
+
+impl Default for CaptureBrowsePageCount {
+    fn default() -> Self {
+        Self {
+            x: default_x_browse_page_count(),
+            linkedin: default_linkedin_browse_page_count(),
+        }
+    }
+}
+
+impl Default for CaptureSourcesSettings {
+    fn default() -> Self {
+        Self {
+            x: true,
+            linkedin: false,
+        }
+    }
+}
+
+impl Default for CaptureSettings {
+    fn default() -> Self {
+        Self {
+            sources: CaptureSourcesSettings::default(),
+            browse_page_count: CaptureBrowsePageCount::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ScheduleSettings {
     pub enabled: bool,
     pub time_of_day: String,
@@ -35,6 +105,8 @@ pub struct UserSettings {
     pub schedule: ScheduleSettings,
     pub cleanup: CleanupSettings,
     pub lm_studio: LmStudioSettings,
+    #[serde(default)]
+    pub capture: CaptureSettings,
 }
 
 impl UserSettings {
@@ -51,7 +123,7 @@ impl Default for UserSettings {
             schedule: ScheduleSettings {
                 enabled: true,
                 time_of_day: "07:30".into(),
-                timezone: "UTC".into(),
+                timezone: local_timezone_name(),
             },
             cleanup: CleanupSettings {
                 hide_replies: true,
@@ -66,6 +138,31 @@ impl Default for UserSettings {
                 selected_model: None,
                 include_images: false,
             },
+            capture: CaptureSettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EditionView {
+    Consolidated,
+    X,
+    Linkedin,
+}
+
+impl Default for EditionView {
+    fn default() -> Self {
+        Self::Consolidated
+    }
+}
+
+impl EditionView {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Consolidated => "consolidated",
+            Self::X => "x",
+            Self::Linkedin => "linkedin",
         }
     }
 }
@@ -112,6 +209,8 @@ pub struct Edition {
     pub title: String,
     pub front_page_summary: String,
     pub created_at: String,
+    #[serde(default)]
+    pub view: EditionView,
     pub sections: Vec<EditionSection>,
 }
 
@@ -186,7 +285,7 @@ pub struct XConnectionSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct XSessionState {
+pub struct BrowserSessionState {
     pub is_open: bool,
     pub is_visible: bool,
     pub is_authenticated: bool,
@@ -196,7 +295,7 @@ pub struct XSessionState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PersistedXSession {
+pub struct PersistedBrowserSession {
     pub last_known_url: String,
     pub is_authenticated: bool,
 }

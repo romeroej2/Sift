@@ -6,8 +6,8 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::AppError;
 use crate::models::{
-    BootstrapState, CleanedItem, Edition, PersistedXSession, SyncRun, TweetDbEntry, UserSettings,
-    XConnectionSummary,
+    BootstrapState, CleanedItem, Edition, PersistedBrowserSession, SyncRun, TweetDbEntry,
+    UserSettings, XConnectionSummary,
 };
 
 fn normalize_schema_sql(value: &str) -> String {
@@ -231,6 +231,7 @@ impl Database {
     }
 
     pub fn load_bootstrap(&self) -> Result<BootstrapState, AppError> {
+        self.mark_incomplete_sync_runs_interrupted()?;
         Ok(BootstrapState {
             settings: self.load_settings()?,
             editions: self.load_editions()?,
@@ -338,7 +339,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn load_persisted_x_session(&self) -> Result<Option<PersistedXSession>, AppError> {
+    pub fn load_persisted_x_session(&self) -> Result<Option<PersistedBrowserSession>, AppError> {
         let conn = self.connect()?;
         let raw = conn
             .query_row(
@@ -353,7 +354,10 @@ impl Database {
             .map_err(AppError::from)
     }
 
-    pub fn save_persisted_x_session(&self, session: &PersistedXSession) -> Result<(), AppError> {
+    pub fn save_persisted_x_session(
+        &self,
+        session: &PersistedBrowserSession,
+    ) -> Result<(), AppError> {
         let conn = self.connect()?;
         conn.execute(
             "INSERT INTO app_meta(key, value) VALUES('x_session_restore', ?1)
@@ -366,6 +370,42 @@ impl Database {
     pub fn clear_persisted_x_session(&self) -> Result<(), AppError> {
         let conn = self.connect()?;
         conn.execute("DELETE FROM app_meta WHERE key = 'x_session_restore'", [])?;
+        Ok(())
+    }
+
+    pub fn load_persisted_linkedin_session(
+        &self,
+    ) -> Result<Option<PersistedBrowserSession>, AppError> {
+        let conn = self.connect()?;
+        let raw = conn
+            .query_row(
+                "SELECT value FROM app_meta WHERE key = 'linkedin_session_restore'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        raw.map(|raw| serde_json::from_str(&raw))
+            .transpose()
+            .map_err(AppError::from)
+    }
+
+    pub fn save_persisted_linkedin_session(
+        &self,
+        session: &PersistedBrowserSession,
+    ) -> Result<(), AppError> {
+        let conn = self.connect()?;
+        conn.execute(
+            "INSERT INTO app_meta(key, value) VALUES('linkedin_session_restore', ?1)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![serde_json::to_string(session)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_persisted_linkedin_session(&self) -> Result<(), AppError> {
+        let conn = self.connect()?;
+        conn.execute("DELETE FROM app_meta WHERE key = 'linkedin_session_restore'", [])?;
         Ok(())
     }
 
@@ -392,6 +432,19 @@ impl Database {
         run.edition_id
       ],
     )?;
+        Ok(())
+    }
+
+    pub fn mark_incomplete_sync_runs_interrupted(&self) -> Result<(), AppError> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE sync_runs
+             SET status = 'error',
+                 finished_at = COALESCE(finished_at, ?1),
+                 error_message = COALESCE(error_message, 'SIFT was closed before this refresh finished.')
+             WHERE status = 'running'",
+            params![chrono::Utc::now().to_rfc3339()],
+        )?;
         Ok(())
     }
 
@@ -600,7 +653,8 @@ mod tests {
 
     use super::Database;
     use crate::models::{
-        Edition, EditionSection, FeedItem, PersistedXSession, SyncRun, SyncStatus, UserSettings,
+        Edition, EditionSection, EditionView, FeedItem, PersistedBrowserSession, SyncRun,
+        SyncStatus, UserSettings,
     };
 
     #[test]
@@ -614,7 +668,7 @@ mod tests {
                 .is_none()
         );
 
-        let session = PersistedXSession {
+        let session = PersistedBrowserSession {
             last_known_url: "https://x.com/home".into(),
             is_authenticated: true,
         };
@@ -719,6 +773,7 @@ mod tests {
             title: "Your SIFT for 2026-04-16".into(),
             front_page_summary: "A solid shipping day.".into(),
             created_at: "2026-04-16T12:11:00Z".into(),
+            view: EditionView::X,
             sections: vec![EditionSection {
                 id: "releases".into(),
                 title: "Releases".into(),
@@ -808,6 +863,7 @@ mod tests {
             title: "Older".into(),
             front_page_summary: "Yesterday".into(),
             created_at: "2026-04-15T08:00:00Z".into(),
+            view: EditionView::Consolidated,
             sections: vec![],
         };
         let newer = Edition {
@@ -816,6 +872,7 @@ mod tests {
             title: "Newer".into(),
             front_page_summary: "Today".into(),
             created_at: "2026-04-16T08:00:00Z".into(),
+            view: EditionView::Consolidated,
             sections: vec![],
         };
         let older_run = SyncRun {
@@ -861,6 +918,7 @@ mod tests {
             title: "Your SIFT for 2026-04-16".into(),
             front_page_summary: "Morning digest".into(),
             created_at: "2026-04-16T08:00:00Z".into(),
+            view: EditionView::Consolidated,
             sections: vec![],
         };
         let later = Edition {
@@ -869,6 +927,7 @@ mod tests {
             title: "Your SIFT for 2026-04-16".into(),
             front_page_summary: "Afternoon digest".into(),
             created_at: "2026-04-16T15:30:00Z".into(),
+            view: EditionView::Consolidated,
             sections: vec![],
         };
         let earlier_run = SyncRun {
@@ -907,6 +966,34 @@ mod tests {
     }
 
     #[test]
+    fn load_bootstrap_marks_abandoned_running_runs_as_interrupted() {
+        let temp_dir = tempdir().expect("temporary database directory");
+        let db = Database::new(temp_dir.path().join("sift.sqlite")).expect("database");
+
+        db.insert_sync_run(&SyncRun {
+            id: "run-stale".into(),
+            started_at: "2026-04-16T08:00:00Z".into(),
+            finished_at: None,
+            status: SyncStatus::Running,
+            item_count: 0,
+            kept_count: 0,
+            error_message: None,
+            edition_id: None,
+        })
+        .expect("insert stale running run");
+
+        let bootstrap = db.load_bootstrap().expect("load bootstrap");
+        let latest_run = bootstrap.latest_run.expect("latest run");
+
+        assert_eq!(latest_run.status, SyncStatus::Error);
+        assert!(latest_run.finished_at.is_some());
+        assert_eq!(
+            latest_run.error_message.as_deref(),
+            Some("SIFT was closed before this refresh finished.")
+        );
+    }
+
+    #[test]
     fn migrate_removes_same_day_unique_constraint_from_editions() {
         let temp_dir = tempdir().expect("temporary database directory");
         let path = temp_dir.path().join("sift.sqlite");
@@ -941,6 +1028,7 @@ mod tests {
             title: "Your SIFT for 2026-04-16".into(),
             front_page_summary: "First run".into(),
             created_at: "2026-04-16T09:00:00Z".into(),
+            view: EditionView::Consolidated,
             sections: vec![],
         };
         let second = Edition {
@@ -949,6 +1037,7 @@ mod tests {
             title: "Your SIFT for 2026-04-16".into(),
             front_page_summary: "Second run".into(),
             created_at: "2026-04-16T10:00:00Z".into(),
+            view: EditionView::Consolidated,
             sections: vec![],
         };
         let first_run = SyncRun {

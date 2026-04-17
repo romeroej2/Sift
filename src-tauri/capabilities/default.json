@@ -5,6 +5,7 @@
   "permissions": [
     "core:default",
     "autostart:default",
-    "notification:default"
+    "notification:default",
+    "log:default"
   ]
 }

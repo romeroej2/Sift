@@ -4,6 +4,7 @@ import {
   getErrorMessage,
   getModelDeskStatusLabel,
   getModelDeskSummary,
+  getScheduleSummary,
   getSyncProgressMeta,
   getXSessionToggleLabel,
   pickFreshEdition,
@@ -18,6 +19,7 @@ function createEdition(id: string, title: string): Edition {
     title,
     frontPageSummary: `${title} summary`,
     createdAt: "2026-04-16T12:00:00Z",
+    view: "x",
     sections: []
   };
 }
@@ -166,6 +168,46 @@ describe("getXSessionToggleLabel", () => {
         mode: "native-webview"
       })
     ).toBe("Hide X session");
+  });
+});
+
+describe("getScheduleSummary", () => {
+  it("shows the upcoming scheduled time when the session is ready", () => {
+    expect(
+      getScheduleSummary(
+        DEFAULT_SETTINGS.schedule,
+        {
+          isOpen: true,
+          isVisible: false,
+          isAuthenticated: true,
+          lastKnownUrl: "https://x.com/home",
+          mode: "native-webview"
+        },
+        new Date("2026-04-16T06:30:00")
+      )
+    ).toMatchObject({
+      title: expect.stringContaining("Next run Thu"),
+      detail: "Ready. SIFT will try automatically while the app is running in the background."
+    });
+  });
+
+  it("explains when a due run is blocked by the X session", () => {
+    expect(
+      getScheduleSummary(
+        DEFAULT_SETTINGS.schedule,
+        {
+          isOpen: false,
+          isVisible: false,
+          isAuthenticated: false,
+          lastKnownUrl: null,
+          mode: "native-webview"
+        },
+        new Date("2026-04-16T08:30:00")
+      )
+    ).toEqual({
+      title: "Run is due now",
+      detail: "The schedule time has passed, but SIFT is waiting for you to open X Session."
+    });
   });
 });
 

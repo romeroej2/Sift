@@ -4,27 +4,58 @@
 
 # SIFT
 
-SIFT is a local-first desktop newsroom for your X home timeline. It turns the posts flowing through a dedicated SIFT-managed X session into a concise daily edition, ranks the most relevant stories with LM Studio, and keeps a searchable local archive on your machine.
+SIFT is a local-first desktop newsroom for your social feeds. It turns posts flowing through dedicated SIFT-managed X and LinkedIn sessions into concise daily editions, ranks the most relevant stories with LM Studio, and keeps a searchable local archive on your machine.
+
+<p align="center">
+  <img src="https://img.shields.io/badge/X-111111?style=for-the-badge&logo=x&logoColor=white" alt="X support badge" />
+  <img src="https://img.shields.io/badge/LinkedIn-0A66C2?style=for-the-badge&logo=linkedin&logoColor=white" alt="LinkedIn support badge" />
+</p>
+
+> SIFT is an independent tool and is not endorsed by, affiliated with, approved by, or sponsored by X Corp. or LinkedIn.
 
 ![SIFT app screenshot](docs/images/sift-screenshot.png)
 
 ## What SIFT does
 
-- Opens a dedicated native X session inside the app so feed capture stays tied to one browser context.
-- Pulls fresh posts from your Home timeline instead of relying on the legacy X API flow.
+- Opens dedicated native X and LinkedIn sessions inside the app so feed capture stays tied to app-managed browser contexts.
+- Pulls fresh posts from your X Home timeline and LinkedIn home feed instead of relying on the legacy X API flow.
+- Lets you choose whether each refresh should use X, LinkedIn, or both sources together.
+- Lets you control how many feed pages SIFT browses per enabled source before it starts drafting the digest.
 - Cleans the feed with local rules such as hiding replies, hiding reposts, removing engagement bait, and muting authors or keywords.
 - Groups related posts into topic clusters, asks LM Studio to rank them, and writes a newspaper-style edition.
+- Produces source-aware desk views so you can switch between Consolidated, X-only, and LinkedIn-only editions.
 - Stores editions, sync history, and feed metadata in a local SQLite database inside the Tauri app data directory.
 - Can refresh on demand or on a daily schedule and surfaces desktop notifications when an edition completes or fails.
 
 ## How it works
 
-1. Open `X Session` in SIFT and sign in to X there.
-2. Start LM Studio locally, load a model, and verify the connection in `Settings`.
-3. When you refresh, SIFT drives the X session back to the Home timeline and captures fresh posts from that live session.
-4. The Rust backend filters and deduplicates posts, then groups them into clusters.
-5. LM Studio ranks the clusters and helps draft headlines, summaries, and the front-page brief.
-6. SIFT saves the finished edition locally and shows it in the `Today` and `Archive` views.
+1. Open the browser sessions you want SIFT to use, then sign in to X and/or LinkedIn there.
+2. In `Settings`, choose whether SIFT should capture from X, LinkedIn, or both, and set how many pages it should browse per enabled source.
+3. Start LM Studio locally, load a model, and verify the connection in `Settings`.
+4. When you refresh, SIFT drives each enabled session back to its home feed and captures fresh posts from those live sessions.
+5. The Rust backend filters and deduplicates posts, then groups them into clusters.
+6. LM Studio ranks the clusters and helps draft headlines, summaries, and the front-page brief.
+7. SIFT saves the finished edition views locally and shows them in the `Today` and `Archive` tabs as `Consolidated`, `X`, and `LinkedIn`.
+
+## Multi-source capability
+
+SIFT now supports a shared multi-source capture workflow:
+
+- `X`: captures from the X home timeline using the existing browser-session flow.
+- `LinkedIn`: captures from the LinkedIn home feed using a dedicated browser-session flow.
+- `Consolidated`: combines enabled-source captures into one shared ranking and digest-generation pass.
+
+The processing pipeline after capture stays shared across sources:
+
+- cleanup filters still apply before ranking
+- clustering and LM Studio ranking still happen in Rust
+- saved editions are still local-first and archived on disk
+
+When both sources are enabled, one refresh produces:
+
+- a `Consolidated` desk view
+- an `X` desk view
+- a `LinkedIn` desk view
 
 ## Stack
 
@@ -105,7 +136,7 @@ npm run tauri:build
 3. Run `npm ci`.
 4. Start LM Studio and load a model.
 5. Run `npm run tauri:dev`.
-6. Open `X Session`, sign in, verify LM Studio in `Settings`, and refresh the edition.
+6. Open the X and/or LinkedIn sessions you want to use, sign in, configure sources and browse depth in `Settings`, verify LM Studio, and refresh the edition.
 
 ## CI/CD
 
