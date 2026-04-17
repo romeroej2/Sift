@@ -7,25 +7,29 @@ import {
   requestPermission as requestNotificationPermission
 } from "@tauri-apps/plugin-notification";
 import type {
+  BrowserSessionState,
+  BrowserSource,
   BootstrapState,
   Edition,
+  EditionView,
   LmStudioHealth,
   SyncProgressEvent,
-  UserSettings,
-  XSessionState
+  UserSettings
 } from "./lib/types";
-import { DEFAULT_MODEL, DEFAULT_SETTINGS } from "./lib/defaults";
+import { DEFAULT_MODEL, DEFAULT_SETTINGS, getMachineTimeZone } from "./lib/defaults";
 import { formatEditionDate, formatTime } from "./lib/format";
 import {
+  EMPTY_BROWSER_SESSION,
   EMPTY_BOOTSTRAP,
-  EMPTY_X_SESSION,
   SYNC_PROGRESS_EVENT,
+  getAvailableEditionViews,
   getErrorMessage,
   getLmStudioSummary,
   getModelDeskStatusLabel,
   getModelDeskSummary,
+  getSessionToggleLabel,
+  getScheduleSummary,
   getSyncProgressMeta,
-  getXSessionToggleLabel,
   pickFreshEdition,
   pickInitialEdition,
   withTimeout
@@ -33,10 +37,14 @@ import {
 import {
   disconnectX,
   getBootstrapState,
+  getLinkedInSessionState,
   getXSessionState,
+  hideLinkedInSessionWindow,
   hideXSessionWindow,
+  logoutLinkedInSessionWindow,
   logoutXSessionWindow,
   openExternalUrl,
+  openLinkedInSessionWindow,
   openXSessionWindow,
   runSync,
   saveSettings,
@@ -100,6 +108,117 @@ function LogoutIcon() {
   );
 }
 
+function SourceBrandIcon({ source }: { source: BrowserSource }) {
+  if (source === "linkedin") {
+    return (
+      <span className="session-pill__brand session-pill__brand--linkedin" aria-hidden="true">
+        <span className="session-pill__brand-text">in</span>
+      </span>
+    );
+  }
+
+  return (
+    <span className="session-pill__brand session-pill__brand--x" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="currentColor">
+        <path d="M18.9 2H22l-6.78 7.75L23.2 22h-6.25l-4.9-6.2L6.62 22H3.5l7.2-8.24L1.2 2h6.4l4.43 5.63L18.9 2Zm-1.1 18h1.72L6.67 3.9H4.83Z" />
+      </svg>
+    </span>
+  );
+}
+
+function getEditionViewLabel(view: EditionView) {
+  return view === "consolidated" ? "Consolidated" : view === "linkedin" ? "LinkedIn" : "X";
+}
+
+function EditionViewTabs({
+  ariaLabel,
+  availableViews,
+  selectedView,
+  onSelect
+}: {
+  ariaLabel: string;
+  availableViews: EditionView[];
+  selectedView: EditionView;
+  onSelect: (view: EditionView) => void;
+}) {
+  if (!availableViews.length) {
+    return null;
+  }
+
+  return (
+    <div className="panel-tabs">
+      <div className="book-tabs" role="tablist" aria-label={ariaLabel}>
+        {availableViews.map((view) => (
+          <button
+            key={view}
+            type="button"
+            role="tab"
+            aria-selected={selectedView === view}
+            className={selectedView === view ? "book-tab book-tab--active" : "book-tab"}
+            onClick={() => onSelect(view)}
+          >
+            {getEditionViewLabel(view)}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function BrowserSessionCard({
+  source,
+  session,
+  onOpen,
+  onHide,
+  onLogout
+}: {
+  source: BrowserSource;
+  session: BrowserSessionState;
+  onOpen: () => void;
+  onHide: () => void;
+  onLogout: () => void;
+}) {
+  const sourceLabel = source === "linkedin" ? "LinkedIn" : "X";
+  const connectionLabel = session.isAuthenticated
+    ? "Connected"
+    : session.isOpen
+      ? "Waiting for sign-in"
+      : "Session closed";
+
+  return (
+    <div className="session-control">
+      <div
+        className={`session-pill session-pill--${source}${session.isAuthenticated ? " session-pill--connected" : session.isOpen ? " session-pill--open" : ""}`}
+      >
+        <SourceBrandIcon source={source} />
+        <div className="session-pill__copy">
+          <div className="session-pill__header">
+            <span className="session-pill__label">{sourceLabel}</span>
+          </div>
+          <span className="session-pill__status">{connectionLabel}</span>
+        </div>
+      </div>
+      <div className="session-actions" role="toolbar" aria-label={`${sourceLabel} session controls`}>
+        <SessionControlButton
+          label={getSessionToggleLabel(source, session)}
+          onClick={session.isOpen && session.isVisible ? onHide : onOpen}
+        >
+          {session.isOpen && session.isVisible ? <HideIcon /> : <ShowIcon />}
+        </SessionControlButton>
+        {session.isOpen ? (
+          <SessionControlButton
+            label={`Log out of ${sourceLabel} in SIFT`}
+            tone="danger"
+            onClick={onLogout}
+          >
+            <LogoutIcon />
+          </SessionControlButton>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function getEditionImageSrc(path: string) {
   if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
     try {
@@ -116,21 +235,29 @@ export default function App() {
   const [screen, setScreen] = useState<Screen>("today");
   const [bootstrap, setBootstrap] = useState<BootstrapState>(EMPTY_BOOTSTRAP);
   const [selectedEditionId, setSelectedEditionId] = useState<string | null>(null);
+  const [selectedView, setSelectedView] = useState<EditionView>("consolidated");
   const [message, setMessage] = useState("Opening today\'s desk...");
   const [lmStudioDraft, setLmStudioDraft] = useState(DEFAULT_SETTINGS.lmStudio);
-  const [xSession, setXSession] = useState<XSessionState>(EMPTY_X_SESSION);
+  const [sessionStates, setSessionStates] = useState<Record<BrowserSource, BrowserSessionState>>({
+    x: EMPTY_BROWSER_SESSION,
+    linkedin: EMPTY_BROWSER_SESSION
+  });
   const [lmHealth, setLmHealth] = useState<LmStudioHealth | null>(null);
   const [isModelDeskExpanded, setIsModelDeskExpanded] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [syncProgress, setSyncProgress] = useState<SyncProgressEvent | null>(null);
+  const [clockNow, setClockNow] = useState(() => Date.now());
   const availableModels = lmHealth?.models ?? [];
+  const xSession = sessionStates.x;
+  const linkedinSession = sessionStates.linkedin;
   const selectedModelDescriptor =
     availableModels.find((model) => model.id === lmStudioDraft.selectedModel) ?? null;
   const selectedModelId = selectedModelDescriptor?.id ?? lmStudioDraft.selectedModel;
   const liveSyncProgress = syncProgress?.status === "running" ? syncProgress : null;
   const isRefreshBusy = isRefreshing || liveSyncProgress !== null;
   const statusMessage = liveSyncProgress?.message ?? message;
-  const latestEditionTitle = pickFreshEdition(bootstrap)?.title ?? null;
+  const availableViews = useMemo(() => getAvailableEditionViews(bootstrap.editions), [bootstrap.editions]);
+  const latestEditionTitle = pickFreshEdition(bootstrap, selectedView)?.title ?? null;
   const statusMeta = liveSyncProgress
     ? getSyncProgressMeta(liveSyncProgress)
     : bootstrap.latestRun
@@ -138,56 +265,81 @@ export default function App() {
         ? bootstrap.latestRun.errorMessage
         : `${latestEditionTitle ? `${latestEditionTitle} · ` : ""}Last run ${formatTime(bootstrap.latestRun.startedAt)} · ${bootstrap.latestRun.status}`
       : "No edition generated yet.";
+  const scheduleSummary = useMemo(
+    () => getScheduleSummary(bootstrap.settings.schedule, sessionStates, bootstrap.settings, new Date(clockNow)),
+    [bootstrap.settings.schedule, bootstrap.settings, clockNow, sessionStates]
+  );
 
   const selectedEdition = useMemo(() => {
-    if (!bootstrap.editions.length) {
+    const visibleEditions = bootstrap.editions.filter((edition) => edition.view === selectedView);
+    if (!visibleEditions.length) {
       return null;
     }
 
     return (
-      bootstrap.editions.find((edition) => edition.id === selectedEditionId) ??
-      bootstrap.editions[0]
+      visibleEditions.find((edition) => edition.id === selectedEditionId) ??
+      visibleEditions[0]
     );
-  }, [bootstrap.editions, selectedEditionId]);
+  }, [bootstrap.editions, selectedEditionId, selectedView]);
 
   function resolveSelectedEditionId(
     state: BootstrapState,
     currentEditionId: string | null,
+    currentView: EditionView,
     preferredEditionId: string | null = null
   ) {
+    const visibleEditions = state.editions.filter((edition) => edition.view === currentView);
+
     if (!state.editions.length) {
       return null;
     }
 
     if (
       preferredEditionId
-      && state.editions.some((edition) => edition.id === preferredEditionId)
+      && visibleEditions.some((edition) => edition.id === preferredEditionId)
     ) {
       return preferredEditionId;
     }
 
     if (
       currentEditionId
-      && state.editions.some((edition) => edition.id === currentEditionId)
+      && visibleEditions.some((edition) => edition.id === currentEditionId)
     ) {
       return currentEditionId;
     }
 
-    return pickFreshEdition(state)?.id ?? pickInitialEdition(state.editions)?.id ?? null;
+    return pickFreshEdition(state, currentView)?.id ?? pickInitialEdition(visibleEditions)?.id ?? null;
   }
 
   function applyBootstrapState(state: BootstrapState, preferredEditionId: string | null = null) {
     setBootstrap(state);
-    setSelectedEditionId((current) =>
-      resolveSelectedEditionId(state, current, preferredEditionId)
-    );
+    setSelectedView((currentView) => {
+      const nextView = getAvailableEditionViews(state.editions).includes(currentView)
+        ? currentView
+        : getAvailableEditionViews(state.editions)[0] ?? "consolidated";
+      setSelectedEditionId((current) =>
+        resolveSelectedEditionId(state, current, nextView, preferredEditionId)
+      );
+      return nextView;
+    });
   }
 
   useEffect(() => {
-    if (bootstrap.editions.length && !selectedEditionId) {
-      setSelectedEditionId(bootstrap.editions[0].id);
+    const visibleEditions = bootstrap.editions.filter((edition) => edition.view === selectedView);
+    if (visibleEditions.length && !selectedEditionId) {
+      setSelectedEditionId(visibleEditions[0].id);
     }
-  }, [bootstrap.editions, selectedEditionId]);
+  }, [bootstrap.editions, selectedEditionId, selectedView]);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      setClockNow(Date.now());
+    }, 30000);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, []);
 
   useEffect(() => {
     if (bootstrap.latestRun?.status !== "running") {
@@ -209,9 +361,10 @@ export default function App() {
 
     async function loadApp() {
       try {
-        const [state, session] = await Promise.all([
+        const [state, xSessionState, linkedinSessionState] = await Promise.all([
           withTimeout(getBootstrapState(), "Loading the newsroom"),
-          withTimeout(getXSessionState(), "Loading the X session")
+          withTimeout(getXSessionState(), "Loading the X session"),
+          withTimeout(getLinkedInSessionState(), "Loading the LinkedIn session")
         ]);
 
         if (isCancelled) {
@@ -219,18 +372,13 @@ export default function App() {
         }
 
         applyBootstrapState(state);
-        setXSession(session);
+        setSessionStates({
+          x: xSessionState,
+          linkedin: linkedinSessionState
+        });
         void hydrateSavedLmStudio(state.settings);
         setMessage(
-          session.isAuthenticated
-            ? session.isVisible
-              ? "SIFT is ready. Your X session is already open."
-              : "SIFT is ready. Your last X session is standing by in the background."
-            : session.isOpen
-              ? session.isVisible
-                ? "SIFT is ready. Your X session is open. Finish signing in there if needed."
-                : "SIFT is ready. Your X session is hidden. Open it to finish signing in if needed."
-              : "SIFT is ready. Open X Session, sign in there, and keep the browser-driven workflow moving."
+          "SIFT is ready. Your enabled browser sessions are standing by."
         );
 
         void ensureDesktopRuntime().catch((error) => {
@@ -247,14 +395,17 @@ export default function App() {
     void loadApp();
 
     const interval = window.setInterval(() => {
-      void getXSessionState()
-        .then((state) => {
+      void Promise.all([getXSessionState(), getLinkedInSessionState()])
+        .then(([xState, linkedinState]) => {
           if (!isCancelled) {
-            setXSession(state);
+            setSessionStates({
+              x: xState,
+              linkedin: linkedinState
+            });
           }
         })
         .catch(() => {
-          // The dedicated X session window is optional, so polling failures can stay quiet.
+          // The dedicated browser session windows are optional, so polling failures can stay quiet.
         });
     }, 4000);
 
@@ -330,9 +481,35 @@ export default function App() {
     return state;
   }
 
-  async function refreshXSessionState() {
-    const state = await getXSessionState();
-    setXSession(state);
+  function setSessionState(source: BrowserSource, session: BrowserSessionState) {
+    setSessionStates((current) => ({
+      ...current,
+      [source]: session
+    }));
+  }
+
+  async function openSourceSession(source: BrowserSource) {
+    const session = source === "linkedin"
+      ? await openLinkedInSessionWindow()
+      : await openXSessionWindow();
+    setSessionState(source, session);
+    return session;
+  }
+
+  async function hideSourceSession(source: BrowserSource) {
+    const session = source === "linkedin"
+      ? await hideLinkedInSessionWindow()
+      : await hideXSessionWindow();
+    setSessionState(source, session);
+    return session;
+  }
+
+  async function logoutSourceSession(source: BrowserSource) {
+    const session = source === "linkedin"
+      ? await logoutLinkedInSessionWindow()
+      : await logoutXSessionWindow();
+    setSessionState(source, session);
+    return session;
   }
 
   async function hydrateSavedLmStudio(settings: UserSettings) {
@@ -385,6 +562,11 @@ export default function App() {
   }
 
   async function handleSaveSettings() {
+    if (!bootstrap.settings.capture.sources.x && !bootstrap.settings.capture.sources.linkedin) {
+      setMessage("Pick at least one source before saving newsroom settings.");
+      return;
+    }
+
     try {
       const saved = await saveSettings({
         ...bootstrap.settings,
@@ -413,19 +595,19 @@ export default function App() {
     setIsRefreshing(true);
     setSyncProgress(null);
     console.info("[SIFT sync] Manual refresh requested.");
+    const enabledSources = (Object.entries(bootstrap.settings.capture.sources) as Array<[BrowserSource, boolean]>)
+      .filter(([, enabled]) => enabled)
+      .map(([source]) => source);
 
     try {
-      setMessage(
-        xSession.isOpen
-          ? "Bringing the X session to the foreground for refresh..."
-          : "Opening the X session before refresh..."
-      );
-      const session = await openXSessionWindow();
-      setXSession(session);
+      setMessage("Opening the enabled source sessions before refresh...");
+      for (const source of enabledSources) {
+        await openSourceSession(source);
+      }
 
-      setMessage("Starting refresh. Checking the live X session...");
+      setMessage("Starting refresh. Checking the live sessions...");
       const state = await runSync("manual");
-      let freshEdition = pickFreshEdition(state);
+      let freshEdition = pickFreshEdition(state, selectedView);
       const noFreshMessage =
         state.latestRun?.status === "success" && !state.latestRun?.editionId
           ? state.latestRun.errorMessage
@@ -436,7 +618,7 @@ export default function App() {
       if (!freshEdition && !noFreshMessage) {
         try {
           const refreshedState = await refreshBootstrap();
-          freshEdition = pickFreshEdition(refreshedState);
+          freshEdition = pickFreshEdition(refreshedState, selectedView);
         } catch (refreshError) {
           console.error("[SIFT sync] Refresh completed but the desk state could not be reloaded.", refreshError);
         }
@@ -455,11 +637,12 @@ export default function App() {
       console.error("[SIFT sync] Manual refresh failed.", error);
       setMessage(detail);
     } finally {
-      try {
-        const session = await hideXSessionWindow();
-        setXSession(session);
-      } catch (hideError) {
-        console.error("[SIFT sync] Refresh finished but the X session could not be hidden.", hideError);
+      for (const source of enabledSources) {
+        try {
+          await hideSourceSession(source);
+        } catch (hideError) {
+          console.error(`[SIFT sync] Refresh finished but the ${source} session could not be hidden.`, hideError);
+        }
       }
 
       setIsRefreshing(false);
@@ -468,8 +651,7 @@ export default function App() {
 
   async function handleOpenXSession() {
     try {
-      const session = await openXSessionWindow();
-      setXSession(session);
+      const session = await openSourceSession("x");
       setMessage(
         session.isAuthenticated
           ? "The X session is ready. Keep your browsing inside that SIFT-managed X window."
@@ -482,8 +664,7 @@ export default function App() {
 
   async function handleHideXSession() {
     try {
-      const session = await hideXSessionWindow();
-      setXSession(session);
+      await hideSourceSession("x");
       setMessage("The X session is hidden. Your sign-in stays alive in the background.");
     } catch (error) {
       setMessage(getErrorMessage(error, "Unable to hide the X session window."));
@@ -500,11 +681,49 @@ export default function App() {
     }
 
     try {
-      const session = await logoutXSessionWindow();
-      setXSession(session);
+      await logoutSourceSession("x");
       setMessage("Logged out of X in SIFT. Open the window again whenever you want to sign back in.");
     } catch (error) {
       setMessage(getErrorMessage(error, "Unable to log out of the X session."));
+    }
+  }
+
+  async function handleOpenLinkedInSession() {
+    try {
+      const session = await openSourceSession("linkedin");
+      setMessage(
+        session.isAuthenticated
+          ? "The LinkedIn session is ready. Keep your browsing inside that SIFT-managed LinkedIn window."
+          : "The LinkedIn session window is open. Sign in there and keep your browsing inside that SIFT-managed window."
+      );
+    } catch (error) {
+      setMessage(getErrorMessage(error, "Unable to open the LinkedIn session window."));
+    }
+  }
+
+  async function handleHideLinkedInSession() {
+    try {
+      await hideSourceSession("linkedin");
+      setMessage("The LinkedIn session is hidden. Your sign-in stays alive in the background.");
+    } catch (error) {
+      setMessage(getErrorMessage(error, "Unable to hide the LinkedIn session window."));
+    }
+  }
+
+  async function handleLogoutLinkedInSession() {
+    const shouldContinue =
+      typeof window.confirm !== "function"
+        || window.confirm("Log out of LinkedIn in SIFT and clear this browser session?");
+
+    if (!shouldContinue) {
+      return;
+    }
+
+    try {
+      await logoutSourceSession("linkedin");
+      setMessage("Logged out of LinkedIn in SIFT. Open the window again whenever you want to sign back in.");
+    } catch (error) {
+      setMessage(getErrorMessage(error, "Unable to log out of the LinkedIn session."));
     }
   }
 
@@ -525,6 +744,16 @@ export default function App() {
     } catch (error) {
       setMessage(getErrorMessage(error, "Could not open the source post in your browser."));
     }
+  }
+
+  function handleSelectView(view: EditionView) {
+    setSelectedView(view);
+    setSelectedEditionId(
+      pickInitialEdition(
+        bootstrap.editions.filter((edition) => edition.view === view),
+        view
+      )?.id ?? null
+    );
   }
 
   return (
@@ -577,42 +806,20 @@ alt="SIFT"
           <section>
             <h2>Browser</h2>
             <div className="stack">
-              <div className="session-control">
-                <div className="session-pill">
-                  <span
-                    className={`session-dot ${xSession.isAuthenticated ? "session-dot--connected" : xSession.isOpen ? "session-dot--open" : "session-dot--closed"}`}
-                  />
-                  <span className="session-pill__text">
-                    {xSession.isAuthenticated
-                      ? "Connected"
-                      : xSession.isOpen
-                        ? "Waiting for sign-in"
-                        : "Session closed"}
-                  </span>
-                  {xSession.lastKnownUrl ? (
-                    <span className="session-pill__url">
-                      {xSession.lastKnownUrl.replace(/^https?:\/\//, "").split("/")[0]}
-                    </span>
-                  ) : null}
-                </div>
-                <div className="session-actions" role="toolbar" aria-label="X session controls">
-                  <SessionControlButton
-                    label={getXSessionToggleLabel(xSession)}
-                    onClick={xSession.isOpen && xSession.isVisible ? handleHideXSession : handleOpenXSession}
-                  >
-                    {xSession.isOpen && xSession.isVisible ? <HideIcon /> : <ShowIcon />}
-                  </SessionControlButton>
-                  {xSession.isOpen ? (
-                    <SessionControlButton
-                      label="Log out of X in SIFT"
-                      tone="danger"
-                      onClick={handleLogoutXSession}
-                    >
-                      <LogoutIcon />
-                    </SessionControlButton>
-                  ) : null}
-                </div>
-              </div>
+              <BrowserSessionCard
+                source="x"
+                session={xSession}
+                onOpen={handleOpenXSession}
+                onHide={handleHideXSession}
+                onLogout={handleLogoutXSession}
+              />
+              <BrowserSessionCard
+                source="linkedin"
+                session={linkedinSession}
+                onOpen={handleOpenLinkedInSession}
+                onHide={handleHideLinkedInSession}
+                onLogout={handleLogoutLinkedInSession}
+              />
 
               {bootstrap.xConnection ? (
                 <div className="mini-card">
@@ -767,31 +974,61 @@ alt="SIFT"
           </section>
         </aside>
 
-        {screen === "settings" ? (
-          <SettingsPanel
-            settings={bootstrap.settings}
-            onChange={(next) => setBootstrap((current) => ({ ...current, settings: next }))}
-            onSave={async (settings) => {
-              const saved = await saveSettings({
-                ...settings,
-                lmStudio: {
-                  ...settings.lmStudio,
-                  authToken: lmStudioDraft.authToken
+        <div className="desk-column">
+          {screen === "settings" ? (
+            <SettingsPanel
+              settings={bootstrap.settings}
+              scheduleSummary={scheduleSummary}
+              onChange={(next) => setBootstrap((current) => ({ ...current, settings: next }))}
+              onSave={async (settings) => {
+                if (!settings.capture.sources.x && !settings.capture.sources.linkedin) {
+                  setMessage("Pick at least one source before saving newsroom settings.");
+                  return;
                 }
-              });
-              setBootstrap((current) => ({ ...current, settings: saved }));
-              setMessage("Paper rules updated.");
-            }}
-          />
-        ) : screen === "archive" ? (
-          <ArchivePanel
-            editions={bootstrap.editions}
-            selectedEditionId={selectedEditionId}
-            onSelect={setSelectedEditionId}
-          />
-        ) : (
-          <EditionPanel edition={selectedEdition} onOpenSourcePost={handleOpenSourcePost} />
-        )}
+                const saved = await saveSettings({
+                  ...settings,
+                  schedule: {
+                    ...settings.schedule,
+                    timezone: getMachineTimeZone()
+                  },
+                  lmStudio: {
+                    ...settings.lmStudio,
+                    authToken: lmStudioDraft.authToken
+                  }
+                });
+                setBootstrap((current) => ({ ...current, settings: saved }));
+                setMessage("Paper rules updated.");
+              }}
+            />
+          ) : screen === "archive" ? (
+            <ArchivePanel
+              tabs={(
+                <EditionViewTabs
+                  ariaLabel="Archive view"
+                  availableViews={availableViews}
+                  selectedView={selectedView}
+                  onSelect={handleSelectView}
+                />
+              )}
+              editions={bootstrap.editions.filter((edition) => edition.view === selectedView)}
+              selectedEditionId={selectedEditionId}
+              onSelect={setSelectedEditionId}
+            />
+          ) : (
+            <EditionPanel
+              tabs={(
+                <EditionViewTabs
+                  ariaLabel="Edition view"
+                  availableViews={availableViews}
+                  selectedView={selectedView}
+                  onSelect={handleSelectView}
+                />
+              )}
+              edition={selectedEdition}
+              onOpenSourcePost={handleOpenSourcePost}
+            />
+          )}
+        </div>
       </div>
     </main>
   );
@@ -799,13 +1036,28 @@ alt="SIFT"
 
 function SettingsPanel({
   settings,
+  scheduleSummary,
   onChange,
   onSave
 }: {
   settings: UserSettings;
+  scheduleSummary: { title: string; detail: string };
   onChange: (value: UserSettings) => void;
   onSave: (value: UserSettings) => Promise<void>;
 }) {
+  const hasEnabledSources = settings.capture.sources.x || settings.capture.sources.linkedin;
+  const updateBrowseCount = (source: BrowserSource, fallback: number) => (rawValue: string) =>
+    onChange({
+      ...settings,
+      capture: {
+        ...settings.capture,
+        browsePageCount: {
+          ...settings.capture.browsePageCount,
+          [source]: Math.max(1, Number.parseInt(rawValue || String(fallback), 10) || fallback)
+        }
+      }
+    });
+
   return (
     <section className="panel content-panel">
       <div className="section-header">
@@ -813,150 +1065,270 @@ function SettingsPanel({
         <h2>Shape the paper.</h2>
       </div>
 
-      <div className="settings-grid">
-        <label className="field">
-          <span>Morning publish time</span>
-          <input
-            type="time"
-            value={settings.schedule.timeOfDay}
-            onChange={(event) =>
-              onChange({
-                ...settings,
-                schedule: {
-                  ...settings.schedule,
-                  timeOfDay: event.target.value
-                }
-              })
-            }
-          />
-        </label>
+      <div className="settings-stack">
+        <section className="settings-card">
+          <div className="settings-card__header">
+            <div>
+              <p className="kicker">Capture</p>
+              <h3>Source desk</h3>
+            </div>
+            <p className="settings-card__copy">
+              Choose where the paper should pull from and how deep each live feed should be browsed before drafting.
+            </p>
+          </div>
 
-        <label className="field">
-          <span>Timezone</span>
-          <input
-            value={settings.schedule.timezone}
-            onChange={(event) =>
-              onChange({
-                ...settings,
-                schedule: {
-                  ...settings.schedule,
-                  timezone: event.target.value
-                }
-              })
-            }
-          />
-        </label>
+          <div className="settings-source-grid">
+            <section
+              className={`settings-source-tile${settings.capture.sources.x ? " settings-source-tile--enabled" : ""}`}
+            >
+              <div className="settings-source-tile__top">
+                <div>
+                  <span className="settings-source-tile__title">X</span>
+                  <span className="settings-source-tile__eyebrow">Short-form pulse</span>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={settings.capture.sources.x}
+                  onChange={(event) =>
+                    onChange({
+                      ...settings,
+                      capture: {
+                        ...settings.capture,
+                        sources: {
+                          ...settings.capture.sources,
+                          x: event.target.checked
+                        }
+                      }
+                    })
+                  }
+                />
+              </div>
+              <p className="settings-source-tile__copy">
+                Fast, denser posts. Good when you want more breadth and chatter.
+              </p>
+              <label className="field">
+                <span>X pages to browse</span>
+                <input
+                  type="number"
+                  min={1}
+                  value={settings.capture.browsePageCount.x}
+                  onChange={(event) => updateBrowseCount("x", 12)(event.target.value)}
+                />
+              </label>
+            </section>
 
-        <label className="field field--checkbox">
-          <input
-            type="checkbox"
-            checked={settings.schedule.enabled}
-            onChange={(event) =>
-              onChange({
-                ...settings,
-                schedule: {
-                  ...settings.schedule,
-                  enabled: event.target.checked
-                }
-              })
-            }
-          />
-          <span>Enable morning auto-run</span>
-        </label>
+            <section
+              className={`settings-source-tile${settings.capture.sources.linkedin ? " settings-source-tile--enabled" : ""}`}
+            >
+              <div className="settings-source-tile__top">
+                <div>
+                  <span className="settings-source-tile__title">LinkedIn</span>
+                  <span className="settings-source-tile__eyebrow">Long-form signal</span>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={settings.capture.sources.linkedin}
+                  onChange={(event) =>
+                    onChange({
+                      ...settings,
+                      capture: {
+                        ...settings.capture,
+                        sources: {
+                          ...settings.capture.sources,
+                          linkedin: event.target.checked
+                        }
+                      }
+                    })
+                  }
+                />
+              </div>
+              <p className="settings-source-tile__copy">
+                Larger, slower cards. Tune this separately when you want fewer but heavier LinkedIn pages.
+              </p>
+              <label className="field">
+                <span>LinkedIn pages to browse</span>
+                <input
+                  type="number"
+                  min={1}
+                  value={settings.capture.browsePageCount.linkedin}
+                  onChange={(event) => updateBrowseCount("linkedin", 8)(event.target.value)}
+                />
+              </label>
+            </section>
+          </div>
 
-        <label className="field field--checkbox">
-          <input
-            type="checkbox"
-            checked={settings.cleanup.hideReplies}
-            onChange={(event) =>
-              onChange({
-                ...settings,
-                cleanup: {
-                  ...settings.cleanup,
-                  hideReplies: event.target.checked
-                }
-              })
-            }
-          />
-          <span>Drop replies</span>
-        </label>
+          {!hasEnabledSources ? (
+            <p className="field-help">Pick at least one source before saving.</p>
+          ) : null}
+        </section>
 
-        <label className="field field--checkbox">
-          <input
-            type="checkbox"
-            checked={settings.cleanup.hideRetweets}
-            onChange={(event) =>
-              onChange({
-                ...settings,
-                cleanup: {
-                  ...settings.cleanup,
-                  hideRetweets: event.target.checked
-                }
-              })
-            }
-          />
-          <span>Drop reposts</span>
-        </label>
+        <section className="settings-card">
+          <div className="settings-card__header">
+            <div>
+              <p className="kicker">Schedule</p>
+              <h3>Morning run</h3>
+            </div>
+            <p className="settings-card__copy">
+              SIFT uses this machine&apos;s timezone automatically for scheduling and edition boundaries.
+            </p>
+          </div>
 
-        <label className="field field--checkbox">
-          <input
-            type="checkbox"
-            checked={settings.cleanup.removeBait}
-            onChange={(event) =>
-              onChange({
-                ...settings,
-                cleanup: {
-                  ...settings.cleanup,
-                  removeBait: event.target.checked
+          <div className="settings-schedule-grid">
+            <label className="field">
+              <span>Morning publish time</span>
+              <input
+                type="time"
+                value={settings.schedule.timeOfDay}
+                onChange={(event) =>
+                  onChange({
+                    ...settings,
+                    schedule: {
+                      ...settings.schedule,
+                      timeOfDay: event.target.value
+                    }
+                  })
                 }
-              })
-            }
-          />
-          <span>Filter common engagement bait</span>
-        </label>
+              />
+            </label>
 
-        <label className="field">
-          <span>Muted keywords</span>
-          <textarea
-            value={settings.cleanup.mutedKeywords.join("\n")}
-            onChange={(event) =>
-              onChange({
-                ...settings,
-                cleanup: {
-                  ...settings.cleanup,
-                  mutedKeywords: event.target.value
-                    .split("\n")
-                    .map((value) => value.trim())
-                    .filter(Boolean)
-                }
-              })
-            }
-            placeholder="One phrase per line"
-          />
-        </label>
+            <div className="mini-card">
+              <strong>Morning auto-run</strong>
+              <span>{scheduleSummary.title}</span>
+              <span>{scheduleSummary.detail}</span>
+            </div>
+          </div>
 
-        <label className="field">
-          <span>Muted authors</span>
-          <textarea
-            value={settings.cleanup.mutedAuthors.join("\n")}
-            onChange={(event) =>
-              onChange({
-                ...settings,
-                cleanup: {
-                  ...settings.cleanup,
-                  mutedAuthors: event.target.value
-                    .split("\n")
-                    .map((value) => value.trim())
-                    .filter(Boolean)
+          <label className="field field--checkbox">
+            <input
+              type="checkbox"
+              checked={settings.schedule.enabled}
+              onChange={(event) =>
+                onChange({
+                  ...settings,
+                  schedule: {
+                    ...settings.schedule,
+                    enabled: event.target.checked
+                  }
+                })
+              }
+            />
+            <span>Enable morning auto-run</span>
+          </label>
+        </section>
+
+        <section className="settings-card">
+          <div className="settings-card__header">
+            <div>
+              <p className="kicker">Cleanup</p>
+              <h3>Filter rules</h3>
+            </div>
+            <p className="settings-card__copy">
+              Keep the ranking pass focused by stripping the content you already know you do not want in the paper.
+            </p>
+          </div>
+
+          <div className="settings-toggle-grid">
+            <label className="field field--checkbox">
+              <input
+                type="checkbox"
+                checked={settings.cleanup.hideReplies}
+                onChange={(event) =>
+                  onChange({
+                    ...settings,
+                    cleanup: {
+                      ...settings.cleanup,
+                      hideReplies: event.target.checked
+                    }
+                  })
                 }
-              })
-            }
-            placeholder="One handle per line"
-          />
-        </label>
+              />
+              <span>Drop replies</span>
+            </label>
+
+            <label className="field field--checkbox">
+              <input
+                type="checkbox"
+                checked={settings.cleanup.hideRetweets}
+                onChange={(event) =>
+                  onChange({
+                    ...settings,
+                    cleanup: {
+                      ...settings.cleanup,
+                      hideRetweets: event.target.checked
+                    }
+                  })
+                }
+              />
+              <span>Drop reposts</span>
+            </label>
+
+            <label className="field field--checkbox">
+              <input
+                type="checkbox"
+                checked={settings.cleanup.removeBait}
+                onChange={(event) =>
+                  onChange({
+                    ...settings,
+                    cleanup: {
+                      ...settings.cleanup,
+                      removeBait: event.target.checked
+                    }
+                  })
+                }
+              />
+              <span>Filter common engagement bait</span>
+            </label>
+          </div>
+
+          <div className="settings-copy-grid">
+            <label className="field">
+              <span>Muted keywords</span>
+              <textarea
+                value={settings.cleanup.mutedKeywords.join("\n")}
+                onChange={(event) =>
+                  onChange({
+                    ...settings,
+                    cleanup: {
+                      ...settings.cleanup,
+                      mutedKeywords: event.target.value
+                        .split("\n")
+                        .map((value) => value.trim())
+                        .filter(Boolean)
+                    }
+                  })
+                }
+                placeholder="One phrase per line"
+              />
+            </label>
+
+            <label className="field">
+              <span>Muted authors</span>
+              <textarea
+                value={settings.cleanup.mutedAuthors.join("\n")}
+                onChange={(event) =>
+                  onChange({
+                    ...settings,
+                    cleanup: {
+                      ...settings.cleanup,
+                      mutedAuthors: event.target.value
+                        .split("\n")
+                        .map((value) => value.trim())
+                        .filter(Boolean)
+                    }
+                  })
+                }
+                placeholder="One handle per line"
+              />
+            </label>
+          </div>
+        </section>
       </div>
 
-      <button className="primary-button" onClick={() => void onSave(settings)}>
+      <button
+        className="primary-button"
+        onClick={() => void onSave(settings)}
+        disabled={!hasEnabledSources}
+      >
         Save newsroom settings
       </button>
     </section>
@@ -964,16 +1336,19 @@ function SettingsPanel({
 }
 
 function ArchivePanel({
+  tabs,
   editions,
   selectedEditionId,
   onSelect
 }: {
+  tabs?: ReactNode;
   editions: Edition[];
   selectedEditionId: string | null;
   onSelect: (value: string) => void;
 }) {
   return (
-    <section className="panel content-panel">
+    <section className="panel content-panel archive-panel">
+      {tabs}
       <div className="section-header">
         <p className="kicker">Archive</p>
         <h2>Past editions</h2>
@@ -1005,21 +1380,24 @@ function ArchivePanel({
 }
 
 function EditionPanel({
+  tabs,
   edition,
   onOpenSourcePost
 }: {
+  tabs?: ReactNode;
   edition: Edition | null;
   onOpenSourcePost: (url: string) => void;
 }) {
   if (!edition) {
     return (
-      <section className="panel content-panel">
+      <section className="panel content-panel paper-panel paper-panel--empty">
+        {tabs}
         <div className="section-header">
           <p className="kicker">Today</p>
           <h2>No issue on the desk yet.</h2>
         </div>
         <p className="empty-copy">
-          Open X Session, verify LM Studio, and finish wiring the browser capture flow to draft your first edition.
+          Open your source sessions, verify LM Studio, and refresh the desk to draft your first edition.
         </p>
       </section>
     );
@@ -1027,6 +1405,7 @@ function EditionPanel({
 
   return (
     <section className="panel content-panel paper-panel">
+      {tabs}
       <div className="paper-head">
         <p className="paper-flag">SIFT Daily Briefing</p>
         <h2>{edition.title}</h2>
