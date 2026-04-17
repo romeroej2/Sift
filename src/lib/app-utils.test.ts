@@ -4,6 +4,7 @@ import {
   getErrorMessage,
   getModelDeskStatusLabel,
   getModelDeskSummary,
+  getSessionToggleLabel,
   getScheduleSummary,
   getSyncProgressMeta,
   getXSessionToggleLabel,
@@ -168,6 +169,20 @@ describe("getXSessionToggleLabel", () => {
         mode: "native-webview"
       })
     ).toBe("Hide X session");
+  });
+});
+
+describe("getSessionToggleLabel", () => {
+  it("uses Reddit-specific labels for Reddit sessions", () => {
+    expect(
+      getSessionToggleLabel("reddit", {
+        isOpen: false,
+        isVisible: false,
+        isAuthenticated: false,
+        lastKnownUrl: null,
+        mode: "native-webview"
+      })
+    ).toBe("Open Reddit session");
   });
 });
 

@@ -6,6 +6,7 @@ import {
   isPermissionGranted as isNotificationPermissionGranted,
   requestPermission as requestNotificationPermission
 } from "@tauri-apps/plugin-notification";
+import { GemBadge } from "gem-badges";
 import type {
   BrowserSessionState,
   BrowserSource,
@@ -38,13 +39,17 @@ import {
   disconnectX,
   getBootstrapState,
   getLinkedInSessionState,
+  getRedditSessionState,
   getXSessionState,
   hideLinkedInSessionWindow,
+  hideRedditSessionWindow,
   hideXSessionWindow,
   logoutLinkedInSessionWindow,
+  logoutRedditSessionWindow,
   logoutXSessionWindow,
   openExternalUrl,
   openLinkedInSessionWindow,
+  openRedditSessionWindow,
   openXSessionWindow,
   runSync,
   saveSettings,
@@ -109,11 +114,54 @@ function LogoutIcon() {
   );
 }
 
+function HeaderBlingLink({ onClick }: { onClick: () => void }) {
+  return (
+    <a
+      className="masthead-bling"
+      href="https://github.com/romeroej2/gem-badges"
+      target="_blank"
+      rel="noreferrer"
+      onClick={onClick}
+      aria-label="Open the gem-badges repo"
+      title="I see you like drip."
+    >
+      <GemBadge
+        config={{
+          material: "diamond",
+          cut: "round",
+          size: 36,
+          glow: true,
+          glowIntensity: 0.9,
+          animate: true,
+          renderMode: "auto"
+        }}
+      />
+    </a>
+  );
+}
+
 function SourceBrandIcon({ source }: { source: BrowserSource }) {
   if (source === "linkedin") {
     return (
       <span className="session-pill__brand session-pill__brand--linkedin" aria-hidden="true">
         <span className="session-pill__brand-text">in</span>
+      </span>
+    );
+  }
+
+  if (source === "reddit") {
+    return (
+      <span className="session-pill__brand session-pill__brand--reddit" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none">
+          <circle cx="12" cy="13" r="5.5" />
+          <path d="M9 18c.7.5 1.8.8 3 .8s2.3-.3 3-.8" />
+          <circle cx="9.8" cy="13" r=".9" fill="currentColor" stroke="none" />
+          <circle cx="14.2" cy="13" r=".9" fill="currentColor" stroke="none" />
+          <path d="M10.5 7.2 12.2 9" />
+          <circle cx="15.8" cy="6.8" r="1.2" />
+          <path d="M7.8 10.2c-.8-.5-1.5-1.2-1.5-2.1 0-1 1-1.8 2.3-1.8.7 0 1.3.2 1.8.5" />
+          <path d="M16.2 10.2c.8-.5 1.5-1.2 1.5-2.1 0-1-1-1.8-2.3-1.8-.7 0-1.3.2-1.8.5" />
+        </svg>
       </span>
     );
   }
@@ -128,7 +176,13 @@ function SourceBrandIcon({ source }: { source: BrowserSource }) {
 }
 
 function getEditionViewLabel(view: EditionView) {
-  return view === "consolidated" ? "Consolidated" : view === "linkedin" ? "LinkedIn" : "X";
+  return view === "consolidated"
+    ? "Consolidated"
+    : view === "linkedin"
+      ? "LinkedIn"
+      : view === "reddit"
+        ? "Reddit"
+        : "X";
 }
 
 function EditionViewTabs({
@@ -179,7 +233,8 @@ function BrowserSessionCard({
   onHide: () => void;
   onLogout: () => void;
 }) {
-  const sourceLabel = source === "linkedin" ? "LinkedIn" : "X";
+  const sourceLabel =
+    source === "linkedin" ? "LinkedIn" : source === "reddit" ? "Reddit" : "X";
   const connectionLabel = session.isAuthenticated
     ? "Connected"
     : session.isOpen
@@ -241,7 +296,8 @@ export default function App() {
   const [lmStudioDraft, setLmStudioDraft] = useState(DEFAULT_SETTINGS.lmStudio);
   const [sessionStates, setSessionStates] = useState<Record<BrowserSource, BrowserSessionState>>({
     x: EMPTY_BROWSER_SESSION,
-    linkedin: EMPTY_BROWSER_SESSION
+    linkedin: EMPTY_BROWSER_SESSION,
+    reddit: EMPTY_BROWSER_SESSION
   });
   const [lmHealth, setLmHealth] = useState<LmStudioHealth | null>(null);
   const [isModelDeskExpanded, setIsModelDeskExpanded] = useState(false);
@@ -253,6 +309,7 @@ export default function App() {
   const availableModels = lmHealth?.models ?? [];
   const xSession = sessionStates.x;
   const linkedinSession = sessionStates.linkedin;
+  const redditSession = sessionStates.reddit;
   const selectedModelDescriptor =
     availableModels.find((model) => model.id === lmStudioDraft.selectedModel) ?? null;
   const selectedModelId = selectedModelDescriptor?.id ?? lmStudioDraft.selectedModel;
@@ -365,10 +422,11 @@ export default function App() {
 
     async function loadApp() {
       try {
-        const [state, xSessionState, linkedinSessionState] = await Promise.all([
+        const [state, xSessionState, linkedinSessionState, redditSessionState] = await Promise.all([
           withTimeout(getBootstrapState(), "Loading the newsroom"),
           withTimeout(getXSessionState(), "Loading the X session"),
-          withTimeout(getLinkedInSessionState(), "Loading the LinkedIn session")
+          withTimeout(getLinkedInSessionState(), "Loading the LinkedIn session"),
+          withTimeout(getRedditSessionState(), "Loading the Reddit session")
         ]);
 
         if (isCancelled) {
@@ -378,7 +436,8 @@ export default function App() {
         applyBootstrapState(state);
         setSessionStates({
           x: xSessionState,
-          linkedin: linkedinSessionState
+          linkedin: linkedinSessionState,
+          reddit: redditSessionState
         });
         void hydrateSavedLmStudio(state.settings);
         setMessage(
@@ -399,12 +458,13 @@ export default function App() {
     void loadApp();
 
     const interval = window.setInterval(() => {
-      void Promise.all([getXSessionState(), getLinkedInSessionState()])
-        .then(([xState, linkedinState]) => {
+      void Promise.all([getXSessionState(), getLinkedInSessionState(), getRedditSessionState()])
+        .then(([xState, linkedinState, redditState]) => {
           if (!isCancelled) {
             setSessionStates({
               x: xState,
-              linkedin: linkedinState
+              linkedin: linkedinState,
+              reddit: redditState
             });
           }
         })
@@ -424,7 +484,11 @@ export default function App() {
       return;
     }
 
-    if (!bootstrap.settings.capture.sources.x && !bootstrap.settings.capture.sources.linkedin) {
+    if (
+      !bootstrap.settings.capture.sources.x
+      && !bootstrap.settings.capture.sources.linkedin
+      && !bootstrap.settings.capture.sources.reddit
+    ) {
       return;
     }
 
@@ -520,6 +584,8 @@ export default function App() {
   async function openSourceSession(source: BrowserSource) {
     const session = source === "linkedin"
       ? await openLinkedInSessionWindow()
+      : source === "reddit"
+        ? await openRedditSessionWindow()
       : await openXSessionWindow();
     setSessionState(source, session);
     return session;
@@ -528,6 +594,8 @@ export default function App() {
   async function hideSourceSession(source: BrowserSource) {
     const session = source === "linkedin"
       ? await hideLinkedInSessionWindow()
+      : source === "reddit"
+        ? await hideRedditSessionWindow()
       : await hideXSessionWindow();
     setSessionState(source, session);
     return session;
@@ -536,6 +604,8 @@ export default function App() {
   async function logoutSourceSession(source: BrowserSource) {
     const session = source === "linkedin"
       ? await logoutLinkedInSessionWindow()
+      : source === "reddit"
+        ? await logoutRedditSessionWindow()
       : await logoutXSessionWindow();
     setSessionState(source, session);
     return session;
@@ -600,7 +670,11 @@ export default function App() {
       settingsAutosaveTimeoutRef.current = null;
     }
 
-    if (!bootstrap.settings.capture.sources.x && !bootstrap.settings.capture.sources.linkedin) {
+    if (
+      !bootstrap.settings.capture.sources.x
+      && !bootstrap.settings.capture.sources.linkedin
+      && !bootstrap.settings.capture.sources.reddit
+    ) {
       setMessage("Pick at least one source before saving newsroom settings.");
       return;
     }
@@ -636,7 +710,11 @@ export default function App() {
       settingsAutosaveTimeoutRef.current = null;
     }
 
-    if (!settings.capture.sources.x && !settings.capture.sources.linkedin) {
+    if (
+      !settings.capture.sources.x
+      && !settings.capture.sources.linkedin
+      && !settings.capture.sources.reddit
+    ) {
       setMessage("Pick at least one source before saving newsroom settings.");
       return;
     }
@@ -774,12 +852,34 @@ export default function App() {
     }
   }
 
+  async function handleOpenRedditSession() {
+    try {
+      const session = await openSourceSession("reddit");
+      setMessage(
+        session.isAuthenticated
+          ? "The Reddit session is ready. Keep your browsing inside that SIFT-managed Reddit window."
+          : "The Reddit session window is open. Sign in there and keep your browsing inside that SIFT-managed window."
+      );
+    } catch (error) {
+      setMessage(getErrorMessage(error, "Unable to open the Reddit session window."));
+    }
+  }
+
   async function handleHideLinkedInSession() {
     try {
       await hideSourceSession("linkedin");
       setMessage("The LinkedIn session is hidden. Your sign-in stays alive in the background.");
     } catch (error) {
       setMessage(getErrorMessage(error, "Unable to hide the LinkedIn session window."));
+    }
+  }
+
+  async function handleHideRedditSession() {
+    try {
+      await hideSourceSession("reddit");
+      setMessage("The Reddit session is hidden. Your sign-in stays alive in the background.");
+    } catch (error) {
+      setMessage(getErrorMessage(error, "Unable to hide the Reddit session window."));
     }
   }
 
@@ -800,6 +900,23 @@ export default function App() {
     }
   }
 
+  async function handleLogoutRedditSession() {
+    const shouldContinue =
+      typeof window.confirm !== "function"
+        || window.confirm("Log out of Reddit in SIFT and clear this browser session?");
+
+    if (!shouldContinue) {
+      return;
+    }
+
+    try {
+      await logoutSourceSession("reddit");
+      setMessage("Logged out of Reddit in SIFT. Open the window again whenever you want to sign back in.");
+    } catch (error) {
+      setMessage(getErrorMessage(error, "Unable to log out of the Reddit session."));
+    }
+  }
+
   async function handleDisconnectX() {
     try {
       const state = await disconnectX();
@@ -817,6 +934,10 @@ export default function App() {
     } catch (error) {
       setMessage(getErrorMessage(error, "Could not open the source post in your browser."));
     }
+  }
+
+  function handleGemBlingClick() {
+    setMessage("I see you like drip.");
   }
 
   function handleSelectView(view: EditionView) {
@@ -866,6 +987,7 @@ alt="SIFT"
           <button className="primary-button" onClick={handleRunSync} disabled={isRefreshBusy}>
             {isRefreshBusy ? "Refreshing..." : "Refresh edition"}
           </button>
+          <HeaderBlingLink onClick={handleGemBlingClick} />
         </div>
       </header>
 
@@ -892,6 +1014,13 @@ alt="SIFT"
                 onOpen={handleOpenLinkedInSession}
                 onHide={handleHideLinkedInSession}
                 onLogout={handleLogoutLinkedInSession}
+              />
+              <BrowserSessionCard
+                source="reddit"
+                session={redditSession}
+                onOpen={handleOpenRedditSession}
+                onHide={handleHideRedditSession}
+                onLogout={handleLogoutRedditSession}
               />
 
               {bootstrap.xConnection ? (
@@ -1103,7 +1232,10 @@ function SettingsPanel({
   onChange: (value: UserSettings) => void;
   onSave: (value: UserSettings) => Promise<void>;
 }) {
-  const hasEnabledSources = settings.capture.sources.x || settings.capture.sources.linkedin;
+  const hasEnabledSources =
+    settings.capture.sources.x
+    || settings.capture.sources.linkedin
+    || settings.capture.sources.reddit;
   const updateBrowseCount = (source: BrowserSource, fallback: number) => (rawValue: string) =>
     onChange({
       ...settings,
@@ -1219,6 +1351,45 @@ function SettingsPanel({
                   min={1}
                   value={settings.capture.browsePageCount.linkedin}
                   onChange={(event) => updateBrowseCount("linkedin", 8)(event.target.value)}
+                />
+              </label>
+            </section>
+
+            <section
+              className={`settings-source-tile${settings.capture.sources.reddit ? " settings-source-tile--enabled" : ""}`}
+            >
+              <div className="settings-source-tile__top">
+                <div>
+                  <span className="settings-source-tile__title">Reddit</span>
+                  <span className="settings-source-tile__eyebrow">Community signal</span>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={settings.capture.sources.reddit}
+                  onChange={(event) =>
+                    onChange({
+                      ...settings,
+                      capture: {
+                        ...settings.capture,
+                        sources: {
+                          ...settings.capture.sources,
+                          reddit: event.target.checked
+                        }
+                      }
+                    })
+                  }
+                />
+              </div>
+              <p className="settings-source-tile__copy">
+                Conversation-heavy posts from your signed-in Reddit home feed, tuned separately from the faster social streams.
+              </p>
+              <label className="field">
+                <span>Reddit pages to browse</span>
+                <input
+                  type="number"
+                  min={1}
+                  value={settings.capture.browsePageCount.reddit}
+                  onChange={(event) => updateBrowseCount("reddit", 10)(event.target.value)}
                 />
               </label>
             </section>

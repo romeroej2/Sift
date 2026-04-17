@@ -58,6 +58,9 @@ pub struct AppState {
     pub linkedin_session_authenticated: Arc<RwLock<bool>>,
     pub linkedin_session_last_known_url: Arc<RwLock<Option<String>>>,
     pub linkedin_session_force_close: Arc<AtomicBool>,
+    pub reddit_session_authenticated: Arc<RwLock<bool>>,
+    pub reddit_session_last_known_url: Arc<RwLock<Option<String>>>,
+    pub reddit_session_force_close: Arc<AtomicBool>,
     pub x_session_capture_requests: Arc<Mutex<HashMap<String, XSessionCaptureRequest>>>,
     pub sync_guard: Arc<Mutex<()>>,
     pub quit_requested: Arc<AtomicBool>,
@@ -76,6 +79,9 @@ impl AppState {
             linkedin_session_authenticated: Arc::new(RwLock::new(false)),
             linkedin_session_last_known_url: Arc::new(RwLock::new(None)),
             linkedin_session_force_close: Arc::new(AtomicBool::new(false)),
+            reddit_session_authenticated: Arc::new(RwLock::new(false)),
+            reddit_session_last_known_url: Arc::new(RwLock::new(None)),
+            reddit_session_force_close: Arc::new(AtomicBool::new(false)),
             x_session_capture_requests: Arc::new(Mutex::new(HashMap::new())),
             sync_guard: Arc::new(Mutex::new(())),
             quit_requested: Arc::new(AtomicBool::new(false)),
@@ -181,6 +187,15 @@ impl AppState {
         .await
     }
 
+    async fn reddit_session_state(&self) -> BrowserSessionState {
+        self.browser_session_state(
+            REDDIT_SESSION_WINDOW_LABEL,
+            &self.reddit_session_authenticated,
+            &self.reddit_session_last_known_url,
+        )
+        .await
+    }
+
     async fn remember_x_session(
         &self,
         last_known_url: String,
@@ -227,6 +242,29 @@ impl AppState {
         self.clear_linkedin_session_runtime().await;
         self.db.clear_persisted_linkedin_session()
     }
+
+    async fn remember_reddit_session(
+        &self,
+        last_known_url: String,
+        is_authenticated: bool,
+    ) -> Result<(), AppError> {
+        *self.reddit_session_last_known_url.write().await = Some(last_known_url.clone());
+        *self.reddit_session_authenticated.write().await = is_authenticated;
+        self.db.save_persisted_reddit_session(&PersistedBrowserSession {
+            last_known_url,
+            is_authenticated,
+        })
+    }
+
+    async fn clear_reddit_session_runtime(&self) {
+        *self.reddit_session_last_known_url.write().await = None;
+        *self.reddit_session_authenticated.write().await = false;
+    }
+
+    async fn forget_reddit_session(&self) -> Result<(), AppError> {
+        self.clear_reddit_session_runtime().await;
+        self.db.clear_persisted_reddit_session()
+    }
 }
 
 const X_SESSION_WINDOW_LABEL: &str = "x-session";
@@ -238,6 +276,10 @@ const LINKEDIN_SESSION_WINDOW_LABEL: &str = "linkedin-session";
 const LINKEDIN_SESSION_POPUP_LABEL_PREFIX: &str = "linkedin-session-popup";
 const LINKEDIN_SESSION_HOME_URL: &str = "https://www.linkedin.com/feed/";
 const LINKEDIN_SESSION_DATA_STORE_ID: [u8; 16] = *b"SIFTLINKEDIN0001";
+const REDDIT_SESSION_WINDOW_LABEL: &str = "reddit-session";
+const REDDIT_SESSION_POPUP_LABEL_PREFIX: &str = "reddit-session-popup";
+const REDDIT_SESSION_HOME_URL: &str = "https://www.reddit.com/";
+const REDDIT_SESSION_DATA_STORE_ID: [u8; 16] = *b"SIFTREDDIT000001";
 const X_SESSION_BRIDGE_SCRIPT: &str = r#"
 if (
   ["x.com", "www.x.com", "twitter.com", "www.twitter.com"].includes(window.location.hostname)
@@ -1080,16 +1122,25 @@ if (
           padding-inline: 4px 2px;
         }
         .sift-linkedin-session-controls__button {
+          appearance: none;
+          -webkit-appearance: none;
           width: 36px;
           height: 36px;
+          min-width: 36px;
+          min-height: 36px;
+          padding: 0;
           border: 0;
           border-radius: 999px;
           display: inline-flex;
+          flex: 0 0 auto;
           align-items: center;
           justify-content: center;
           background: rgba(255, 255, 255, 0.08);
           color: inherit;
           cursor: pointer;
+          line-height: 0;
+          font-size: 0;
+          vertical-align: middle;
           transition: background 140ms ease, transform 140ms ease, opacity 140ms ease;
           pointer-events: auto;
           touch-action: manipulation;
@@ -1113,6 +1164,11 @@ if (
         .sift-linkedin-session-controls__button svg {
           width: 18px;
           height: 18px;
+          min-width: 18px;
+          min-height: 18px;
+          display: block;
+          flex: 0 0 auto;
+          overflow: visible;
           fill: none;
           stroke: currentColor;
           stroke-width: 1.9;
@@ -1218,6 +1274,16 @@ if (
       window.setTimeout(attach, 200);
     }
   };
+
+  if (!window.__SIFT_LINKEDIN_SESSION_CONTROLS_WATCHDOG__) {
+    window.__SIFT_LINKEDIN_SESSION_CONTROLS_WATCHDOG__ = window.setInterval(() => {
+      try {
+        siftEnsureSessionControls();
+      } catch {
+        // Keep the session controls best-effort during LinkedIn feed navigations.
+      }
+    }, 1500);
+  }
 
   const siftFeedSelector = "main article";
   const siftFallbackFeedSelectors = [
@@ -1774,6 +1840,7 @@ if (
 
   window.__SIFT_COLLECT_LINKEDIN_FEED__ = async (requestId, options = {}) => {
     try {
+      siftEnsureSessionControls();
       if (!/^\/feed(?:$|[/?#])/.test(window.location.pathname)) {
         throw new Error("LinkedIn session is not on the home feed yet.");
       }
@@ -1785,6 +1852,7 @@ if (
       const maxItems = Math.min(Math.max(Number(options.maxItems) || 400, 100), 800);
       const maxPasses = Math.max(Number(options.maxPasses) || 8, 1);
       const waitForAdvanceMs = Math.max(Number(options.waitForAdvanceMs) || 4000, 1200);
+      const stallLimit = Math.max(Number(options.stablePasses) || 3, 2);
       const deadline = Date.now() + 20000;
       while (Date.now() < deadline && !siftFeedSurfaceReady(siftFeedSelector)) {
         await siftWait(250);
@@ -1796,6 +1864,9 @@ if (
 
       const collected = new Map();
       let scroller = siftFindFeedScroller(siftFeedSelector);
+      let stalledPasses = 0;
+      let completedPasses = 0;
+      let endedEarly = false;
       siftScrollFeedTo(scroller, 0);
       await siftWait(750);
       for (let attempt = 0; attempt < 3 && siftFeedElements(siftFeedSelector).length === 0; attempt += 1) {
@@ -1827,6 +1898,7 @@ if (
       };
 
       for (let pass = 0; pass < maxPasses; pass += 1) {
+        completedPasses = pass + 1;
         siftCollectVisiblePosts(siftFeedSelector, collected);
         const itemCount = collected.size;
         const freshCount = Array.from(collected.values()).filter((item) => siftIsFresh(item)).length;
@@ -1839,7 +1911,7 @@ if (
             itemCount,
             freshCount,
             stablePasses: 0,
-            exhaustedPasses: 0,
+            exhaustedPasses: stalledPasses,
             boundaryPasses: 0,
           },
         }).catch(() => undefined);
@@ -1854,7 +1926,7 @@ if (
           durationMs: 320,
           settleMs: 120,
         });
-        const advanced = await siftWaitForFeedAdvance(
+        let advanced = await siftWaitForFeedAdvance(
           siftFeedSelector,
           scroller,
           advance.previousIds,
@@ -1862,7 +1934,42 @@ if (
           waitForAdvanceMs,
         );
         if (!advanced) {
-          break;
+          const fallbackAdvance = await siftAdvanceFeed(
+            siftFeedSelector,
+            scroller,
+            Math.max(baseScrollStep * 1.35, 980),
+            {
+              segments: 4,
+              durationMs: 380,
+              settleMs: 160,
+            },
+          );
+          advanced = await siftWaitForFeedAdvance(
+            siftFeedSelector,
+            scroller,
+            fallbackAdvance.previousIds,
+            fallbackAdvance.previousHeight,
+            waitForAdvanceMs + 2000,
+          );
+        }
+
+        const before = collected.size;
+        siftCollectVisiblePosts(siftFeedSelector, collected);
+        const grew = collected.size > before;
+        if (!(advanced || grew)) {
+          stalledPasses += 1;
+          if (stalledPasses >= stallLimit) {
+            endedEarly = completedPasses < maxPasses;
+            break;
+          }
+          await siftWait(900);
+        } else {
+          stalledPasses = 0;
+        }
+
+        if (!(advanced || grew)) {
+          scroller = siftFindFeedScroller(siftFeedSelector);
+          continue;
         }
 
         scroller = siftFindFeedScroller(siftFeedSelector);
@@ -1875,6 +1982,9 @@ if (
           currentUrl: window.location.href,
           items: Array.from(collected.values()),
           error: null,
+          completedPasses,
+          totalPasses: maxPasses,
+          endedEarly,
         },
       });
     } catch (error) {
@@ -1884,6 +1994,351 @@ if (
           currentUrl: window.location.href,
           items: [],
           error: error instanceof Error ? error.message : String(error),
+          completedPasses: null,
+          totalPasses: null,
+          endedEarly: null,
+        },
+      });
+    }
+  };
+}
+"#;
+
+const REDDIT_SESSION_BRIDGE_SCRIPT: &str = r#"
+if (
+  ["reddit.com", "www.reddit.com"].includes(window.location.hostname)
+  && !window.__SIFT_COLLECT_REDDIT_FEED__
+) {
+  const siftWait = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
+  const siftReadText = (node) => (node?.innerText || node?.textContent || "").replace(/\s+/g, " ").trim();
+  const siftControlIcons = {
+    hide:
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3l18 18"></path><path d="M10.58 10.58A3 3 0 0 0 9 12a3 3 0 0 0 5.33 1.82"></path><path d="M9.88 5.09A10.94 10.94 0 0 1 12 4.91c5 0 9.27 3.11 11 7.5a11.8 11.8 0 0 1-3.29 4.68"></path><path d="M6.61 6.61A11.81 11.81 0 0 0 1 12.41a11.84 11.84 0 0 0 4.26 5.1"></path></svg>',
+    logout:
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><path d="M16 17l5-5-5-5"></path><path d="M21 12H9"></path></svg>',
+  };
+
+  const siftEnsureSessionControls = () => {
+    if (!document.body) {
+      return;
+    }
+
+    if (!document.getElementById("sift-reddit-session-controls-style")) {
+      const style = document.createElement("style");
+      style.id = "sift-reddit-session-controls-style";
+      style.textContent = `
+        #sift-reddit-session-controls {
+          position: fixed;
+          right: 18px;
+          bottom: 18px;
+          z-index: 2147483647;
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          padding: 10px 12px;
+          border-radius: 999px;
+          color: #fff;
+          background: rgba(11, 19, 31, 0.88);
+          box-shadow: 0 12px 36px rgba(0, 0, 0, 0.32);
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+        .sift-reddit-session-controls__badge { font-size: 12px; font-weight: 700; letter-spacing: 0.01em; }
+        .sift-reddit-session-controls__button {
+          appearance: none;
+          -webkit-appearance: none;
+          width: 36px;
+          height: 36px;
+          min-width: 36px;
+          min-height: 36px;
+          padding: 0;
+          border: 0;
+          border-radius: 999px;
+          display: inline-flex;
+          flex: 0 0 auto;
+          align-items: center;
+          justify-content: center;
+          background: rgba(255, 255, 255, 0.08);
+          color: inherit;
+          cursor: pointer;
+          line-height: 0;
+          font-size: 0;
+          vertical-align: middle;
+        }
+        .sift-reddit-session-controls__button--danger { background: rgba(255, 69, 0, 0.18); }
+        .sift-reddit-session-controls__button svg {
+          width: 18px;
+          height: 18px;
+          min-width: 18px;
+          min-height: 18px;
+          display: block;
+          flex: 0 0 auto;
+          overflow: visible;
+          fill: none;
+          stroke: currentColor;
+          stroke-width: 1.9;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+        }
+      `;
+      document.head.appendChild(style);
+    }
+
+    if (document.getElementById("sift-reddit-session-controls")) {
+      return;
+    }
+
+    const dock = document.createElement("div");
+    dock.id = "sift-reddit-session-controls";
+    const badge = document.createElement("span");
+    badge.className = "sift-reddit-session-controls__badge";
+    badge.textContent = "SIFT Reddit";
+    dock.appendChild(badge);
+
+    const buildButton = (command, label, icon, danger = false) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "sift-reddit-session-controls__button";
+      if (danger) {
+        button.classList.add("sift-reddit-session-controls__button--danger");
+      }
+      button.setAttribute("aria-label", label);
+      button.title = label;
+      button.innerHTML = icon;
+      button.addEventListener("click", () => {
+        window.__TAURI_INTERNALS__?.invoke?.(command).catch(() => undefined);
+      });
+      return button;
+    };
+
+    dock.appendChild(buildButton("hide_reddit_session_window", "Hide this Reddit window", siftControlIcons.hide));
+    dock.appendChild(buildButton("logout_reddit_session_window", "Log out of Reddit in SIFT", siftControlIcons.logout, true));
+    document.body.appendChild(dock);
+  };
+
+  const siftFeedSelector = 'shreddit-post, faceplate-tracker[noun="feed_post"], article[data-testid="post-container"], div[data-testid="post-container"]';
+  const siftPostElements = () =>
+    Array.from(document.querySelectorAll(siftFeedSelector))
+      .filter((node) => node instanceof Element)
+      .filter((node, index, items) => items.indexOf(node) === index);
+
+  const siftPostUrl = (article) => {
+    const candidates = Array.from(article.querySelectorAll('a[href*="/comments/"]'));
+    for (const link of candidates) {
+      const href = link.getAttribute("href") || "";
+      try {
+        const url = new URL(href, window.location.origin);
+        if (/\/comments\/[^/]+/i.test(url.pathname)) {
+          url.hash = "";
+          return url.toString();
+        }
+      } catch {}
+    }
+    return null;
+  };
+
+  const siftSharedUrls = (article, sourceUrl) => {
+    const urls = new Set();
+    Array.from(article.querySelectorAll("a[href]")).forEach((link) => {
+      const href = link.getAttribute("href") || "";
+      try {
+        const url = new URL(href, window.location.origin);
+        if (!["http:", "https:"].includes(url.protocol)) {
+          return;
+        }
+        url.hash = "";
+        if (sourceUrl && url.toString() === sourceUrl) {
+          return;
+        }
+        if (["reddit.com", "www.reddit.com"].includes(url.hostname) && /\/comments\/[^/]+/i.test(url.pathname)) {
+          return;
+        }
+        urls.add(url.toString());
+      } catch {}
+    });
+    return Array.from(urls);
+  };
+
+  const siftParsePost = (article) => {
+    const sourceUrl = siftPostUrl(article);
+    const postId = sourceUrl?.match(/\/comments\/([^/]+)/i)?.[1]
+      || article.getAttribute("id")
+      || article.getAttribute("post-id")
+      || article.getAttribute("thingid")
+      || null;
+    if (!sourceUrl || !postId) {
+      return null;
+    }
+
+    const authorHandle =
+      article.getAttribute("author")
+      || article.querySelector('a[href*="/user/"], a[href*="/u/"]')?.getAttribute("href")?.match(/\/(?:user|u)\/([^/?#]+)/i)?.[1]
+      || "reddit-user";
+    const authorName = article.getAttribute("subreddit-prefixed-name")
+      || article.querySelector('[slot="subreddit-name"], [data-testid="subreddit-name"]')?.textContent?.trim()
+      || article.querySelector('[slot="authorName"]')?.textContent?.trim()
+      || `u/${authorHandle}`;
+    const title = article.getAttribute("post-title")
+      || siftReadText(article.querySelector('[slot="title"], h3'))
+      || "";
+    const body = siftReadText(article.querySelector('[slot="text-body"], [data-click-id="text"], [data-adclicklocation="media"], p'));
+    const text = [title, body].filter(Boolean).join("\n\n").trim();
+    if (!text) {
+      return null;
+    }
+
+    const postedAt =
+      article.querySelector("faceplate-timeago")?.getAttribute("ts")
+      || article.querySelector("time")?.getAttribute("datetime")
+      || new Date().toISOString();
+    const socialContext = siftReadText(article.querySelector('[slot="credit-bar"], [slot="thumbnail"]')) || null;
+
+    return {
+      id: postId,
+      authorName,
+      authorHandle: authorHandle.replace(/^u\//i, "").replace(/^@/, ""),
+      text,
+      sourceUrl,
+      postedAt,
+      isRepost: false,
+      isReply: false,
+      socialContext,
+      sharedUrls: siftSharedUrls(article, sourceUrl),
+      media: [],
+    };
+  };
+
+  const siftCollectVisiblePosts = (collected) => {
+    siftPostElements().forEach((article) => {
+      const parsed = siftParsePost(article);
+      if (parsed) {
+        collected.set(parsed.id, parsed);
+      }
+    });
+  };
+
+  const siftVisiblePostIds = () => new Set(siftPostElements().map((article) => siftPostUrl(article) || article.id).filter(Boolean));
+  const siftReadScrollMetrics = () => {
+    const root = document.scrollingElement || document.documentElement;
+    return {
+      top: window.scrollY || root.scrollTop || 0,
+      height: root.scrollHeight || document.documentElement.scrollHeight || 0,
+      clientHeight: window.innerHeight || root.clientHeight || document.documentElement.clientHeight || 0,
+    };
+  };
+  const siftScrollTo = (top) => window.scrollTo(0, Math.max(0, top));
+  const siftAdvanceFeed = async (distance) => {
+    const before = siftReadScrollMetrics();
+    const previousIds = siftVisiblePostIds();
+    siftScrollTo(before.top + distance);
+    return { previousHeight: before.height, previousIds };
+  };
+  const siftWaitForAdvance = async (previousIds, previousHeight, timeoutMs) => {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      await siftWait(250);
+      const metrics = siftReadScrollMetrics();
+      if (metrics.height > previousHeight + 48) {
+        return true;
+      }
+      for (const id of siftVisiblePostIds()) {
+        if (!previousIds.has(id)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  if (!window.__SIFT_REDDIT_SESSION_CONTROLS_WATCHDOG__) {
+    window.__SIFT_REDDIT_SESSION_CONTROLS_WATCHDOG__ = window.setInterval(() => {
+      try {
+        siftEnsureSessionControls();
+      } catch {}
+    }, 1500);
+  }
+
+  window.__SIFT_COLLECT_REDDIT_FEED__ = async (requestId, options = {}) => {
+    try {
+      siftEnsureSessionControls();
+      if (!/^\/(?:$|best\/?$|hot\/?$|new\/?$)/.test(window.location.pathname)) {
+        throw new Error("Reddit session is not on the home feed yet.");
+      }
+
+      const maxItems = Math.min(Math.max(Number(options.maxItems) || 400, 100), 800);
+      const maxPasses = Math.max(Number(options.maxPasses) || 10, 1);
+      const waitForAdvanceMs = Math.max(Number(options.waitForAdvanceMs) || 4000, 1200);
+      const stallLimit = Math.max(Number(options.stablePasses) || 3, 2);
+      const collected = new Map();
+      let stalledPasses = 0;
+      let completedPasses = 0;
+      let endedEarly = false;
+      siftScrollTo(0);
+      await siftWait(900);
+
+      for (let pass = 0; pass < maxPasses; pass += 1) {
+        completedPasses = pass + 1;
+        siftCollectVisiblePosts(collected);
+        await window.__TAURI_INTERNALS__.invoke("submit_reddit_feed_capture_progress", {
+          progress: {
+            requestId,
+            currentUrl: window.location.href,
+            pass: pass + 1,
+            totalPasses: maxPasses,
+            itemCount: collected.size,
+            freshCount: collected.size,
+            stablePasses: stalledPasses,
+            exhaustedPasses: stalledPasses,
+            boundaryPasses: 0,
+          },
+        }).catch(() => undefined);
+
+        if (collected.size >= maxItems) {
+          break;
+        }
+
+        const advance = await siftAdvanceFeed(Math.max(siftReadScrollMetrics().clientHeight * 0.9, 880));
+        const advanced = await siftWaitForAdvance(
+          advance.previousIds,
+          advance.previousHeight,
+          waitForAdvanceMs,
+        );
+        const before = collected.size;
+        siftCollectVisiblePosts(collected);
+        const grew = collected.size > before;
+        if (!(advanced || grew)) {
+          stalledPasses += 1;
+          if (stalledPasses >= stallLimit) {
+            endedEarly = completedPasses < maxPasses;
+            break;
+          }
+          await siftWait(900);
+        } else {
+          stalledPasses = 0;
+        }
+      }
+
+      siftScrollTo(0);
+      await window.__TAURI_INTERNALS__.invoke("submit_reddit_feed_capture", {
+        capture: {
+          requestId,
+          currentUrl: window.location.href,
+          items: Array.from(collected.values()),
+          error: null,
+          completedPasses,
+          totalPasses: maxPasses,
+          endedEarly,
+        },
+      });
+    } catch (error) {
+      await window.__TAURI_INTERNALS__.invoke("submit_reddit_feed_capture", {
+        capture: {
+          requestId,
+          currentUrl: window.location.href,
+          items: [],
+          error: error instanceof Error ? error.message : String(error),
+          completedPasses: null,
+          totalPasses: null,
+          endedEarly: null,
         },
       });
     }
@@ -1902,6 +2357,10 @@ fn is_linkedin_domain(url: &Url) -> bool {
     matches!(url.host_str(), Some("linkedin.com" | "www.linkedin.com"))
 }
 
+fn is_reddit_domain(url: &Url) -> bool {
+    matches!(url.host_str(), Some("reddit.com" | "www.reddit.com"))
+}
+
 fn is_google_auth_url(url: &Url) -> bool {
     matches!(url.host_str(), Some("accounts.google.com"))
 }
@@ -1914,6 +2373,10 @@ fn is_x_session_related_label(label: &str) -> bool {
 
 fn is_linkedin_session_related_label(label: &str) -> bool {
     label == LINKEDIN_SESSION_WINDOW_LABEL || label.starts_with(LINKEDIN_SESSION_POPUP_LABEL_PREFIX)
+}
+
+fn is_reddit_session_related_label(label: &str) -> bool {
+    label == REDDIT_SESSION_WINDOW_LABEL || label.starts_with(REDDIT_SESSION_POPUP_LABEL_PREFIX)
 }
 
 fn x_session_window_labels(app: &tauri::AppHandle) -> Vec<String> {
@@ -1930,6 +2393,13 @@ fn linkedin_session_window_labels(app: &tauri::AppHandle) -> Vec<String> {
         .collect()
 }
 
+fn reddit_session_window_labels(app: &tauri::AppHandle) -> Vec<String> {
+    app.webview_windows()
+        .into_keys()
+        .filter(|label| is_reddit_session_related_label(label))
+        .collect()
+}
+
 fn close_x_session_windows(app: &tauri::AppHandle) -> Result<(), String> {
     for label in x_session_window_labels(app) {
         if let Some(window) = app.get_webview_window(&label) {
@@ -1942,6 +2412,16 @@ fn close_x_session_windows(app: &tauri::AppHandle) -> Result<(), String> {
 
 fn close_linkedin_session_windows(app: &tauri::AppHandle) -> Result<(), String> {
     for label in linkedin_session_window_labels(app) {
+        if let Some(window) = app.get_webview_window(&label) {
+            window.close().map_err(|error| error.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
+fn close_reddit_session_windows(app: &tauri::AppHandle) -> Result<(), String> {
+    for label in reddit_session_window_labels(app) {
         if let Some(window) = app.get_webview_window(&label) {
             window.close().map_err(|error| error.to_string())?;
         }
@@ -1969,6 +2449,10 @@ fn default_linkedin_session_url() -> Url {
     Url::parse(LINKEDIN_SESSION_HOME_URL).expect("valid linkedin home url")
 }
 
+fn default_reddit_session_url() -> Url {
+    Url::parse(REDDIT_SESSION_HOME_URL).expect("valid reddit home url")
+}
+
 fn resolve_x_session_launch_url(saved_url: Option<&str>) -> Url {
     saved_url
         .and_then(|raw| Url::parse(raw).ok())
@@ -1981,6 +2465,13 @@ fn resolve_linkedin_session_launch_url(saved_url: Option<&str>) -> Url {
         .and_then(|raw| Url::parse(raw).ok())
         .filter(is_linkedin_domain)
         .unwrap_or_else(default_linkedin_session_url)
+}
+
+fn resolve_reddit_session_launch_url(saved_url: Option<&str>) -> Url {
+    saved_url
+        .and_then(|raw| Url::parse(raw).ok())
+        .filter(is_reddit_domain)
+        .unwrap_or_else(default_reddit_session_url)
 }
 
 fn build_x_session_window(
@@ -2087,6 +2578,16 @@ fn is_completed_linkedin_session_url(url: &Url) -> bool {
         && !url.path().starts_with("/signup")
 }
 
+fn is_completed_reddit_session_url(url: &Url) -> bool {
+    if !is_reddit_domain(url) {
+        return false;
+    }
+
+    !url.path().starts_with("/login")
+        && !url.path().starts_with("/register")
+        && !url.path().starts_with("/password")
+}
+
 fn build_linkedin_session_window(
     app: &tauri::AppHandle,
     state: AppState,
@@ -2153,6 +2654,70 @@ fn build_linkedin_session_window(
     .map_err(|error| error.to_string())
 }
 
+fn build_reddit_session_window(
+    app: &tauri::AppHandle,
+    state: AppState,
+    initial_url: Url,
+    is_visible: bool,
+    focus_window: bool,
+) -> Result<tauri::WebviewWindow, String> {
+    let popup_app = app.clone();
+    let page_state = state.clone();
+
+    WebviewWindowBuilder::new(
+        app,
+        REDDIT_SESSION_WINDOW_LABEL,
+        WebviewUrl::External(initial_url),
+    )
+    .data_store_identifier(REDDIT_SESSION_DATA_STORE_ID)
+    .title("SIFT Reddit Session")
+    .inner_size(1320.0, 900.0)
+    .min_inner_size(980.0, 700.0)
+    .resizable(true)
+    .visible(is_visible)
+    .focused(focus_window)
+    .background_throttling(BackgroundThrottlingPolicy::Disabled)
+    .center()
+    .prevent_overflow()
+    .initialization_script(REDDIT_SESSION_BRIDGE_SCRIPT)
+    .on_new_window(move |url, features| {
+        let popup_label = format!("{REDDIT_SESSION_POPUP_LABEL_PREFIX}-{}", Uuid::new_v4());
+
+        let popup_window = WebviewWindowBuilder::new(
+            &popup_app,
+            popup_label,
+            WebviewUrl::External(Url::parse("about:blank").expect("valid popup url")),
+        )
+        .data_store_identifier(REDDIT_SESSION_DATA_STORE_ID)
+        .window_features(features)
+        .title(url.as_str())
+        .on_document_title_changed(|window, title| {
+            let _ = window.set_title(&title);
+        })
+        .build()
+        .expect("reddit session popup window");
+
+        tauri::webview::NewWindowResponse::Create {
+            window: popup_window,
+        }
+    })
+    .on_page_load(move |_window, payload| {
+        if payload.event() == tauri::webview::PageLoadEvent::Finished {
+            let page_state = page_state.clone();
+            let url = payload.url().to_string();
+            let is_authenticated = is_completed_reddit_session_url(payload.url());
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = page_state.remember_reddit_session(url, is_authenticated).await
+                {
+                    eprintln!("failed to persist Reddit session page state: {error}");
+                }
+            });
+        }
+    })
+    .build()
+    .map_err(|error| error.to_string())
+}
+
 fn restore_x_session_window(state: &AppState) -> Result<(), AppError> {
     let Some(saved_session) = state.db.load_persisted_x_session()? else {
         return Ok(());
@@ -2208,6 +2773,28 @@ fn restore_linkedin_session_window(state: &AppState) -> Result<(), AppError> {
     Ok(())
 }
 
+fn restore_reddit_session_window(state: &AppState) -> Result<(), AppError> {
+    let Some(saved_session) = state.db.load_persisted_reddit_session()? else {
+        return Ok(());
+    };
+
+    if state.app.get_webview_window(REDDIT_SESSION_WINDOW_LABEL).is_some() {
+        return Ok(());
+    }
+
+    let initial_url = resolve_reddit_session_launch_url(Some(saved_session.last_known_url.as_str()));
+    let initial_url_string = initial_url.to_string();
+    *state.reddit_session_last_known_url.blocking_write() = Some(initial_url_string.clone());
+    *state.reddit_session_authenticated.blocking_write() = saved_session.is_authenticated;
+    state.db.save_persisted_reddit_session(&PersistedBrowserSession {
+        last_known_url: initial_url_string,
+        is_authenticated: saved_session.is_authenticated,
+    })?;
+    build_reddit_session_window(&state.app, state.clone(), initial_url, false, false)
+        .map_err(AppError::Message)?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn get_bootstrap_state(state: tauri::State<'_, AppState>) -> Result<BootstrapState, String> {
     state.db.load_bootstrap().map_err(|error| error.to_string())
@@ -2239,6 +2826,13 @@ async fn get_linkedin_session_state(
     state: tauri::State<'_, AppState>,
 ) -> Result<BrowserSessionState, String> {
     Ok(state.linkedin_session_state().await)
+}
+
+#[tauri::command]
+async fn get_reddit_session_state(
+    state: tauri::State<'_, AppState>,
+) -> Result<BrowserSessionState, String> {
+    Ok(state.reddit_session_state().await)
 }
 
 #[tauri::command]
@@ -2318,6 +2912,43 @@ async fn open_linkedin_session_window(
     let _ = window.set_focus();
 
     Ok(state.linkedin_session_state().await)
+}
+
+#[tauri::command]
+async fn open_reddit_session_window(
+    state: tauri::State<'_, AppState>,
+) -> Result<BrowserSessionState, String> {
+    if let Some(window) = state.app.get_webview_window(REDDIT_SESSION_WINDOW_LABEL) {
+        let _ = window.show();
+        let _ = window.set_focus();
+        return Ok(state.reddit_session_state().await);
+    }
+
+    let saved_session = state
+        .db
+        .load_persisted_reddit_session()
+        .map_err(|error| error.to_string())?;
+    let initial_url = resolve_reddit_session_launch_url(
+        saved_session
+            .as_ref()
+            .map(|session| session.last_known_url.as_str()),
+    );
+    let is_authenticated = saved_session
+        .as_ref()
+        .is_some_and(|session| session.is_authenticated);
+
+    state
+        .remember_reddit_session(initial_url.to_string(), is_authenticated)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let window =
+        build_reddit_session_window(&state.app, state.inner().clone(), initial_url, true, true)?;
+
+    let _ = window.show();
+    let _ = window.set_focus();
+
+    Ok(state.reddit_session_state().await)
 }
 
 #[tauri::command]
@@ -2402,12 +3033,50 @@ async fn logout_linkedin_session(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
+async fn logout_reddit_session(state: &AppState) -> Result<(), String> {
+    state.reddit_session_force_close.store(true, Ordering::SeqCst);
+
+    let result = (|| -> Result<(), String> {
+        if let Some(window) = state.app.get_webview_window(REDDIT_SESSION_WINDOW_LABEL) {
+            window
+                .clear_all_browsing_data()
+                .map_err(|error| error.to_string())?;
+        }
+
+        close_reddit_session_windows(&state.app)
+    })();
+
+    if let Err(error) = result {
+        state.reddit_session_force_close.store(false, Ordering::SeqCst);
+        return Err(error);
+    }
+
+    state
+        .forget_reddit_session()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if state.app.get_webview_window(REDDIT_SESSION_WINDOW_LABEL).is_none() {
+        state.reddit_session_force_close.store(false, Ordering::SeqCst);
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 async fn close_linkedin_session_window(
     state: tauri::State<'_, AppState>,
 ) -> Result<BrowserSessionState, String> {
     logout_linkedin_session(state.inner()).await?;
     Ok(state.linkedin_session_state().await)
+}
+
+#[tauri::command]
+async fn close_reddit_session_window(
+    state: tauri::State<'_, AppState>,
+) -> Result<BrowserSessionState, String> {
+    logout_reddit_session(state.inner()).await?;
+    Ok(state.reddit_session_state().await)
 }
 
 #[tauri::command]
@@ -2433,6 +3102,17 @@ async fn hide_linkedin_session_window(
 }
 
 #[tauri::command]
+async fn hide_reddit_session_window(
+    state: tauri::State<'_, AppState>,
+) -> Result<BrowserSessionState, String> {
+    if let Some(window) = state.app.get_webview_window(REDDIT_SESSION_WINDOW_LABEL) {
+        window.hide().map_err(|error| error.to_string())?;
+    }
+
+    Ok(state.reddit_session_state().await)
+}
+
+#[tauri::command]
 async fn logout_x_session_window(
     state: tauri::State<'_, AppState>,
 ) -> Result<BrowserSessionState, String> {
@@ -2446,6 +3126,14 @@ async fn logout_linkedin_session_window(
 ) -> Result<BrowserSessionState, String> {
     logout_linkedin_session(state.inner()).await?;
     Ok(state.linkedin_session_state().await)
+}
+
+#[tauri::command]
+async fn logout_reddit_session_window(
+    state: tauri::State<'_, AppState>,
+) -> Result<BrowserSessionState, String> {
+    logout_reddit_session(state.inner()).await?;
+    Ok(state.reddit_session_state().await)
 }
 
 #[tauri::command]
@@ -2549,26 +3237,46 @@ async fn submit_linkedin_feed_capture(
 }
 
 #[tauri::command]
+async fn submit_reddit_feed_capture(
+    state: tauri::State<'_, AppState>,
+    capture: XSessionCapturePayload,
+) -> Result<(), String> {
+    submit_x_feed_capture(state, capture).await
+}
+
+#[tauri::command]
 async fn submit_x_feed_capture_progress(
     state: tauri::State<'_, AppState>,
     progress: XSessionCaptureProgressPayload,
 ) -> Result<(), String> {
-    let (run_id, reason) = {
+    let (run_id, reason, source_label) = {
         let mut requests = state.x_session_capture_requests.lock().await;
         let request = requests.get_mut(&progress.request_id).ok_or_else(|| {
             "The feed capture request expired before the page reported progress.".to_string()
         })?;
         request.last_progress_at = Instant::now();
         request.latest_progress = Some(progress.snapshot());
-        (request.run_id.clone(), request.reason.clone())
+        (
+            request.run_id.clone(),
+            request.reason.clone(),
+            request.source_label.clone(),
+        )
     };
 
-    emit_capture_progress(state.inner(), &run_id, &reason, &progress);
+    emit_capture_progress(state.inner(), &run_id, &reason, &source_label, &progress);
     Ok(())
 }
 
 #[tauri::command]
 async fn submit_linkedin_feed_capture_progress(
+    state: tauri::State<'_, AppState>,
+    progress: XSessionCaptureProgressPayload,
+) -> Result<(), String> {
+    submit_x_feed_capture_progress(state, progress).await
+}
+
+#[tauri::command]
+async fn submit_reddit_feed_capture_progress(
     state: tauri::State<'_, AppState>,
     progress: XSessionCaptureProgressPayload,
 ) -> Result<(), String> {
@@ -2748,6 +3456,10 @@ pub fn run() {
                 eprintln!("failed to restore LinkedIn session window: {error}");
                 log::error!("failed to restore LinkedIn session window: {error}");
             }
+            if let Err(error) = restore_reddit_session_window(&state) {
+                eprintln!("failed to restore Reddit session window: {error}");
+                log::error!("failed to restore Reddit session window: {error}");
+            }
 
             tauri::async_runtime::spawn(run_scheduler(state.clone()));
             tauri::async_runtime::spawn(async move {
@@ -2776,6 +3488,12 @@ pub fn run() {
                     {
                         api.prevent_close();
                         let _ = window.hide();
+                    } else if window.label() == REDDIT_SESSION_WINDOW_LABEL
+                        && !state.quit_requested.load(Ordering::SeqCst)
+                        && !state.reddit_session_force_close.load(Ordering::SeqCst)
+                    {
+                        api.prevent_close();
+                        let _ = window.hide();
                     }
                 }
             }
@@ -2798,6 +3516,14 @@ pub fn run() {
                             state.clear_linkedin_session_runtime().await;
                         });
                     }
+                } else if window.label() == REDDIT_SESSION_WINDOW_LABEL {
+                    if let Some(state) = window.try_state::<AppState>() {
+                        let state = state.inner().clone();
+                        state.reddit_session_force_close.store(false, Ordering::SeqCst);
+                        tauri::async_runtime::spawn(async move {
+                            state.clear_reddit_session_runtime().await;
+                        });
+                    }
                 }
             }
             _ => {}
@@ -2807,21 +3533,28 @@ pub fn run() {
             save_settings,
             get_x_session_state,
             get_linkedin_session_state,
+            get_reddit_session_state,
             open_x_session_window,
             open_linkedin_session_window,
+            open_reddit_session_window,
             close_x_session_window,
             close_linkedin_session_window,
+            close_reddit_session_window,
             hide_x_session_window,
             hide_linkedin_session_window,
+            hide_reddit_session_window,
             logout_x_session_window,
             logout_linkedin_session_window,
+            logout_reddit_session_window,
             verify_lm_studio,
             start_x_connect,
             poll_x_connect,
             submit_x_feed_capture,
             submit_linkedin_feed_capture,
+            submit_reddit_feed_capture,
             submit_x_feed_capture_progress,
             submit_linkedin_feed_capture_progress,
+            submit_reddit_feed_capture_progress,
             run_sync,
             disconnect_x,
             open_external_url

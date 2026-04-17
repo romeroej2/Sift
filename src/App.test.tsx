@@ -14,15 +14,19 @@ const {
   getBootstrapStateMock,
   getXSessionStateMock,
   getLinkedInSessionStateMock,
+  getRedditSessionStateMock,
   verifyLmStudioMock,
   saveSettingsMock,
   runSyncMock,
   openXSessionWindowMock,
   openLinkedInSessionWindowMock,
+  openRedditSessionWindowMock,
   hideXSessionWindowMock,
   hideLinkedInSessionWindowMock,
+  hideRedditSessionWindowMock,
   logoutXSessionWindowMock,
   logoutLinkedInSessionWindowMock,
+  logoutRedditSessionWindowMock,
   disconnectXMock,
   openExternalUrlMock,
   listenMock,
@@ -34,6 +38,7 @@ const {
   getBootstrapStateMock: vi.fn<() => Promise<BootstrapState>>(),
   getXSessionStateMock: vi.fn<() => Promise<BrowserSessionState>>(),
   getLinkedInSessionStateMock: vi.fn<() => Promise<BrowserSessionState>>(),
+  getRedditSessionStateMock: vi.fn<() => Promise<BrowserSessionState>>(),
   verifyLmStudioMock: vi.fn<
     (baseUrl: string, authToken: string | null) => Promise<LmStudioHealth>
   >(),
@@ -41,10 +46,13 @@ const {
   runSyncMock: vi.fn(),
   openXSessionWindowMock: vi.fn(),
   openLinkedInSessionWindowMock: vi.fn(),
+  openRedditSessionWindowMock: vi.fn(),
   hideXSessionWindowMock: vi.fn(),
   hideLinkedInSessionWindowMock: vi.fn(),
+  hideRedditSessionWindowMock: vi.fn(),
   logoutXSessionWindowMock: vi.fn(),
   logoutLinkedInSessionWindowMock: vi.fn(),
+  logoutRedditSessionWindowMock: vi.fn(),
   disconnectXMock: vi.fn(),
   openExternalUrlMock: vi.fn(),
   listenMock: vi.fn(),
@@ -58,13 +66,17 @@ vi.mock("./lib/api", () => ({
   disconnectX: disconnectXMock,
   getBootstrapState: getBootstrapStateMock,
   getLinkedInSessionState: getLinkedInSessionStateMock,
+  getRedditSessionState: getRedditSessionStateMock,
   getXSessionState: getXSessionStateMock,
   hideLinkedInSessionWindow: hideLinkedInSessionWindowMock,
+  hideRedditSessionWindow: hideRedditSessionWindowMock,
   hideXSessionWindow: hideXSessionWindowMock,
   logoutLinkedInSessionWindow: logoutLinkedInSessionWindowMock,
+  logoutRedditSessionWindow: logoutRedditSessionWindowMock,
   logoutXSessionWindow: logoutXSessionWindowMock,
   openExternalUrl: openExternalUrlMock,
   openLinkedInSessionWindow: openLinkedInSessionWindowMock,
+  openRedditSessionWindow: openRedditSessionWindowMock,
   openXSessionWindow: openXSessionWindowMock,
   runSync: runSyncMock,
   saveSettings: saveSettingsMock,
@@ -150,15 +162,18 @@ function createSessionState(overrides: Partial<BrowserSessionState> = {}): Brows
 async function renderLoadedApp({
   bootstrap = createBootstrapState(),
   session = createSessionState(),
-  linkedinSession = createSessionState()
+  linkedinSession = createSessionState(),
+  redditSession = createSessionState()
 }: {
   bootstrap?: BootstrapState;
   session?: BrowserSessionState;
   linkedinSession?: BrowserSessionState;
+  redditSession?: BrowserSessionState;
 } = {}) {
   getBootstrapStateMock.mockResolvedValue(bootstrap);
   getXSessionStateMock.mockResolvedValue(session);
   getLinkedInSessionStateMock.mockResolvedValue(linkedinSession);
+  getRedditSessionStateMock.mockResolvedValue(redditSession);
 
   render(<App />);
 
@@ -182,11 +197,15 @@ beforeEach(() => {
   runSyncMock.mockResolvedValue(createBootstrapState());
   openXSessionWindowMock.mockResolvedValue(createSessionState({ isOpen: true, isVisible: true }));
   getLinkedInSessionStateMock.mockResolvedValue(createSessionState());
+  getRedditSessionStateMock.mockResolvedValue(createSessionState());
   openLinkedInSessionWindowMock.mockResolvedValue(createSessionState({ isOpen: true, isVisible: true }));
+  openRedditSessionWindowMock.mockResolvedValue(createSessionState({ isOpen: true, isVisible: true }));
   hideXSessionWindowMock.mockResolvedValue(createSessionState({ isOpen: true, isVisible: false }));
   hideLinkedInSessionWindowMock.mockResolvedValue(createSessionState({ isOpen: true, isVisible: false }));
+  hideRedditSessionWindowMock.mockResolvedValue(createSessionState({ isOpen: true, isVisible: false }));
   logoutXSessionWindowMock.mockResolvedValue(createSessionState());
   logoutLinkedInSessionWindowMock.mockResolvedValue(createSessionState());
+  logoutRedditSessionWindowMock.mockResolvedValue(createSessionState());
   disconnectXMock.mockResolvedValue(createBootstrapState());
   openExternalUrlMock.mockResolvedValue(undefined);
   vi.spyOn(console, "info").mockImplementation(() => undefined);
@@ -522,7 +541,8 @@ describe("App", () => {
         ...DEFAULT_SETTINGS.capture,
         sources: {
           x: true,
-          linkedin: true
+          linkedin: true,
+          reddit: true
         }
       }
     };
@@ -559,6 +579,12 @@ describe("App", () => {
         isVisible: false,
         isAuthenticated: true,
         lastKnownUrl: "https://www.linkedin.com/feed/"
+      }),
+      redditSession: createSessionState({
+        isOpen: true,
+        isVisible: false,
+        isAuthenticated: true,
+        lastKnownUrl: "https://www.reddit.com/"
       })
     });
 
@@ -572,6 +598,52 @@ describe("App", () => {
     expect(hideXSessionWindowMock).not.toHaveBeenCalled();
     expect(openLinkedInSessionWindowMock).toHaveBeenCalledTimes(1);
     expect(hideLinkedInSessionWindowMock).toHaveBeenCalledTimes(1);
+    expect(openRedditSessionWindowMock).toHaveBeenCalledTimes(1);
+    expect(hideRedditSessionWindowMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders Reddit session controls and settings when Reddit is available", async () => {
+    await renderLoadedApp({
+      redditSession: createSessionState({
+        isOpen: true,
+        isVisible: true,
+        isAuthenticated: true,
+        lastKnownUrl: "https://www.reddit.com/"
+      })
+    });
+
+    expect(screen.getByText("Reddit")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Hide Reddit session" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+
+    expect(screen.getByLabelText("Reddit pages to browse")).toBeInTheDocument();
+  });
+
+  it("includes Reddit when saving newsroom settings", async () => {
+    await renderLoadedApp();
+
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    fireEvent.click(screen.getByLabelText("Reddit pages to browse").closest("section")!.querySelector("input[type='checkbox']")!);
+    fireEvent.change(screen.getByLabelText("Reddit pages to browse"), {
+      target: { value: "11" }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save newsroom settings" }));
+
+    await waitFor(() => {
+      expect(saveSettingsMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          capture: expect.objectContaining({
+            sources: expect.objectContaining({
+              reddit: true
+            }),
+            browsePageCount: expect.objectContaining({
+              reddit: 11
+            })
+          })
+        })
+      );
+    });
   });
 
   it("keeps the current edition visible when a refresh finds no newer posts", async () => {

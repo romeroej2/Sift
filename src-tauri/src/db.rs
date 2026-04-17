@@ -409,6 +409,42 @@ impl Database {
         Ok(())
     }
 
+    pub fn load_persisted_reddit_session(
+        &self,
+    ) -> Result<Option<PersistedBrowserSession>, AppError> {
+        let conn = self.connect()?;
+        let raw = conn
+            .query_row(
+                "SELECT value FROM app_meta WHERE key = 'reddit_session_restore'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        raw.map(|raw| serde_json::from_str(&raw))
+            .transpose()
+            .map_err(AppError::from)
+    }
+
+    pub fn save_persisted_reddit_session(
+        &self,
+        session: &PersistedBrowserSession,
+    ) -> Result<(), AppError> {
+        let conn = self.connect()?;
+        conn.execute(
+            "INSERT INTO app_meta(key, value) VALUES('reddit_session_restore', ?1)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![serde_json::to_string(session)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_persisted_reddit_session(&self) -> Result<(), AppError> {
+        let conn = self.connect()?;
+        conn.execute("DELETE FROM app_meta WHERE key = 'reddit_session_restore'", [])?;
+        Ok(())
+    }
+
     pub fn insert_sync_run(&self, run: &SyncRun) -> Result<(), AppError> {
         let conn = self.connect()?;
         conn.execute(
@@ -689,6 +725,42 @@ mod tests {
         assert!(
             db.load_persisted_x_session()
                 .expect("load cleared persisted x session")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn persisted_reddit_session_round_trips_and_clears() {
+        let temp_dir = tempdir().expect("temporary database directory");
+        let db = Database::new(temp_dir.path().join("sift.sqlite")).expect("database");
+
+        assert!(
+            db.load_persisted_reddit_session()
+                .expect("load empty persisted reddit session")
+                .is_none()
+        );
+
+        let session = PersistedBrowserSession {
+            last_known_url: "https://www.reddit.com/".into(),
+            is_authenticated: true,
+        };
+
+        db.save_persisted_reddit_session(&session)
+            .expect("save persisted reddit session");
+
+        let loaded = db
+            .load_persisted_reddit_session()
+            .expect("load persisted reddit session");
+        assert!(loaded.is_some());
+        let loaded = loaded.expect("persisted reddit session");
+        assert_eq!(loaded.last_known_url, session.last_known_url);
+        assert!(loaded.is_authenticated);
+
+        db.clear_persisted_reddit_session()
+            .expect("clear persisted reddit session");
+        assert!(
+            db.load_persisted_reddit_session()
+                .expect("load cleared persisted reddit session")
                 .is_none()
         );
     }

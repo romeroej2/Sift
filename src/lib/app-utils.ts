@@ -37,7 +37,7 @@ export function pickInitialEdition(editions: Edition[], view?: EditionView) {
 }
 
 export function getAvailableEditionViews(editions: Edition[]): EditionView[] {
-  const allViews: EditionView[] = ["consolidated", "x", "linkedin"];
+  const allViews: EditionView[] = ["consolidated", "x", "linkedin", "reddit"];
   return allViews.filter((view) => editions.some((edition) => edition.view === view));
 }
 
@@ -157,7 +157,8 @@ export function getErrorMessage(error: unknown, fallback: string) {
 }
 
 export function getSessionToggleLabel(source: BrowserSource, session: BrowserSessionState) {
-  const sourceLabel = source === "linkedin" ? "LinkedIn" : "X";
+  const sourceLabel =
+    source === "linkedin" ? "LinkedIn" : source === "reddit" ? "Reddit" : "X";
 
   if (session.isOpen && session.isVisible) {
     return `Hide ${sourceLabel} session`;
@@ -221,7 +222,13 @@ export function getScheduleSummary(
     .filter(([, enabled]) => enabled)
     .map(([source]) => source);
   const blockedSourceLabel = (enabledSources.length ? enabledSources : ["x"])
-    .map((source) => (source === "linkedin" ? "LinkedIn Session" : "X Session"))
+    .map((source) =>
+      source === "linkedin"
+        ? "LinkedIn Session"
+        : source === "reddit"
+          ? "Reddit Session"
+          : "X Session"
+    )
     .join(" and ");
   const allOpen = enabledSources.every((source) => sessions[source]?.isOpen);
   const allAuthenticated = enabledSources.every((source) => sessions[source]?.isAuthenticated);

@@ -26,7 +26,7 @@ use crate::models::{
     LmStudioHealth, ModelDescriptor, OAuthSession, PollStatus, SyncReason, SyncRun, SyncStatus,
     UserSettings, XClientConfigDraft, XConnectLaunch, XConnectPayload, XConnectPollResult,
 };
-use crate::{AppError, AppState, is_linkedin_domain, is_x_domain};
+use crate::{AppError, AppState, is_linkedin_domain, is_reddit_domain, is_x_domain};
 
 fn machine_timezone() -> Tz {
     iana_time_zone::get_timezone()
@@ -42,6 +42,12 @@ pub struct XSessionCapturePayload {
     pub current_url: String,
     pub items: Vec<XSessionCaptureItem>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub completed_passes: Option<usize>,
+    #[serde(default)]
+    pub total_passes: Option<usize>,
+    #[serde(default)]
+    pub ended_early: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -96,6 +102,7 @@ pub struct XSessionCaptureProgressSnapshot {
 pub struct XSessionCaptureRequest {
     pub run_id: String,
     pub reason: SyncReason,
+    pub source_label: String,
     pub sender: Option<oneshot::Sender<Result<XSessionCapturePayload, String>>>,
     pub last_progress_at: Instant,
     pub latest_progress: Option<XSessionCaptureProgressSnapshot>,
@@ -149,6 +156,7 @@ struct CaptureOutcome {
 enum CaptureSourceKind {
     X,
     Linkedin,
+    Reddit,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +197,7 @@ impl CaptureSourceKind {
         match self {
             Self::X => "x-session",
             Self::Linkedin => "linkedin-session",
+            Self::Reddit => "reddit-session",
         }
     }
 
@@ -196,6 +205,7 @@ impl CaptureSourceKind {
         match self {
             Self::X => "X",
             Self::Linkedin => "LinkedIn",
+            Self::Reddit => "Reddit",
         }
     }
 }
@@ -374,16 +384,22 @@ fn emit_sync_progress(
     }
 }
 
-fn format_capture_progress_message(progress: &XSessionCaptureProgressPayload) -> String {
+fn format_capture_progress_message(
+    source_label: &str,
+    progress: &XSessionCaptureProgressPayload,
+) -> String {
     let mut message = if progress.fresh_count > 0 {
         format!(
-            "Collecting posts from the live X session. Pass {}/{} · {} fresh so far.",
-            progress.pass, progress.total_passes, progress.fresh_count
+            "Collecting posts from the live {source_label} session. Pass {}/{} · {} fresh so far.",
+            progress.pass,
+            progress.total_passes,
+            progress.fresh_count
         )
     } else {
         format!(
-            "Collecting posts from the live X session. Pass {}/{} · still scanning for fresh posts.",
-            progress.pass, progress.total_passes
+            "Collecting posts from the live {source_label} session. Pass {}/{} · still scanning for fresh posts.",
+            progress.pass,
+            progress.total_passes
         )
     };
 
@@ -406,11 +422,12 @@ fn format_capture_progress_message(progress: &XSessionCaptureProgressPayload) ->
 }
 
 fn format_capture_total_timeout_message(
+    source_label: &str,
     progress: Option<&XSessionCaptureProgressSnapshot>,
 ) -> String {
     if let Some(progress) = progress {
         format!(
-            "Timed out waiting for the live X session to finish collecting feed items after pass {}/{}. Last heartbeat: {} captured, {} fresh at {}.",
+            "Timed out waiting for the live {source_label} session to finish collecting feed items after pass {}/{}. Last heartbeat: {} captured, {} fresh at {}.",
             progress.pass,
             progress.total_passes,
             progress.item_count,
@@ -418,16 +435,17 @@ fn format_capture_total_timeout_message(
             progress.current_url
         )
     } else {
-        "Timed out waiting for the live X session to return feed items.".into()
+        format!("Timed out waiting for the live {source_label} session to return feed items.")
     }
 }
 
 fn format_capture_idle_timeout_message(
+    source_label: &str,
     progress: Option<&XSessionCaptureProgressSnapshot>,
 ) -> String {
     if let Some(progress) = progress {
         format!(
-            "The live X session stopped reporting progress after pass {}/{}. Last heartbeat: {} captured, {} fresh at {}.",
+            "The live {source_label} session stopped reporting progress after pass {}/{}. Last heartbeat: {} captured, {} fresh at {}.",
             progress.pass,
             progress.total_passes,
             progress.item_count,
@@ -435,7 +453,7 @@ fn format_capture_idle_timeout_message(
             progress.current_url
         )
     } else {
-        "Timed out waiting for the live X session to start returning feed items.".into()
+        format!("Timed out waiting for the live {source_label} session to start returning feed items.")
     }
 }
 
@@ -443,6 +461,7 @@ pub(crate) fn emit_capture_progress(
     state: &AppState,
     run_id: &str,
     reason: &SyncReason,
+    source_label: &str,
     progress: &XSessionCaptureProgressPayload,
 ) {
     emit_sync_progress(
@@ -451,7 +470,7 @@ pub(crate) fn emit_capture_progress(
         reason,
         SyncStatus::Running,
         "capturing-feed",
-        format_capture_progress_message(progress),
+        format_capture_progress_message(source_label, progress),
         Some(progress.item_count),
         Some(progress.fresh_count),
         None,
@@ -1316,6 +1335,17 @@ pub async fn maybe_run_scheduled_sync(state: &AppState) -> Result<(), AppError> 
         }
     }
 
+    if settings.capture.sources.reddit {
+        let session_window = state.app.get_webview_window(crate::REDDIT_SESSION_WINDOW_LABEL);
+        if let Some(window) = &session_window {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+        if session_window.is_none() || !*state.reddit_session_authenticated.read().await {
+            return Ok(());
+        }
+    }
+
     let _ = generate_paper(state, SyncReason::Scheduled).await?;
 
     Ok(())
@@ -1579,6 +1609,7 @@ async fn build_edition(
         EditionView::Consolidated => format!("Your SIFT for {}", edition_date),
         EditionView::X => format!("Your SIFT for {} · X", edition_date),
         EditionView::Linkedin => format!("Your SIFT for {} · LinkedIn", edition_date),
+        EditionView::Reddit => format!("Your SIFT for {} · Reddit", edition_date),
     };
     Ok((
         edition_date.clone(),
@@ -1689,6 +1720,9 @@ fn enabled_capture_sources(settings: &UserSettings) -> Vec<CaptureSourceKind> {
     if settings.capture.sources.linkedin {
         sources.push(CaptureSourceKind::Linkedin);
     }
+    if settings.capture.sources.reddit {
+        sources.push(CaptureSourceKind::Reddit);
+    }
     sources
 }
 
@@ -1701,15 +1735,21 @@ fn build_view_specs(capture: &MultiCaptureOutcome) -> Vec<ViewBuildSpec> {
         .enabled_sources
         .iter()
         .any(|source| *source == CaptureSourceKind::Linkedin);
+    let has_reddit = capture
+        .enabled_sources
+        .iter()
+        .any(|source| *source == CaptureSourceKind::Reddit);
+    let enabled_count = usize::from(has_x) + usize::from(has_linkedin) + usize::from(has_reddit);
 
-    if has_x && has_linkedin {
-        return vec![
-            ViewBuildSpec {
-                view: EditionView::Consolidated,
-                label: "Consolidated",
-                items: capture.items.clone(),
-            },
-            ViewBuildSpec {
+    if enabled_count > 1 {
+        let mut specs = vec![ViewBuildSpec {
+            view: EditionView::Consolidated,
+            label: "Consolidated",
+            items: capture.items.clone(),
+        }];
+
+        if has_x {
+            specs.push(ViewBuildSpec {
                 view: EditionView::X,
                 label: "X",
                 items: capture
@@ -1718,8 +1758,10 @@ fn build_view_specs(capture: &MultiCaptureOutcome) -> Vec<ViewBuildSpec> {
                     .filter(|item| item.source == CaptureSourceKind::X.as_feed_source())
                     .cloned()
                     .collect(),
-            },
-            ViewBuildSpec {
+            });
+        }
+        if has_linkedin {
+            specs.push(ViewBuildSpec {
                 view: EditionView::Linkedin,
                 label: "LinkedIn",
                 items: capture
@@ -1728,14 +1770,36 @@ fn build_view_specs(capture: &MultiCaptureOutcome) -> Vec<ViewBuildSpec> {
                     .filter(|item| item.source == CaptureSourceKind::Linkedin.as_feed_source())
                     .cloned()
                     .collect(),
-            },
-        ];
+            });
+        }
+        if has_reddit {
+            specs.push(ViewBuildSpec {
+                view: EditionView::Reddit,
+                label: "Reddit",
+                items: capture
+                    .items
+                    .iter()
+                    .filter(|item| item.source == CaptureSourceKind::Reddit.as_feed_source())
+                    .cloned()
+                    .collect(),
+            });
+        }
+
+        return specs;
     }
 
     if has_linkedin {
         return vec![ViewBuildSpec {
             view: EditionView::Linkedin,
             label: "LinkedIn",
+            items: capture.items.clone(),
+        }];
+    }
+
+    if has_reddit {
+        return vec![ViewBuildSpec {
+            view: EditionView::Reddit,
+            label: "Reddit",
             items: capture.items.clone(),
         }];
     }
@@ -1751,6 +1815,7 @@ fn browse_page_count_for_source(settings: &UserSettings, source: CaptureSourceKi
     match source {
         CaptureSourceKind::X => settings.capture.browse_page_count.x.max(1),
         CaptureSourceKind::Linkedin => settings.capture.browse_page_count.linkedin.max(1),
+        CaptureSourceKind::Reddit => settings.capture.browse_page_count.reddit.max(1),
     }
 }
 
@@ -1829,6 +1894,7 @@ async fn collect_items_from_source_live_session(
         CaptureSourceKind::Linkedin => {
             ensure_live_linkedin_session_on_home(state, run_id, reason).await?
         }
+        CaptureSourceKind::Reddit => ensure_live_reddit_session_on_home(state, run_id, reason).await?,
     };
     let request_id = Uuid::new_v4().to_string();
     let (sender, receiver) = oneshot::channel::<Result<XSessionCapturePayload, String>>();
@@ -1837,6 +1903,7 @@ async fn collect_items_from_source_live_session(
         XSessionCaptureRequest {
             run_id: run_id.to_string(),
             reason: reason.clone(),
+            source_label: source.as_label().to_string(),
             sender: Some(sender),
             last_progress_at: Instant::now(),
             latest_progress: None,
@@ -1860,6 +1927,7 @@ async fn collect_items_from_source_live_session(
         collector = match source {
             CaptureSourceKind::X => "window.__SIFT_COLLECT_FEED__",
             CaptureSourceKind::Linkedin => "window.__SIFT_COLLECT_LINKEDIN_FEED__",
+            CaptureSourceKind::Reddit => "window.__SIFT_COLLECT_REDDIT_FEED__",
         },
         request_id = serde_json::to_string(&request_id)?,
         options = serde_json::to_string(&serde_json::json!({
@@ -1910,6 +1978,7 @@ async fn collect_items_from_source_live_session(
                 .await
                 .remove(&request_id);
             return Err(AppError::Message(format_capture_total_timeout_message(
+                source.as_label(),
                 latest_progress.as_ref(),
             )));
         }
@@ -1921,6 +1990,7 @@ async fn collect_items_from_source_live_session(
                 .await
                 .remove(&request_id);
             return Err(AppError::Message(format_capture_idle_timeout_message(
+                source.as_label(),
                 latest_progress.as_ref(),
             )));
         }
@@ -1998,6 +2068,23 @@ async fn collect_items_from_source_live_session(
         fresh_brand_new_count,
         fresh_seen_again_count,
     );
+    let pass_summary = match (capture.completed_passes, capture.total_passes) {
+        (Some(completed), Some(total)) => format!(" after {completed}/{total} passes"),
+        _ => String::new(),
+    };
+    let early_stop_note = if capture.ended_early.unwrap_or(false) {
+        match source {
+            CaptureSourceKind::Linkedin => {
+                " LinkedIn stopped before the configured cap because the feed did not advance further."
+            }
+            CaptureSourceKind::Reddit => {
+                " Reddit stopped before the configured cap because the home feed did not advance further."
+            }
+            CaptureSourceKind::X => "",
+        }
+    } else {
+        ""
+    };
 
     emit_sync_progress(
         state,
@@ -2006,7 +2093,7 @@ async fn collect_items_from_source_live_session(
         SyncStatus::Running,
         "capturing-feed",
         format!(
-            "Captured {raw_count} posts from {}. {fresh_breakdown} remain {} after cleanup.{}{}",
+            "Captured {raw_count} posts from {}{pass_summary}. {fresh_breakdown} remain {} after cleanup.{}{}{}",
             source.as_label(),
             boundary.collector_label(),
             if filtered_out_count > 0 {
@@ -2018,7 +2105,8 @@ async fn collect_items_from_source_live_session(
                 format!(" {skipped_old} were already covered before that boundary.")
             } else {
                 String::new()
-            }
+            },
+            early_stop_note
         ),
         Some(raw_count),
         Some(fresh_brand_new_count),
@@ -2169,6 +2257,64 @@ async fn ensure_live_linkedin_session_on_home(
     Ok(window)
 }
 
+async fn ensure_live_reddit_session_on_home(
+    state: &AppState,
+    run_id: &str,
+    reason: &SyncReason,
+) -> Result<tauri::WebviewWindow, AppError> {
+    let window = state
+        .app
+        .get_webview_window(crate::REDDIT_SESSION_WINDOW_LABEL)
+        .ok_or_else(|| {
+            AppError::Message(
+                "Open Reddit Session first so SIFT has a live browser session to collect from."
+                    .into(),
+            )
+        })?;
+
+    if !*state.reddit_session_authenticated.read().await {
+        return Err(AppError::Message(
+            "Sign in to Reddit inside the native SIFT session before refreshing the edition."
+                .into(),
+        ));
+    }
+
+    let already_home = state
+        .reddit_session_last_known_url
+        .read()
+        .await
+        .clone()
+        .and_then(|value| Url::parse(&value).ok())
+        .is_some_and(|url| is_reddit_home_feed_url(&url));
+
+    emit_sync_progress(
+        state,
+        run_id,
+        reason,
+        SyncStatus::Running,
+        "navigating-home",
+        if already_home {
+            "Refreshing the Reddit home feed before capture."
+        } else {
+            "Opening the Reddit home feed and forcing a refresh."
+        },
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let previous_url = state.reddit_session_last_known_url.read().await.clone();
+    *state.reddit_session_last_known_url.write().await = None;
+    if let Err(error) = window.navigate(build_reddit_home_feed_refresh_url()) {
+        *state.reddit_session_last_known_url.write().await = previous_url;
+        return Err(AppError::Message(error.to_string()));
+    }
+    wait_for_reddit_session_url(state, is_reddit_home_feed_url, Duration::from_secs(15)).await?;
+
+    Ok(window)
+}
+
 async fn wait_for_session_url<F>(
     state: &AppState,
     predicate: F,
@@ -2246,6 +2392,46 @@ fn is_linkedin_home_feed_url(url: &Url) -> bool {
 fn build_linkedin_home_feed_refresh_url() -> Url {
     let mut url =
         Url::parse("https://www.linkedin.com/feed/").expect("valid linkedin feed url");
+    url.query_pairs_mut()
+        .append_pair("sift_refresh", &Uuid::new_v4().to_string());
+    url
+}
+
+async fn wait_for_reddit_session_url<F>(
+    state: &AppState,
+    predicate: F,
+    timeout_after: Duration,
+) -> Result<String, AppError>
+where
+    F: Fn(&Url) -> bool,
+{
+    let started_at = Instant::now();
+
+    while started_at.elapsed() < timeout_after {
+        let current = state.reddit_session_last_known_url.read().await.clone();
+        if let Some(current) = current {
+            if let Ok(url) = Url::parse(&current) {
+                if predicate(&url) {
+                    return Ok(current);
+                }
+            }
+        }
+
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(AppError::Message(
+        "Timed out waiting for the live Reddit session to reach the home feed.".into(),
+    ))
+}
+
+fn is_reddit_home_feed_url(url: &Url) -> bool {
+    is_reddit_domain(url)
+        && matches!(url.path(), "/" | "/best/" | "/hot/" | "/new/")
+}
+
+fn build_reddit_home_feed_refresh_url() -> Url {
+    let mut url = Url::parse("https://www.reddit.com/").expect("valid reddit home url");
     url.query_pairs_mut()
         .append_pair("sift_refresh", &Uuid::new_v4().to_string());
     url
@@ -3439,6 +3625,67 @@ mod tests {
 
         assert!(is_home_timeline_url(&url));
         assert!(!refresh_nonce.is_empty());
+    }
+
+    #[test]
+    fn reddit_refresh_url_targets_home_with_refresh_nonce() {
+        let url = build_reddit_home_feed_refresh_url();
+        let refresh_nonce = url
+            .query_pairs()
+            .find(|(key, _)| key == "sift_refresh")
+            .map(|(_, value)| value.to_string())
+            .expect("refresh query");
+
+        assert!(is_reddit_home_feed_url(&url));
+        assert!(!refresh_nonce.is_empty());
+    }
+
+    #[test]
+    fn live_session_capture_preserves_reddit_source_prefix() {
+        let settings = UserSettings::default();
+        let items = vec![XSessionCaptureItem {
+            id: "abc123".into(),
+            author_name: "r/builder".into(),
+            author_handle: "builder".into(),
+            text: "A thoughtful Reddit launch post".into(),
+            source_url: "https://www.reddit.com/r/builder/comments/abc123/post/".into(),
+            posted_at: "2026-04-16T12:02:00Z".into(),
+            is_repost: false,
+            is_reply: false,
+            social_context: None,
+            shared_urls: vec!["https://example.com/release".into()],
+            media: Vec::new(),
+        }];
+
+        let cleaned = normalize_session_capture(items, &settings, CaptureSourceKind::Reddit);
+        assert_eq!(cleaned.len(), 1);
+        assert_eq!(cleaned[0].id, "reddit-session:abc123");
+        assert_eq!(cleaned[0].source, "reddit-session");
+    }
+
+    #[test]
+    fn build_view_specs_adds_reddit_view_when_reddit_is_enabled() {
+        let capture = MultiCaptureOutcome {
+            items: vec![FeedItem {
+                id: "reddit-session:1".into(),
+                source: "reddit-session".into(),
+                author_name: "Reddit".into(),
+                author_handle: "reddit".into(),
+                text: "Post".into(),
+                source_url: "https://www.reddit.com/r/test/comments/1/post/".into(),
+                posted_at: "2026-04-16T12:00:00Z".into(),
+                raw_json: serde_json::json!({}),
+                fingerprint: fingerprint("Post"),
+            }],
+            brand_new_count: 1,
+            resurfaced_count: 0,
+            enabled_sources: vec![CaptureSourceKind::Reddit],
+        };
+
+        let specs = build_view_specs(&capture);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].view, EditionView::Reddit);
+        assert_eq!(specs[0].label, "Reddit");
     }
 
     #[tokio::test]

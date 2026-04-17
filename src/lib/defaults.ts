@@ -28,11 +28,13 @@ export const DEFAULT_SETTINGS: UserSettings = {
   capture: {
     sources: {
       x: true,
-      linkedin: false
+      linkedin: false,
+      reddit: false
     },
     browsePageCount: {
       x: 12,
-      linkedin: 8
+      linkedin: 8,
+      reddit: 10
     }
   }
 };

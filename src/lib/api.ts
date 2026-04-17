@@ -17,12 +17,20 @@ export function getLinkedInSessionState() {
   return invoke<BrowserSessionState>("get_linkedin_session_state");
 }
 
+export function getRedditSessionState() {
+  return invoke<BrowserSessionState>("get_reddit_session_state");
+}
+
 export function openXSessionWindow() {
   return invoke<BrowserSessionState>("open_x_session_window");
 }
 
 export function openLinkedInSessionWindow() {
   return invoke<BrowserSessionState>("open_linkedin_session_window");
+}
+
+export function openRedditSessionWindow() {
+  return invoke<BrowserSessionState>("open_reddit_session_window");
 }
 
 export function hideXSessionWindow() {
@@ -33,12 +41,20 @@ export function hideLinkedInSessionWindow() {
   return invoke<BrowserSessionState>("hide_linkedin_session_window");
 }
 
+export function hideRedditSessionWindow() {
+  return invoke<BrowserSessionState>("hide_reddit_session_window");
+}
+
 export function logoutXSessionWindow() {
   return invoke<BrowserSessionState>("logout_x_session_window");
 }
 
 export function logoutLinkedInSessionWindow() {
   return invoke<BrowserSessionState>("logout_linkedin_session_window");
+}
+
+export function logoutRedditSessionWindow() {
+  return invoke<BrowserSessionState>("logout_reddit_session_window");
 }
 
 export function verifyLmStudio(baseUrl: string, authToken: string | null) {

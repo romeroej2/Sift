@@ -32,6 +32,8 @@ pub struct CaptureSourcesSettings {
     pub x: bool,
     #[serde(default)]
     pub linkedin: bool,
+    #[serde(default)]
+    pub reddit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +56,8 @@ pub struct CaptureBrowsePageCount {
     pub x: usize,
     #[serde(default = "default_linkedin_browse_page_count")]
     pub linkedin: usize,
+    #[serde(default = "default_reddit_browse_page_count")]
+    pub reddit: usize,
 }
 
 fn default_x_browse_page_count() -> usize {
@@ -64,11 +68,16 @@ fn default_linkedin_browse_page_count() -> usize {
     8
 }
 
+fn default_reddit_browse_page_count() -> usize {
+    10
+}
+
 impl Default for CaptureBrowsePageCount {
     fn default() -> Self {
         Self {
             x: default_x_browse_page_count(),
             linkedin: default_linkedin_browse_page_count(),
+            reddit: default_reddit_browse_page_count(),
         }
     }
 }
@@ -78,6 +87,7 @@ impl Default for CaptureSourcesSettings {
         Self {
             x: true,
             linkedin: false,
+            reddit: false,
         }
     }
 }
@@ -149,6 +159,7 @@ pub enum EditionView {
     Consolidated,
     X,
     Linkedin,
+    Reddit,
 }
 
 impl Default for EditionView {
@@ -163,6 +174,7 @@ impl EditionView {
             Self::Consolidated => "consolidated",
             Self::X => "x",
             Self::Linkedin => "linkedin",
+            Self::Reddit => "reddit",
         }
     }
 }

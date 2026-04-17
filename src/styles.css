@@ -346,6 +346,31 @@ a {
   align-items: center;
 }
 
+.masthead-bling {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  border-radius: 999px;
+  flex-shrink: 0;
+  margin-left: auto;
+  transition: transform var(--transition-base), filter var(--transition-base);
+}
+
+.masthead-bling:hover {
+  transform: translateY(-1px) scale(1.05);
+  filter: drop-shadow(0 8px 16px rgba(111, 80, 38, 0.18));
+}
+
+.masthead-bling:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(140, 93, 44, 0.22);
+}
+
 .nav-button,
 .secondary-button,
 .primary-button {
@@ -637,6 +662,11 @@ a {
 
 .session-pill__brand--linkedin {
   background: linear-gradient(145deg, #0a66c2, #004182);
+  color: #ffffff;
+}
+
+.session-pill__brand--reddit {
+  background: linear-gradient(145deg, #ff6a33, #ff4500);
   color: #ffffff;
 }
 
@@ -1348,6 +1378,11 @@ a {
 
   .masthead-actions {
     flex-wrap: wrap;
+  }
+
+  .masthead-bling {
+    width: 42px;
+    height: 42px;
   }
 
   .model-desk__summary {

@@ -1,6 +1,6 @@
 export type SyncStatus = "idle" | "running" | "success" | "error";
-export type BrowserSource = "x" | "linkedin";
-export type EditionView = "consolidated" | "x" | "linkedin";
+export type BrowserSource = "x" | "linkedin" | "reddit";
+export type EditionView = "consolidated" | "x" | "linkedin" | "reddit";
 export type SyncProgressStage =
   | "starting"
   | "navigating-home"
@@ -29,6 +29,7 @@ export interface LmStudioSettings {
 export interface CaptureSourcesSettings {
   x: boolean;
   linkedin: boolean;
+  reddit: boolean;
 }
 
 export interface CaptureSettings {
