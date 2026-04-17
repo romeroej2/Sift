@@ -599,6 +599,68 @@ if (
     scroller.scrollTop = top;
   };
 
+  const siftMaxScrollTop = (scroller) => {
+    const metrics = siftReadScrollMetrics(scroller);
+    return Math.max(metrics.height - metrics.clientHeight, 0);
+  };
+
+  const siftClampScrollTop = (scroller, top) =>
+    Math.max(0, Math.min(Number(top) || 0, siftMaxScrollTop(scroller)));
+
+  const siftAnimateScrollTo = async (scroller, top, durationMs = 280) => {
+    const startTop = siftReadScrollMetrics(scroller).top;
+    const targetTop = siftClampScrollTop(scroller, top);
+    const distance = targetTop - startTop;
+    if (Math.abs(distance) < 4) {
+      siftScrollFeedTo(scroller, targetTop);
+      return targetTop;
+    }
+
+    const startedAt = Date.now();
+    const totalDuration = Math.max(durationMs, 120);
+    while (true) {
+      const elapsed = Date.now() - startedAt;
+      const progress = Math.min(elapsed / totalDuration, 1);
+      const eased = 1 - Math.pow(1 - progress, 3);
+      siftScrollFeedTo(scroller, startTop + (distance * eased));
+      if (progress >= 1) {
+        break;
+      }
+      await siftWait(16);
+    }
+
+    siftScrollFeedTo(scroller, targetTop);
+    return targetTop;
+  };
+
+  const siftAdvanceFeed = async (selector, scroller, distance, options = {}) => {
+    const segments = Math.max(Number(options.segments) || 2, 1);
+    const durationMs = Math.max(Number(options.durationMs) || 280, 120);
+    const settleMs = Math.max(Number(options.settleMs) || 140, 0);
+    const visibleIdsBefore = siftVisibleTweetIds(selector);
+    const metricsBefore = siftReadScrollMetrics(scroller);
+    const perSegment = distance / segments;
+    let lastTop = metricsBefore.top;
+
+    for (let segment = 0; segment < segments; segment += 1) {
+      const remainingSegments = segments - segment;
+      lastTop = await siftAnimateScrollTo(
+        scroller,
+        lastTop + (perSegment * remainingSegments),
+        durationMs,
+      );
+      if (settleMs > 0 && segment < segments - 1) {
+        await siftWait(settleMs);
+      }
+    }
+
+    return {
+      previousHeight: metricsBefore.height,
+      previousIds: visibleIdsBefore,
+      top: lastTop,
+    };
+  };
+
   const siftVisibleTweetIds = (selector) => {
     const ids = new Set();
     document.querySelectorAll(selector).forEach((article) => {
@@ -812,38 +874,39 @@ if (
           break;
         }
 
-        const visibleTweets = Array.from(document.querySelectorAll(selector));
-        const visibleIdsBefore = siftVisibleTweetIds(selector);
         const metricsBefore = siftReadScrollMetrics(scroller);
-        const scrollStep = Math.max(metricsBefore.clientHeight * 0.9, 1200);
-        const lastVisibleTweet = visibleTweets[visibleTweets.length - 1];
-
-        if (lastVisibleTweet && typeof lastVisibleTweet.scrollIntoView === "function") {
-          lastVisibleTweet.scrollIntoView({ block: "end" });
-          await siftWait(300);
-        }
+        const baseScrollStep = Math.max(metricsBefore.clientHeight * 0.55, 520);
+        const fallbackScrollStep = Math.max(metricsBefore.clientHeight * 0.8, 860);
 
         const siftHeartbeat = async () => {
           await siftReportProgress(pass + 1, collected.size, siftCountFreshItems());
         };
 
-        siftScrollFeedTo(scroller, metricsBefore.top + scrollStep);
+        const firstAdvance = await siftAdvanceFeed(selector, scroller, baseScrollStep, {
+          segments: 2,
+          durationMs: 260,
+          settleMs: 120,
+        });
         let advanced = await siftWaitForFeedAdvance(
           selector,
           scroller,
-          visibleIdsBefore,
-          metricsBefore.height,
+          firstAdvance.previousIds,
+          firstAdvance.previousHeight,
           waitForAdvanceMs,
           siftHeartbeat,
         );
 
         if (!advanced) {
-          siftScrollFeedTo(scroller, metricsBefore.top + (scrollStep * 2));
+          const secondAdvance = await siftAdvanceFeed(selector, scroller, fallbackScrollStep, {
+            segments: 3,
+            durationMs: 320,
+            settleMs: 140,
+          });
           advanced = await siftWaitForFeedAdvance(
             selector,
             scroller,
-            visibleIdsBefore,
-            metricsBefore.height,
+            secondAdvance.previousIds,
+            secondAdvance.previousHeight,
             waitForAdvanceMs,
             siftHeartbeat,
           );
