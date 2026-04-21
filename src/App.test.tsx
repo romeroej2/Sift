@@ -301,6 +301,7 @@ describe("App", () => {
     });
 
     await renderLoadedApp();
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
     fireEvent.click(screen.getByRole("button", { name: /Model desk/i }));
     fireEvent.click(screen.getByRole("button", { name: "Verify" }));
 
@@ -763,6 +764,7 @@ describe("App", () => {
 
     await renderLoadedApp();
 
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
     fireEvent.click(screen.getByRole("button", { name: /Model desk/i }));
     fireEvent.change(screen.getByLabelText("LM Studio URL"), {
       target: { value: "http://127.0.0.1:4321" }
@@ -971,7 +973,7 @@ describe("App", () => {
       await screen.findByText("The X session is hidden. Your sign-in stays alive in the background.")
     ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Clear Legacy Connection" }));
+    fireEvent.click(screen.getByRole("button", { name: "Clear legacy connection" }));
 
     await waitFor(() => {
       expect(disconnectXMock).toHaveBeenCalled();

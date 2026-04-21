@@ -225,13 +225,15 @@ function BrowserSessionCard({
   session,
   onOpen,
   onHide,
-  onLogout
+  onLogout,
+  compact = false
 }: {
   source: BrowserSource;
   session: BrowserSessionState;
   onOpen: () => void;
   onHide: () => void;
   onLogout: () => void;
+  compact?: boolean;
 }) {
   const sourceLabel =
     source === "linkedin" ? "LinkedIn" : source === "reddit" ? "Reddit" : "X";
@@ -240,6 +242,38 @@ function BrowserSessionCard({
     : session.isOpen
       ? "Waiting for sign-in"
       : "Session closed";
+  const connectionTone = session.isAuthenticated ? "connected" : session.isOpen ? "open" : "closed";
+
+  if (compact) {
+    return (
+      <div className={`session-chip session-chip--${connectionTone}`}>
+        <div className="session-chip__summary">
+          <SourceBrandIcon source={source} />
+          <div className="session-chip__copy">
+            <span className="session-chip__label">{sourceLabel}</span>
+            <span className="session-chip__status">{connectionLabel}</span>
+          </div>
+        </div>
+        <div className="session-actions" role="toolbar" aria-label={`${sourceLabel} session controls`}>
+          <SessionControlButton
+            label={getSessionToggleLabel(source, session)}
+            onClick={session.isOpen && session.isVisible ? onHide : onOpen}
+          >
+            {session.isOpen && session.isVisible ? <HideIcon /> : <ShowIcon />}
+          </SessionControlButton>
+          {session.isOpen ? (
+            <SessionControlButton
+              label={`Log out of ${sourceLabel} in SIFT`}
+              tone="danger"
+              onClick={onLogout}
+            >
+              <LogoutIcon />
+            </SessionControlButton>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="session-control">
@@ -953,41 +987,81 @@ export default function App() {
   return (
     <main className="app-shell">
       <header className="masthead masthead--compact">
-        <div className="brand-header">
-          <img
-            className="brand-mark"
-            src="/sift-mark.png"
-alt="SIFT"
-          />
-          <div>
-            <p className="kicker">SIFT Daily Briefing</p>
-<h1>The signal in your feed, without the noise.</h1>
+        <div className="masthead-main">
+          <div className="brand-header">
+            <img
+              className="brand-mark"
+              src="/sift-mark.png"
+              alt="SIFT"
+            />
+            <div>
+              <p className="kicker">SIFT Daily Briefing</p>
+              <h1>The signal in your feed, without the noise.</h1>
+            </div>
           </div>
-        </div>
 
-        <div className="masthead-actions">
-          <button
-            className={screen === "today" ? "nav-button nav-button--active" : "nav-button"}
-            onClick={() => setScreen("today")}
-          >
-            Today
-          </button>
-          <button
-            className={screen === "archive" ? "nav-button nav-button--active" : "nav-button"}
-            onClick={() => setScreen("archive")}
-          >
-            Archive
-          </button>
-          <button
-            className={screen === "settings" ? "nav-button nav-button--active" : "nav-button"}
-            onClick={() => setScreen("settings")}
-          >
-            Settings
-          </button>
-          <button className="primary-button" onClick={handleRunSync} disabled={isRefreshBusy}>
-            {isRefreshBusy ? "Refreshing..." : "Refresh edition"}
-          </button>
-          <HeaderBlingLink onClick={handleGemBlingClick} />
+          <div className="masthead-toolbar">
+            <section className="browser-status-bar" aria-label="Browser status">
+              <span className="browser-status-bar__label">Browser status</span>
+              <BrowserSessionCard
+                source="x"
+                session={xSession}
+                onOpen={handleOpenXSession}
+                onHide={handleHideXSession}
+                onLogout={handleLogoutXSession}
+                compact
+              />
+              <BrowserSessionCard
+                source="linkedin"
+                session={linkedinSession}
+                onOpen={handleOpenLinkedInSession}
+                onHide={handleHideLinkedInSession}
+                onLogout={handleLogoutLinkedInSession}
+                compact
+              />
+              <BrowserSessionCard
+                source="reddit"
+                session={redditSession}
+                onOpen={handleOpenRedditSession}
+                onHide={handleHideRedditSession}
+                onLogout={handleLogoutRedditSession}
+                compact
+              />
+              {bootstrap.xConnection ? (
+                <div className="browser-status-note">
+                  <span>Legacy X API: @{bootstrap.xConnection.handle}</span>
+                  <button className="secondary-button" onClick={handleDisconnectX}>
+                    Clear legacy connection
+                  </button>
+                </div>
+              ) : null}
+            </section>
+
+            <div className="masthead-actions">
+              <button
+                className={screen === "today" ? "nav-button nav-button--active" : "nav-button"}
+                onClick={() => setScreen("today")}
+              >
+                Today
+              </button>
+              <button
+                className={screen === "archive" ? "nav-button nav-button--active" : "nav-button"}
+                onClick={() => setScreen("archive")}
+              >
+                Archive
+              </button>
+              <button
+                className={screen === "settings" ? "nav-button nav-button--active" : "nav-button"}
+                onClick={() => setScreen("settings")}
+              >
+                Settings
+              </button>
+              <button className="primary-button" onClick={handleRunSync} disabled={isRefreshBusy}>
+                {isRefreshBusy ? "Refreshing..." : "Refresh edition"}
+              </button>
+              <HeaderBlingLink onClick={handleGemBlingClick} />
+            </div>
+          </div>
         </div>
       </header>
 
@@ -997,47 +1071,134 @@ alt="SIFT"
       </section>
 
       <div className="layout-grid">
-        <aside className="sidebar panel">
-          <section>
-            <h2>Browser</h2>
-            <div className="stack">
-              <BrowserSessionCard
-                source="x"
-                session={xSession}
-                onOpen={handleOpenXSession}
-                onHide={handleHideXSession}
-                onLogout={handleLogoutXSession}
-              />
-              <BrowserSessionCard
-                source="linkedin"
-                session={linkedinSession}
-                onOpen={handleOpenLinkedInSession}
-                onHide={handleHideLinkedInSession}
-                onLogout={handleLogoutLinkedInSession}
-              />
-              <BrowserSessionCard
-                source="reddit"
-                session={redditSession}
-                onOpen={handleOpenRedditSession}
-                onHide={handleHideRedditSession}
-                onLogout={handleLogoutRedditSession}
-              />
+        <div className="desk-column">
+          {screen === "settings" ? (
+            <SettingsPanel
+              settings={bootstrap.settings}
+              scheduleSummary={scheduleSummary}
+              isModelDeskExpanded={isModelDeskExpanded}
+              setIsModelDeskExpanded={setIsModelDeskExpanded}
+              lmStudioDraft={lmStudioDraft}
+              setLmStudioDraft={setLmStudioDraft}
+              lmHealth={lmHealth}
+              selectedModelId={selectedModelId}
+              availableModels={availableModels}
+              onVerifyLmStudio={handleVerifyLmStudio}
+              onSaveModelDesk={handleSaveSettings}
+              onChange={(next) => {
+                setBootstrap((current) => ({ ...current, settings: next }));
+                setIsSettingsDirty(true);
+              }}
+              onSave={(settings) => persistNewsroomSettings(settings, "Paper rules updated.")}
+            />
+          ) : screen === "archive" ? (
+            <ArchivePanel
+              tabs={(
+                <EditionViewTabs
+                  ariaLabel="Archive view"
+                  availableViews={availableViews}
+                  selectedView={selectedView}
+                  onSelect={handleSelectView}
+                />
+              )}
+              editions={bootstrap.editions.filter((edition) => edition.view === selectedView)}
+              selectedEditionId={selectedEditionId}
+              onSelect={setSelectedEditionId}
+            />
+          ) : (
+            <EditionPanel
+              tabs={(
+                <EditionViewTabs
+                  ariaLabel="Edition view"
+                  availableViews={availableViews}
+                  selectedView={selectedView}
+                  onSelect={handleSelectView}
+                />
+              )}
+              edition={selectedEdition}
+              onOpenSourcePost={handleOpenSourcePost}
+            />
+          )}
+        </div>
+      </div>
+    </main>
+  );
+}
 
-              {bootstrap.xConnection ? (
-                <div className="mini-card">
-                  <strong>Legacy API connection detected</strong>
-                  <span>
-                    @{bootstrap.xConnection.handle} is still stored locally, but it is not required for the new browser-session path.
-                  </span>
-                  <button className="secondary-button" onClick={handleDisconnectX}>
-                    Clear Legacy Connection
-                  </button>
-                </div>
-              ) : null}
+function SettingsPanel({
+  settings,
+  scheduleSummary,
+  isModelDeskExpanded,
+  setIsModelDeskExpanded,
+  lmStudioDraft,
+  setLmStudioDraft,
+  lmHealth,
+  selectedModelId,
+  availableModels,
+  onVerifyLmStudio,
+  onSaveModelDesk,
+  onChange,
+  onSave
+}: {
+  settings: UserSettings;
+  scheduleSummary: { title: string; detail: string };
+  isModelDeskExpanded: boolean;
+  setIsModelDeskExpanded: React.Dispatch<React.SetStateAction<boolean>>;
+  lmStudioDraft: UserSettings["lmStudio"];
+  setLmStudioDraft: React.Dispatch<React.SetStateAction<UserSettings["lmStudio"]>>;
+  lmHealth: LmStudioHealth | null;
+  selectedModelId: string | null;
+  availableModels: LmStudioHealth["models"];
+  onVerifyLmStudio: () => void;
+  onSaveModelDesk: () => void;
+  onChange: (value: UserSettings) => void;
+  onSave: (value: UserSettings) => Promise<void>;
+}) {
+  const hasEnabledSources =
+    settings.capture.sources.x
+    || settings.capture.sources.linkedin
+    || settings.capture.sources.reddit;
+  const updateBrowseCount = (source: BrowserSource, fallback: number) => (rawValue: string) =>
+    onChange({
+      ...settings,
+      capture: {
+        ...settings.capture,
+        browsePageCount: {
+          ...settings.capture.browsePageCount,
+          [source]: Math.max(1, Number.parseInt(rawValue || String(fallback), 10) || fallback)
+        }
+      }
+    });
+
+  return (
+    <section className="panel content-panel">
+      <div className="section-header">
+        <div>
+          <p className="kicker">Settings</p>
+          <h2>Shape the paper.</h2>
+        </div>
+        <button
+          className="primary-button"
+          onClick={() => void onSave(settings)}
+          disabled={!hasEnabledSources}
+        >
+          Save newsroom settings
+        </button>
+      </div>
+
+      <div className="settings-stack">
+        <section className="settings-card">
+          <div className="settings-card__header">
+            <div>
+              <p className="kicker">Models</p>
+              <h3>Model desk</h3>
             </div>
-          </section>
+            <p className="settings-card__copy">
+              Verify the local LM Studio endpoint, choose the active model, and decide whether image attachments should be sent during ranking.
+            </p>
+          </div>
 
-          <section className="model-desk">
+          <section className="model-desk model-desk--settings">
             <button
               className={
                 isModelDeskExpanded
@@ -1099,10 +1260,10 @@ alt="SIFT"
                     <small>Optional. Kept only for the current app session.</small>
                   </label>
                   <div className="button-row model-desk__actions">
-                    <button className="primary-button" onClick={handleVerifyLmStudio}>
+                    <button className="primary-button" onClick={onVerifyLmStudio}>
                       Verify
                     </button>
-                    <button className="secondary-button" onClick={handleSaveSettings}>
+                    <button className="secondary-button" onClick={onSaveModelDesk}>
                       Save
                     </button>
                   </div>
@@ -1174,97 +1335,8 @@ alt="SIFT"
               </div>
             ) : null}
           </section>
-        </aside>
+        </section>
 
-        <div className="desk-column">
-          {screen === "settings" ? (
-            <SettingsPanel
-              settings={bootstrap.settings}
-              scheduleSummary={scheduleSummary}
-              onChange={(next) => {
-                setBootstrap((current) => ({ ...current, settings: next }));
-                setIsSettingsDirty(true);
-              }}
-              onSave={(settings) => persistNewsroomSettings(settings, "Paper rules updated.")}
-            />
-          ) : screen === "archive" ? (
-            <ArchivePanel
-              tabs={(
-                <EditionViewTabs
-                  ariaLabel="Archive view"
-                  availableViews={availableViews}
-                  selectedView={selectedView}
-                  onSelect={handleSelectView}
-                />
-              )}
-              editions={bootstrap.editions.filter((edition) => edition.view === selectedView)}
-              selectedEditionId={selectedEditionId}
-              onSelect={setSelectedEditionId}
-            />
-          ) : (
-            <EditionPanel
-              tabs={(
-                <EditionViewTabs
-                  ariaLabel="Edition view"
-                  availableViews={availableViews}
-                  selectedView={selectedView}
-                  onSelect={handleSelectView}
-                />
-              )}
-              edition={selectedEdition}
-              onOpenSourcePost={handleOpenSourcePost}
-            />
-          )}
-        </div>
-      </div>
-    </main>
-  );
-}
-
-function SettingsPanel({
-  settings,
-  scheduleSummary,
-  onChange,
-  onSave
-}: {
-  settings: UserSettings;
-  scheduleSummary: { title: string; detail: string };
-  onChange: (value: UserSettings) => void;
-  onSave: (value: UserSettings) => Promise<void>;
-}) {
-  const hasEnabledSources =
-    settings.capture.sources.x
-    || settings.capture.sources.linkedin
-    || settings.capture.sources.reddit;
-  const updateBrowseCount = (source: BrowserSource, fallback: number) => (rawValue: string) =>
-    onChange({
-      ...settings,
-      capture: {
-        ...settings.capture,
-        browsePageCount: {
-          ...settings.capture.browsePageCount,
-          [source]: Math.max(1, Number.parseInt(rawValue || String(fallback), 10) || fallback)
-        }
-      }
-    });
-
-  return (
-    <section className="panel content-panel">
-      <div className="section-header">
-        <div>
-          <p className="kicker">Settings</p>
-          <h2>Shape the paper.</h2>
-        </div>
-        <button
-          className="primary-button"
-          onClick={() => void onSave(settings)}
-          disabled={!hasEnabledSources}
-        >
-          Save newsroom settings
-        </button>
-      </div>
-
-      <div className="settings-stack">
         <section className="settings-card">
           <div className="settings-card__header">
             <div>
