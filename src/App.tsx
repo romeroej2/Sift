@@ -777,19 +777,8 @@ export default function App() {
     setIsRefreshing(true);
     setSyncProgress(null);
     console.info("[SIFT sync] Manual refresh requested.");
-    const enabledSources = (Object.entries(bootstrap.settings.capture.sources) as Array<[BrowserSource, boolean]>)
-      .filter(([, enabled]) => enabled)
-      .map(([source]) => source);
-    const temporarilyShownSources = enabledSources.filter((source) => !sessionStates[source].isVisible);
 
     try {
-      if (temporarilyShownSources.length > 0) {
-        setMessage("Opening the enabled source sessions before refresh...");
-      }
-      for (const source of temporarilyShownSources) {
-        await openSourceSession(source);
-      }
-
       setMessage("Starting refresh. Checking the live sessions...");
       const state = await runSync("manual");
       let freshEdition = pickFreshEdition(state, selectedView);
@@ -822,14 +811,6 @@ export default function App() {
       console.error("[SIFT sync] Manual refresh failed.", error);
       setMessage(detail);
     } finally {
-      for (const source of temporarilyShownSources) {
-        try {
-          await hideSourceSession(source);
-        } catch (hideError) {
-          console.error(`[SIFT sync] Refresh finished but the ${source} session could not be hidden.`, hideError);
-        }
-      }
-
       setIsRefreshing(false);
     }
   }

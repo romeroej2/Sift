@@ -254,7 +254,7 @@ describe("App", () => {
     ).toBeInTheDocument();
   });
 
-  it("opens the X session before manual refresh and hides it again afterward", async () => {
+  it("delegates manual refresh session choreography to the sync command", async () => {
     const freshEdition = createEdition({
       id: "edition-fresh-from-closed",
       title: "Fresh from closed session",
@@ -280,11 +280,11 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Refresh edition" }));
 
     await waitFor(() => {
-      expect(openXSessionWindowMock).toHaveBeenCalledTimes(1);
       expect(runSyncMock).toHaveBeenCalledWith("manual");
-      expect(hideXSessionWindowMock).toHaveBeenCalledTimes(1);
     });
 
+    expect(openXSessionWindowMock).not.toHaveBeenCalled();
+    expect(hideXSessionWindowMock).not.toHaveBeenCalled();
     expect(await screen.findByRole("heading", { name: "Fresh from closed session" })).toBeInTheDocument();
     expect(screen.getByText("Showing Fresh from closed session.")).toBeInTheDocument();
   });
@@ -530,11 +530,11 @@ describe("App", () => {
     expect(screen.getByText("Showing Fresh issue.")).toBeInTheDocument();
   });
 
-  it("only hides session windows that refresh temporarily opened", async () => {
+  it("does not toggle browser session windows from the React refresh handler", async () => {
     const freshEdition = createEdition({
       id: "edition-mixed-source-visibility",
       title: "Mixed source visibility",
-      frontPageSummary: "Only the hidden session should be toggled."
+      frontPageSummary: "Refresh orchestration moved behind the sync command."
     });
     const dualSourceSettings: UserSettings = {
       ...DEFAULT_SETTINGS,
@@ -597,10 +597,10 @@ describe("App", () => {
 
     expect(openXSessionWindowMock).not.toHaveBeenCalled();
     expect(hideXSessionWindowMock).not.toHaveBeenCalled();
-    expect(openLinkedInSessionWindowMock).toHaveBeenCalledTimes(1);
-    expect(hideLinkedInSessionWindowMock).toHaveBeenCalledTimes(1);
-    expect(openRedditSessionWindowMock).toHaveBeenCalledTimes(1);
-    expect(hideRedditSessionWindowMock).toHaveBeenCalledTimes(1);
+    expect(openLinkedInSessionWindowMock).not.toHaveBeenCalled();
+    expect(hideLinkedInSessionWindowMock).not.toHaveBeenCalled();
+    expect(openRedditSessionWindowMock).not.toHaveBeenCalled();
+    expect(hideRedditSessionWindowMock).not.toHaveBeenCalled();
   });
 
   it("renders Reddit session controls and settings when Reddit is available", async () => {

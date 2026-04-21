@@ -1844,6 +1844,7 @@ async fn collect_items_from_enabled_sources(
     let mut total_resurfaced_count = 0usize;
 
     for source in &enabled_sources {
+        let temporarily_shown = show_source_session_for_refresh(state, *source).await?;
         let capture = collect_items_from_source_live_session(
             state,
             settings,
@@ -1852,7 +1853,16 @@ async fn collect_items_from_enabled_sources(
             &boundary,
             *source,
         )
-        .await?;
+        .await;
+
+        if temporarily_shown {
+            if let Err(hide_error) = hide_source_session_after_refresh(state, *source) {
+                capture?;
+                return Err(hide_error);
+            }
+        }
+
+        let capture = capture?;
         total_brand_new_count += capture.brand_new_count;
         total_resurfaced_count += capture.resurfaced_count;
         all_items.extend(capture.items);
@@ -1878,6 +1888,28 @@ async fn collect_items_from_enabled_sources(
         resurfaced_count: total_resurfaced_count,
         enabled_sources,
     })
+}
+
+async fn show_source_session_for_refresh(
+    state: &AppState,
+    source: CaptureSourceKind,
+) -> Result<bool, AppError> {
+    match source {
+        CaptureSourceKind::X => state.ensure_x_session_visible_for_refresh().await,
+        CaptureSourceKind::Linkedin => state.ensure_linkedin_session_visible_for_refresh().await,
+        CaptureSourceKind::Reddit => state.ensure_reddit_session_visible_for_refresh().await,
+    }
+}
+
+fn hide_source_session_after_refresh(
+    state: &AppState,
+    source: CaptureSourceKind,
+) -> Result<(), AppError> {
+    match source {
+        CaptureSourceKind::X => state.hide_x_session_after_refresh(),
+        CaptureSourceKind::Linkedin => state.hide_linkedin_session_after_refresh(),
+        CaptureSourceKind::Reddit => state.hide_reddit_session_after_refresh(),
+    }
 }
 
 async fn collect_items_from_source_live_session(

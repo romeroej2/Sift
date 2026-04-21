@@ -196,6 +196,143 @@ impl AppState {
         .await
     }
 
+    pub(crate) async fn ensure_x_session_visible_for_refresh(&self) -> Result<bool, AppError> {
+        if let Some(window) = self.app.get_webview_window(X_SESSION_WINDOW_LABEL) {
+            let was_visible = window.is_visible().unwrap_or(false);
+            if !was_visible {
+                window
+                    .show()
+                    .map_err(|error| AppError::Message(error.to_string()))?;
+                let _ = window.set_focus();
+            }
+            return Ok(!was_visible);
+        }
+
+        let saved_session = self.db.load_persisted_x_session()?;
+        let initial_url = resolve_x_session_launch_url(
+            saved_session
+                .as_ref()
+                .map(|session| session.last_known_url.as_str()),
+        );
+        let is_authenticated = saved_session
+            .as_ref()
+            .is_some_and(|session| session.is_authenticated);
+
+        self.remember_x_session(initial_url.to_string(), is_authenticated)
+            .await?;
+
+        let window = build_x_session_window(&self.app, self.clone(), initial_url, true, true)
+            .map_err(AppError::Message)?;
+        window
+            .show()
+            .map_err(|error| AppError::Message(error.to_string()))?;
+        let _ = window.set_focus();
+
+        Ok(true)
+    }
+
+    pub(crate) fn hide_x_session_after_refresh(&self) -> Result<(), AppError> {
+        if let Some(window) = self.app.get_webview_window(X_SESSION_WINDOW_LABEL) {
+            window
+                .hide()
+                .map_err(|error| AppError::Message(error.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn ensure_linkedin_session_visible_for_refresh(
+        &self,
+    ) -> Result<bool, AppError> {
+        if let Some(window) = self.app.get_webview_window(LINKEDIN_SESSION_WINDOW_LABEL) {
+            let was_visible = window.is_visible().unwrap_or(false);
+            if !was_visible {
+                window
+                    .show()
+                    .map_err(|error| AppError::Message(error.to_string()))?;
+                let _ = window.set_focus();
+            }
+            return Ok(!was_visible);
+        }
+
+        let saved_session = self.db.load_persisted_linkedin_session()?;
+        let initial_url = resolve_linkedin_session_launch_url(
+            saved_session
+                .as_ref()
+                .map(|session| session.last_known_url.as_str()),
+        );
+        let is_authenticated = saved_session
+            .as_ref()
+            .is_some_and(|session| session.is_authenticated);
+
+        self.remember_linkedin_session(initial_url.to_string(), is_authenticated)
+            .await?;
+
+        let window = build_linkedin_session_window(&self.app, self.clone(), initial_url, true, true)
+            .map_err(AppError::Message)?;
+        window
+            .show()
+            .map_err(|error| AppError::Message(error.to_string()))?;
+        let _ = window.set_focus();
+
+        Ok(true)
+    }
+
+    pub(crate) fn hide_linkedin_session_after_refresh(&self) -> Result<(), AppError> {
+        if let Some(window) = self.app.get_webview_window(LINKEDIN_SESSION_WINDOW_LABEL) {
+            window
+                .hide()
+                .map_err(|error| AppError::Message(error.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn ensure_reddit_session_visible_for_refresh(&self) -> Result<bool, AppError> {
+        if let Some(window) = self.app.get_webview_window(REDDIT_SESSION_WINDOW_LABEL) {
+            let was_visible = window.is_visible().unwrap_or(false);
+            if !was_visible {
+                window
+                    .show()
+                    .map_err(|error| AppError::Message(error.to_string()))?;
+                let _ = window.set_focus();
+            }
+            return Ok(!was_visible);
+        }
+
+        let saved_session = self.db.load_persisted_reddit_session()?;
+        let initial_url = resolve_reddit_session_launch_url(
+            saved_session
+                .as_ref()
+                .map(|session| session.last_known_url.as_str()),
+        );
+        let is_authenticated = saved_session
+            .as_ref()
+            .is_some_and(|session| session.is_authenticated);
+
+        self.remember_reddit_session(initial_url.to_string(), is_authenticated)
+            .await?;
+
+        let window = build_reddit_session_window(&self.app, self.clone(), initial_url, true, true)
+            .map_err(AppError::Message)?;
+        window
+            .show()
+            .map_err(|error| AppError::Message(error.to_string()))?;
+        let _ = window.set_focus();
+
+        Ok(true)
+    }
+
+    pub(crate) fn hide_reddit_session_after_refresh(&self) -> Result<(), AppError> {
+        if let Some(window) = self.app.get_webview_window(REDDIT_SESSION_WINDOW_LABEL) {
+            window
+                .hide()
+                .map_err(|error| AppError::Message(error.to_string()))?;
+        }
+
+        Ok(())
+    }
+
     async fn remember_x_session(
         &self,
         last_known_url: String,
