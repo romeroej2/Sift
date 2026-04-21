@@ -765,6 +765,26 @@ impl Database {
         )?;
         Ok(exists > 0)
     }
+
+    pub fn delete_run(&self, run_id: &str) -> Result<(), AppError> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM item_decisions WHERE run_id = ?1", params![run_id])?;
+        tx.execute("DELETE FROM editions WHERE sync_run_id = ?1", params![run_id])?;
+        tx.execute("DELETE FROM sync_runs WHERE id = ?1", params![run_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_all_editions(&self) -> Result<(), AppError> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM item_decisions", [])?;
+        tx.execute("DELETE FROM editions", [])?;
+        tx.execute("DELETE FROM sync_runs", [])?;
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1116,6 +1136,35 @@ mod tests {
         assert_eq!(editions.len(), 2);
         assert_eq!(editions[0].id, later.id);
         assert_eq!(editions[1].id, earlier.id);
+    }
+
+    #[test]
+    fn delete_all_editions_clears_runs_and_archive() {
+        let temp_dir = tempdir().expect("temporary database directory");
+        let db = Database::new(temp_dir.path().join("sift.sqlite")).expect("database");
+
+        let edition = Edition {
+            id: "edition-1".into(),
+            edition_date: "2026-04-16".into(),
+            title: "Your SIFT for 2026-04-16".into(),
+            front_page_summary: "Digest".into(),
+            created_at: "2026-04-16T08:00:00Z".into(),
+            run_id: "run-1".into(),
+            view: EditionView::Consolidated,
+            sections: vec![],
+        };
+        let mut run = sample_sync_run("run-1");
+        run.edition_id = Some(edition.id.clone());
+
+        db.insert_sync_run(&run).expect("insert run");
+        db.save_edition(&edition, &[], &run).expect("save edition");
+
+        db.delete_all_editions().expect("delete all editions");
+
+        let bootstrap = db.load_bootstrap().expect("load bootstrap");
+        assert!(bootstrap.editions.is_empty());
+        assert!(bootstrap.run_history.is_empty());
+        assert!(bootstrap.latest_run.is_none());
     }
 
     #[test]

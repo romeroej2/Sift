@@ -2932,6 +2932,30 @@ fn restore_reddit_session_window(state: &AppState) -> Result<(), AppError> {
     Ok(())
 }
 
+fn hide_session_windows_on_startup(app: &tauri::AppHandle) {
+    for label in [
+        X_SESSION_WINDOW_LABEL,
+        LINKEDIN_SESSION_WINDOW_LABEL,
+        REDDIT_SESSION_WINDOW_LABEL,
+    ] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.hide();
+        }
+    }
+}
+
+fn schedule_session_windows_hidden_on_startup(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let delays_ms = [0_u64, 150, 600, 1500];
+        for delay_ms in delays_ms {
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            hide_session_windows_on_startup(&app);
+        }
+    });
+}
+
 #[tauri::command]
 async fn get_bootstrap_state(state: tauri::State<'_, AppState>) -> Result<BootstrapState, String> {
     state.db.load_bootstrap().map_err(|error| error.to_string())
@@ -3449,6 +3473,27 @@ async fn disconnect_x(state: tauri::State<'_, AppState>) -> Result<BootstrapStat
 }
 
 #[tauri::command]
+async fn delete_run(
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Result<BootstrapState, String> {
+    state
+        .db
+        .delete_run(&run_id)
+        .map_err(|error| error.to_string())?;
+    state.db.load_bootstrap().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn delete_all_editions(state: tauri::State<'_, AppState>) -> Result<BootstrapState, String> {
+    state
+        .db
+        .delete_all_editions()
+        .map_err(|error| error.to_string())?;
+    state.db.load_bootstrap().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn open_external_url(url: String) -> Result<(), String> {
     let parsed = Url::parse(&url).map_err(|error| error.to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -3597,6 +3642,7 @@ pub fn run() {
                 eprintln!("failed to restore Reddit session window: {error}");
                 log::error!("failed to restore Reddit session window: {error}");
             }
+            schedule_session_windows_hidden_on_startup(app_handle.clone());
 
             tauri::async_runtime::spawn(run_scheduler(state.clone()));
             tauri::async_runtime::spawn(async move {
@@ -3694,6 +3740,8 @@ pub fn run() {
             submit_reddit_feed_capture_progress,
             run_sync,
             disconnect_x,
+            delete_run,
+            delete_all_editions,
             open_external_url
         ])
         .run(tauri::generate_context!())

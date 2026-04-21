@@ -72,3 +72,11 @@ export function disconnectX() {
 export function openExternalUrl(url: string) {
   return invoke<void>("open_external_url", { url });
 }
+
+export function deleteRun(runId: string) {
+  return invoke<BootstrapState>("delete_run", { runId });
+}
+
+export function deleteAllEditions() {
+  return invoke<BootstrapState>("delete_all_editions");
+}

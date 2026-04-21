@@ -44,6 +44,8 @@ import {
   withTimeout
 } from "./lib/app-utils";
 import {
+  deleteAllEditions,
+  deleteRun,
   disconnectX,
   getBootstrapState,
   getLinkedInSessionState,
@@ -160,7 +162,14 @@ function SourceBrandIcon({ source }: { source: BrowserSource }) {
   if (source === "reddit") {
     return (
       <span className="session-pill__brand session-pill__brand--reddit" aria-hidden="true">
-        <svg viewBox="0 0 24 24" fill="none">
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.8"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
           <circle cx="12" cy="13" r="5.5" />
           <path d="M9 18c.7.5 1.8.8 3 .8s2.3-.3 3-.8" />
           <circle cx="9.8" cy="13" r=".9" fill="currentColor" stroke="none" />
@@ -335,6 +344,7 @@ export default function App() {
   const [selectedEditionId, setSelectedEditionId] = useState<string | null>(null);
   const [selectedView, setSelectedView] = useState<EditionView>("consolidated");
   const [message, setMessage] = useState("Opening today\'s desk...");
+  const [isArchiveDeleteArmed, setIsArchiveDeleteArmed] = useState(false);
   const [lmStudioDraft, setLmStudioDraft] = useState(DEFAULT_SETTINGS.lmStudio);
   const [sessionStates, setSessionStates] = useState<Record<BrowserSource, BrowserSessionState>>({
     x: EMPTY_BROWSER_SESSION,
@@ -347,6 +357,7 @@ export default function App() {
   const [syncProgress, setSyncProgress] = useState<SyncProgressEvent | null>(null);
   const [clockNow, setClockNow] = useState(() => Date.now());
   const [isSettingsDirty, setIsSettingsDirty] = useState(false);
+  const [lastSettingsSavedAt, setLastSettingsSavedAt] = useState<number | null>(null);
   const settingsAutosaveTimeoutRef = useRef<number | null>(null);
   const availableModels = lmHealth?.models ?? [];
   const xSession = sessionStates.x;
@@ -447,6 +458,12 @@ export default function App() {
       window.clearInterval(interval);
     };
   }, []);
+
+  useEffect(() => {
+    if (screen !== "archive" || bootstrap.editions.length === 0) {
+      setIsArchiveDeleteArmed(false);
+    }
+  }, [bootstrap.editions.length, screen]);
 
   useEffect(() => {
     if (bootstrap.latestRun?.status !== "running") {
@@ -736,6 +753,7 @@ export default function App() {
         authToken: current.authToken
       }));
       setIsSettingsDirty(false);
+      setLastSettingsSavedAt(Date.now());
       void hydrateSavedLmStudio({
         ...saved,
         lmStudio: {
@@ -779,6 +797,7 @@ export default function App() {
       });
       setBootstrap((current) => ({ ...current, settings: saved }));
       setIsSettingsDirty(false);
+      setLastSettingsSavedAt(Date.now());
       setMessage(successMessage);
     } catch (error) {
       setMessage(getErrorMessage(error, "Unable to save settings."));
@@ -954,6 +973,47 @@ export default function App() {
     }
   }
 
+  async function handleDeleteRun(runId: string) {
+    const shouldContinue =
+      typeof window.confirm !== "function"
+        || window.confirm("Delete this run and all its editions? This cannot be undone.");
+
+    if (!shouldContinue) {
+      return;
+    }
+
+    try {
+      const state = await deleteRun(runId);
+      const wasActive = state.editions.every((edition) => edition.runId !== runId);
+      if (!wasActive) {
+        setSelectedEditionId(null);
+      }
+      setBootstrap(state);
+      setMessage("Run deleted.");
+    } catch (error) {
+      setMessage(getErrorMessage(error, "Could not delete run."));
+    }
+  }
+
+  async function handleDeleteAllEditions() {
+    if (!isArchiveDeleteArmed) {
+      setIsArchiveDeleteArmed(true);
+      setMessage("Click Delete all again to remove every archived edition.");
+      return;
+    }
+
+    try {
+      const state = await deleteAllEditions();
+      setIsArchiveDeleteArmed(false);
+      setSelectedEditionId(null);
+      setBootstrap(state);
+      setMessage("All archived editions deleted.");
+    } catch (error) {
+      setIsArchiveDeleteArmed(false);
+      setMessage(getErrorMessage(error, "Could not delete all archived editions."));
+    }
+  }
+
   async function handleOpenSourcePost(url: string) {
     try {
       await openExternalUrl(url);
@@ -979,23 +1039,24 @@ export default function App() {
 
   return (
     <main className="app-shell">
-      <header className="masthead masthead--compact">
-        <div className="masthead-main">
-          <div className="brand-header">
-            <img
-              className="brand-mark"
-              src="/sift-mark.png"
-              alt="SIFT"
-            />
-            <div>
-              <p className="kicker">SIFT Daily Briefing</p>
-              <h1>The signal in your feed, without the noise.</h1>
+      <header className="masthead">
+        <div className="masthead-identity">
+          <div className="masthead-brand">
+            <span className="masthead-mark" aria-hidden="true">
+              <svg viewBox="0 0 32 32" fill="none">
+                <circle cx="16" cy="16" r="14" stroke="currentColor" strokeWidth="1.5" opacity="0.3" />
+                <circle cx="16" cy="16" r="8" stroke="currentColor" strokeWidth="1.5" opacity="0.5" />
+                <circle cx="16" cy="16" r="2.5" fill="currentColor" />
+              </svg>
+            </span>
+            <div className="masthead-titles">
+              <span className="masthead-title">SIFT</span>
+              <span className="masthead-subtitle">Daily Briefing</span>
             </div>
           </div>
 
-          <div className="masthead-toolbar">
-            <section className="browser-status-bar" aria-label="Browser status">
-              <span className="browser-status-bar__label">Browser status</span>
+          <div className="masthead-utility">
+            <section className="session-dots" aria-label="Browser status">
               <BrowserSessionCard
                 source="x"
                 session={xSession}
@@ -1020,45 +1081,64 @@ export default function App() {
                 onLogout={handleLogoutRedditSession}
                 compact
               />
-              {bootstrap.xConnection ? (
-                <div className="browser-status-note">
-                  <span>Legacy X API: @{bootstrap.xConnection.handle}</span>
-                  <button className="secondary-button" onClick={handleDisconnectX}>
-                    Clear legacy connection
-                  </button>
-                </div>
-              ) : null}
             </section>
+            <HeaderBlingLink onClick={handleGemBlingClick} />
+          </div>
+        </div>
 
-            <div className="masthead-actions">
-              <button
-                className={screen === "today" ? "nav-button nav-button--active" : "nav-button"}
-                onClick={() => setScreen("today")}
-              >
-                Today
-              </button>
-              <button
-                className={screen === "archive" ? "nav-button nav-button--active" : "nav-button"}
-                onClick={() => setScreen("archive")}
-              >
-                Archive
-              </button>
-              <button
-                className={screen === "settings" ? "nav-button nav-button--active" : "nav-button"}
-                onClick={() => setScreen("settings")}
-              >
-                Settings
-              </button>
-              <button className="primary-button" onClick={handleRunSync} disabled={isRefreshBusy}>
-                {isRefreshBusy ? "Refreshing..." : "Refresh edition"}
-              </button>
-              <HeaderBlingLink onClick={handleGemBlingClick} />
-            </div>
+        <div className="masthead-nav-row">
+          <nav className="masthead-nav" aria-label="Primary">
+            <button
+              className={screen === "today" ? "masthead-nav__link masthead-nav__link--active" : "masthead-nav__link"}
+              onClick={() => setScreen("today")}
+              aria-current={screen === "today" ? "page" : undefined}
+            >
+              <span>Today</span>
+            </button>
+            <button
+              className={screen === "archive" ? "masthead-nav__link masthead-nav__link--active" : "masthead-nav__link"}
+              onClick={() => setScreen("archive")}
+              aria-current={screen === "archive" ? "page" : undefined}
+            >
+              <span>Archive</span>
+            </button>
+            <button
+              className={screen === "settings" ? "masthead-nav__link masthead-nav__link--active" : "masthead-nav__link"}
+              onClick={() => setScreen("settings")}
+              aria-current={screen === "settings" ? "page" : undefined}
+            >
+              <span>Settings</span>
+            </button>
+          </nav>
+
+          <div className="masthead-cta">
+            {bootstrap.xConnection ? (
+              <div className="masthead-legacy-note">
+                <span>Legacy X: @{bootstrap.xConnection.handle}</span>
+                <button className="secondary-button" onClick={handleDisconnectX}>
+                  Clear
+                </button>
+              </div>
+            ) : null}
+            <button
+              className="primary-button masthead-cta__button"
+              onClick={handleRunSync}
+              disabled={isRefreshBusy}
+              data-busy={isRefreshBusy}
+            >
+              <span className="masthead-cta__icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="23 4 23 10 17 10" />
+                  <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+                </svg>
+              </span>
+              {isRefreshBusy ? "Refreshing..." : "Refresh edition"}
+            </button>
           </div>
         </div>
       </header>
 
-<section className="status-strip" aria-live="polite">
+      <section className={isRefreshBusy ? "status-strip status-strip--busy" : "status-strip"} aria-live="polite">
         <span className="status-strip__primary">{statusMessage}</span>
         <span className="status-strip__meta">{statusMeta}</span>
       </section>
@@ -1078,27 +1158,25 @@ export default function App() {
               availableModels={availableModels}
               onVerifyLmStudio={handleVerifyLmStudio}
               onSaveModelDesk={handleSaveSettings}
+              isSettingsDirty={isSettingsDirty}
+              lastSettingsSavedAt={lastSettingsSavedAt}
+              now={clockNow}
               onChange={(next) => {
                 setBootstrap((current) => ({ ...current, settings: next }));
                 setIsSettingsDirty(true);
               }}
-              onSave={(settings) => persistNewsroomSettings(settings, "Paper rules updated.")}
             />
           ) : screen === "archive" ? (
-            <ArchivePanel
-              tabs={(
-                <EditionViewTabs
-                  ariaLabel="Archive view"
-                  availableViews={availableViews}
-                  selectedView={selectedView}
-                  onSelect={handleSelectView}
-                />
-              )}
-              editions={bootstrap.editions.filter((edition) => edition.view === selectedView)}
-              runHistory={bootstrap.runHistory}
-              selectedEditionId={selectedEditionId}
-              onSelect={setSelectedEditionId}
-            />
+              <ArchivePanel
+                editions={bootstrap.editions}
+                runHistory={bootstrap.runHistory}
+                selectedEditionId={selectedEditionId}
+                onSelect={setSelectedEditionId}
+                onOpenSourcePost={handleOpenSourcePost}
+                onDeleteRun={handleDeleteRun}
+                onDeleteAllEditions={handleDeleteAllEditions}
+                isDeleteAllArmed={isArchiveDeleteArmed}
+              />
           ) : (
             <EditionPanel
               tabs={(
@@ -1120,6 +1198,59 @@ export default function App() {
   );
 }
 
+function formatRelativeSavedAt(savedAt: number, now: number) {
+  const delta = Math.max(0, now - savedAt);
+  const seconds = Math.floor(delta / 1000);
+  if (seconds < 60) {
+    return "just now";
+  }
+
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes} min ago`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+  return `${hours} hr ago`;
+}
+
+function SettingsSaveIndicator({
+  isDirty,
+  hasEnabledSources,
+  lastSavedAt,
+  now
+}: {
+  isDirty: boolean;
+  hasEnabledSources: boolean;
+  lastSavedAt: number | null;
+  now: number;
+}) {
+  let tone: "muted" | "saving" | "saved" | "warning" = "muted";
+  let label = "Autosave enabled";
+
+  if (isDirty && !hasEnabledSources) {
+    tone = "warning";
+    label = "Enable a source to autosave";
+  } else if (isDirty) {
+    tone = "saving";
+    label = "Saving\u2026";
+  } else if (lastSavedAt !== null) {
+    tone = "saved";
+    label = `Saved \u00b7 ${formatRelativeSavedAt(lastSavedAt, now)}`;
+  }
+
+  return (
+    <div
+      className={`settings-save-indicator settings-save-indicator--${tone}`}
+      role="status"
+      aria-live="polite"
+    >
+      <span className="settings-save-indicator__dot" aria-hidden="true" />
+      <span>{label}</span>
+    </div>
+  );
+}
+
 function SettingsPanel({
   settings,
   scheduleSummary,
@@ -1132,8 +1263,10 @@ function SettingsPanel({
   availableModels,
   onVerifyLmStudio,
   onSaveModelDesk,
-  onChange,
-  onSave
+  isSettingsDirty,
+  lastSettingsSavedAt,
+  now,
+  onChange
 }: {
   settings: UserSettings;
   scheduleSummary: { title: string; detail: string };
@@ -1146,8 +1279,10 @@ function SettingsPanel({
   availableModels: LmStudioHealth["models"];
   onVerifyLmStudio: () => void;
   onSaveModelDesk: () => void;
+  isSettingsDirty: boolean;
+  lastSettingsSavedAt: number | null;
+  now: number;
   onChange: (value: UserSettings) => void;
-  onSave: (value: UserSettings) => Promise<void>;
 }) {
   const hasEnabledSources =
     settings.capture.sources.x
@@ -1187,18 +1322,17 @@ function SettingsPanel({
 
   return (
     <section className="panel content-panel">
-      <div className="section-header">
+      <div className="section-header section-header--split">
         <div>
           <p className="kicker">Settings</p>
           <h2>Shape the paper.</h2>
         </div>
-        <button
-          className="primary-button"
-          onClick={() => void onSave(settings)}
-          disabled={!hasEnabledSources}
-        >
-          Save newsroom settings
-        </button>
+        <SettingsSaveIndicator
+          isDirty={isSettingsDirty}
+          hasEnabledSources={Boolean(hasEnabledSources)}
+          lastSavedAt={lastSettingsSavedAt}
+          now={now}
+        />
       </div>
 
       <div className="settings-stack">
@@ -1365,7 +1499,7 @@ function SettingsPanel({
 
           <div className="settings-source-grid">
             <section
-              className={`settings-source-tile${settings.capture.sources.x ? " settings-source-tile--enabled" : ""}`}
+              className={`settings-source-tile${settings.capture.sources.x ? " settings-source-tile--enabled settings-source-tile--x" : ""}`}
             >
               <div className="settings-source-tile__top">
                 <div>
@@ -1395,7 +1529,7 @@ function SettingsPanel({
             </section>
 
             <section
-              className={`settings-source-tile${settings.capture.sources.linkedin ? " settings-source-tile--enabled" : ""}`}
+              className={`settings-source-tile${settings.capture.sources.linkedin ? " settings-source-tile--enabled settings-source-tile--linkedin" : ""}`}
             >
               <div className="settings-source-tile__top">
                 <div>
@@ -1425,11 +1559,28 @@ function SettingsPanel({
             </section>
 
             <section
-              className={`settings-source-tile${settings.capture.sources.reddit ? " settings-source-tile--enabled" : ""}`}
+              className={`settings-source-tile${settings.capture.sources.reddit ? " settings-source-tile--enabled settings-source-tile--reddit" : ""}`}
             >
               <div className="settings-source-tile__top">
                 <div>
-                  <span className="settings-source-tile__title">Reddit</span>
+                  <span className="settings-source-tile__title-row">
+                    <span
+                      className="settings-source-tile__source-icon settings-source-tile__source-icon--reddit"
+                      aria-hidden="true"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none">
+                        <circle cx="12" cy="13" r="5.5" />
+                        <path d="M9 18c.7.5 1.8.8 3 .8s2.3-.3 3-.8" />
+                        <circle cx="9.8" cy="13" r=".9" fill="currentColor" stroke="none" />
+                        <circle cx="14.2" cy="13" r=".9" fill="currentColor" stroke="none" />
+                        <path d="M10.5 7.2 12.2 9" />
+                        <circle cx="15.8" cy="6.8" r="1.2" />
+                        <path d="M7.8 10.2c-.8-.5-1.5-1.2-1.5-2.1 0-1 1-1.8 2.3-1.8.7 0 1.3.2 1.8.5" />
+                        <path d="M16.2 10.2c.8-.5 1.5-1.2 1.5-2.1 0-1-1-1.8-2.3-1.8-.7 0-1.3.2-1.8.5" />
+                      </svg>
+                    </span>
+                    <span className="settings-source-tile__title">Reddit</span>
+                  </span>
                   <span className="settings-source-tile__eyebrow">Community signal</span>
                 </div>
                 <input
@@ -1769,57 +1920,174 @@ function SettingsPanel({
 }
 
 function ArchivePanel({
-  tabs,
   editions,
   runHistory,
   selectedEditionId,
-  onSelect
+  onSelect,
+  onOpenSourcePost,
+  onDeleteRun,
+  onDeleteAllEditions,
+  isDeleteAllArmed
 }: {
-  tabs?: ReactNode;
   editions: Edition[];
   runHistory: SyncRun[];
   selectedEditionId: string | null;
   onSelect: (value: string) => void;
+  onOpenSourcePost: (url: string) => void;
+  onDeleteRun?: (runId: string) => void;
+  onDeleteAllEditions?: () => void;
+  isDeleteAllArmed?: boolean;
 }) {
   const runById = new Map(runHistory.map((run) => [run.id, run]));
+  const sortedEditions = editions.slice().sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  const selectedEdition = sortedEditions.find((e) => e.id === selectedEditionId) ?? null;
+  const selectedRun = selectedEdition ? (runById.get(selectedEdition.runId) ?? null) : null;
+
+  const allViews: EditionView[] = ["consolidated", "x", "linkedin", "reddit"];
+  const siblingEditions = selectedEdition
+    ? sortedEditions.filter((e) => e.runId === selectedEdition.runId)
+    : [];
+  const siblingViews = allViews.filter((view) =>
+    siblingEditions.some((e) => e.view === view)
+  );
+
+  const runGroups = useMemo(() => {
+    const groups = new Map<string, Edition[]>();
+    for (const edition of sortedEditions) {
+      const list = groups.get(edition.runId) ?? [];
+      list.push(edition);
+      groups.set(edition.runId, list);
+    }
+    return Array.from(groups.entries())
+      .map(([runId, runEditions]) => {
+        const run = runById.get(runId);
+        const primary = runEditions.find((e) => e.view === "consolidated") ?? runEditions[0];
+        const pages = allViews
+          .map((view) => runEditions.find((e) => e.view === view))
+          .filter(Boolean) as Edition[];
+        return { runId, run, primary, pages };
+      })
+      .sort((a, b) => new Date(b.primary.createdAt).getTime() - new Date(a.primary.createdAt).getTime());
+  }, [sortedEditions, runById]);
 
   return (
-    <section className="panel content-panel archive-panel">
-      {tabs}
-      <div className="section-header">
-        <p className="kicker">Archive</p>
-        <h2>Past editions</h2>
-      </div>
-
-      <div className="archive-list">
-        {editions.length ? (
-          editions.map((edition) => {
-            const run = runById.get(edition.runId);
-            return (
+    <div className="archive-layout">
+      <aside className="archive-browser">
+        <div className="section-header section-header--archive">
+          <div>
+            <p className="kicker">Archive</p>
+            <h2>{sortedEditions.length} editions</h2>
+          </div>
+          {sortedEditions.length > 0 && onDeleteAllEditions ? (
             <button
-              key={edition.id}
-              className={
-                edition.id === selectedEditionId
-                  ? "archive-item archive-item--active"
-                  : "archive-item"
-              }
-              onClick={() => onSelect(edition.id)}
+              className={isDeleteAllArmed ? "archive-header__clear archive-header__clear--armed" : "archive-header__clear"}
+              type="button"
+              onClick={onDeleteAllEditions}
+              aria-label={isDeleteAllArmed ? "Confirm delete all editions" : "Delete all editions"}
             >
-              <strong>{formatEditionDate(edition.editionDate)}</strong>
-              <span>{edition.title}</span>
-              <small>
-                Saved {formatTime(edition.createdAt)}
-                {run?.scheduleRuleLabel ? ` · ${run.scheduleRuleLabel}` : ""}
-                {run ? ` · ${formatDuration(run.timings.totalMs)}` : ""}
-              </small>
+              {isDeleteAllArmed ? "Confirm delete all" : "Delete all"}
             </button>
-            );
-          })
+          ) : null}
+        </div>
+
+        <div className="archive-list">
+          {runGroups.length ? (
+            runGroups.map(({ runId, run, primary, pages }) => (
+              <section key={runId} className="archive-run-group">
+                <header className="archive-run-header">
+                  <span className="archive-run-header__time">{formatTime(primary.createdAt)}</span>
+                  <span className="archive-run-header__label">
+                    {run?.scheduleRuleLabel ?? "Manual"}
+                  </span>
+                  <span className="archive-run-header__right">
+                    {run ? (
+                      <span className="archive-run-header__duration">
+                        {formatDuration(run.timings.totalMs)}
+                      </span>
+                    ) : null}
+                    {onDeleteRun ? (
+                      <button
+                        className="archive-run-header__delete"
+                        type="button"
+                        onClick={() => onDeleteRun(runId)}
+                        aria-label="Delete this run"
+                        title="Delete this run"
+                      >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                          <polyline points="3 6 5 6 21 6" />
+                          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                        </svg>
+                      </button>
+                    ) : null}
+                  </span>
+                </header>
+                <div className="archive-run-pages" role="list">
+                  {pages.map((edition) => {
+                    const isActive = edition.id === selectedEditionId;
+                    return (
+                      <button
+                        key={edition.id}
+                        className={isActive ? "archive-page archive-page--active" : "archive-page"}
+                        onClick={() => onSelect(edition.id)}
+                        role="listitem"
+                        aria-current={isActive ? "true" : undefined}
+                      >
+                        <span
+                          className="archive-page__dot"
+                          aria-hidden="true"
+                          data-view={edition.view}
+                        />
+                        <span className="archive-page__label">
+                          {getEditionViewLabel(edition.view)}
+                        </span>
+                        <span className="archive-page__title">{edition.title}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
+            ))
+          ) : (
+            <p className="empty-copy">Once your first issue is generated, it will land here.</p>
+          )}
+        </div>
+      </aside>
+
+      <div className="archive-reader">
+        {selectedEdition ? (
+          <EditionPanel
+            tabs={
+              siblingViews.length > 1 ? (
+                <EditionViewTabs
+                  ariaLabel="Edition pages"
+                  availableViews={siblingViews}
+                  selectedView={selectedEdition.view}
+                  onSelect={(view) => {
+                    const target = siblingEditions.find((e) => e.view === view);
+                    if (target && target.id !== selectedEditionId) {
+                      onSelect(target.id);
+                    }
+                  }}
+                />
+              ) : undefined
+            }
+            edition={selectedEdition}
+            run={selectedRun}
+            onOpenSourcePost={onOpenSourcePost}
+          />
         ) : (
-          <p className="empty-copy">Once your first issue is generated, it will land here.</p>
+          <section className="panel content-panel paper-panel paper-panel--empty">
+            <div className="section-header">
+              <p className="kicker">Archive</p>
+              <h2>Select an edition</h2>
+            </div>
+            <p className="empty-copy">
+              Choose an edition from the list to read it here.
+            </p>
+          </section>
         )}
       </div>
-    </section>
+    </div>
   );
 }
 
@@ -1887,19 +2155,23 @@ function EditionPanel({
                   title={card.sourceUrl}
                 >
                   {card.leadImage ? (
-                    <img
-                      className="story-card__image"
-                      src={getEditionImageSrc(card.leadImage.path)}
-                      alt={card.leadImage.alt}
-                      loading="lazy"
-                    />
+                    <div className="story-card__image-wrap">
+                      <img
+                        className="story-card__image"
+                        src={getEditionImageSrc(card.leadImage.path)}
+                        alt={card.leadImage.alt}
+                        loading="lazy"
+                      />
+                    </div>
                   ) : null}
-                  <span className="story-card__meta">
-                    {card.authorName} · @{card.authorHandle}
-                  </span>
-                  <h4>{card.headline}</h4>
-                  <p>{card.summary}</p>
-                  <span className="story-card__why">{card.whyItMatters}</span>
+                  <div className="story-card__content">
+                    <span className="story-card__meta">
+                      {card.authorName} · @{card.authorHandle}
+                    </span>
+                    <h4>{card.headline}</h4>
+                    <p>{card.summary}</p>
+                    <span className="story-card__why">{card.whyItMatters}</span>
+                  </div>
                 </button>
               ))}
             </div>

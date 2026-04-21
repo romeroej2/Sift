@@ -29,6 +29,8 @@ const {
   logoutLinkedInSessionWindowMock,
   logoutRedditSessionWindowMock,
   disconnectXMock,
+  deleteRunMock,
+  deleteAllEditionsMock,
   openExternalUrlMock,
   listenMock,
   enableAutostartMock,
@@ -55,6 +57,8 @@ const {
   logoutLinkedInSessionWindowMock: vi.fn(),
   logoutRedditSessionWindowMock: vi.fn(),
   disconnectXMock: vi.fn(),
+  deleteRunMock: vi.fn(),
+  deleteAllEditionsMock: vi.fn(),
   openExternalUrlMock: vi.fn(),
   listenMock: vi.fn(),
   enableAutostartMock: vi.fn(),
@@ -65,6 +69,8 @@ const {
 
 vi.mock("./lib/api", () => ({
   disconnectX: disconnectXMock,
+  deleteAllEditions: deleteAllEditionsMock,
+  deleteRun: deleteRunMock,
   getBootstrapState: getBootstrapStateMock,
   getLinkedInSessionState: getLinkedInSessionStateMock,
   getRedditSessionState: getRedditSessionStateMock,
@@ -235,6 +241,8 @@ beforeEach(() => {
   logoutLinkedInSessionWindowMock.mockResolvedValue(createSessionState());
   logoutRedditSessionWindowMock.mockResolvedValue(createSessionState());
   disconnectXMock.mockResolvedValue(createBootstrapState());
+  deleteRunMock.mockResolvedValue(createBootstrapState());
+  deleteAllEditionsMock.mockResolvedValue(createBootstrapState());
   openExternalUrlMock.mockResolvedValue(undefined);
   vi.spyOn(console, "info").mockImplementation(() => undefined);
   vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -346,7 +354,7 @@ describe("App", () => {
     ).toBeInTheDocument();
   });
 
-  it("lets you update newsroom settings and save them", async () => {
+  it("autosaves newsroom settings when several fields change", async () => {
     await renderLoadedApp();
 
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
@@ -363,32 +371,34 @@ describe("App", () => {
     fireEvent.change(screen.getByLabelText("Muted authors"), {
       target: { value: "@alice\n bob \n" }
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save newsroom settings" }));
 
-    await waitFor(() => {
-      expect(saveSettingsMock).toHaveBeenCalledWith({
-        ...DEFAULT_SETTINGS,
-        schedule: {
-          ...DEFAULT_SETTINGS.schedule,
-          rules: [
-            {
-              ...DEFAULT_SETTINGS.schedule.rules[0],
-              timeOfDay: "09:15"
-            }
-          ],
-          timezone: expect.any(String)
-        },
-        cleanup: {
-          hideReplies: false,
-          hideRetweets: false,
-          removeBait: false,
-          mutedKeywords: ["ai", "crypto"],
-          mutedAuthors: ["@alice", "bob"]
-        }
-      });
-    });
+    await waitFor(
+      () => {
+        expect(saveSettingsMock).toHaveBeenCalledWith({
+          ...DEFAULT_SETTINGS,
+          schedule: {
+            ...DEFAULT_SETTINGS.schedule,
+            rules: [
+              {
+                ...DEFAULT_SETTINGS.schedule.rules[0],
+                timeOfDay: "09:15"
+              }
+            ],
+            timezone: expect.any(String)
+          },
+          cleanup: {
+            hideReplies: false,
+            hideRetweets: false,
+            removeBait: false,
+            mutedKeywords: ["ai", "crypto"],
+            mutedAuthors: ["@alice", "bob"]
+          }
+        });
+      },
+      { timeout: 2000 }
+    );
 
-    expect(await screen.findByText("Paper rules updated.")).toBeInTheDocument();
+    expect(await screen.findByText("Settings autosaved.")).toBeInTheDocument();
   });
 
   it("autosaves newsroom settings after they change", async () => {
@@ -431,25 +441,27 @@ describe("App", () => {
     fireEvent.change(screen.getByLabelText("X pages to browse"), {
       target: { value: "5" }
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save newsroom settings" }));
 
-    await waitFor(() => {
-      expect(saveSettingsMock).toHaveBeenCalledWith(
-        expect.objectContaining({
-          schedule: expect.objectContaining({
-            rules: expect.arrayContaining([
-              expect.objectContaining({
-                cadence: "interval",
-                intervalHours: 2,
-                browsePageCount: expect.objectContaining({
-                  x: 5
+    await waitFor(
+      () => {
+        expect(saveSettingsMock).toHaveBeenCalledWith(
+          expect.objectContaining({
+            schedule: expect.objectContaining({
+              rules: expect.arrayContaining([
+                expect.objectContaining({
+                  cadence: "interval",
+                  intervalHours: 2,
+                  browsePageCount: expect.objectContaining({
+                    x: 5
+                  })
                 })
-              })
-            ])
+              ])
+            })
           })
-        })
-      );
-    });
+        );
+      },
+      { timeout: 2000 }
+    );
   });
 
   it("shows an empty archive state when there are no saved editions", async () => {
@@ -465,11 +477,13 @@ describe("App", () => {
   it("lets you select an archived edition and return to it on the Today view", async () => {
     const latestEdition = createEdition({
       id: "edition-latest",
+      runId: "run-latest",
       title: "Latest edition",
       frontPageSummary: "Today is packed."
     });
     const earlierEdition = createEdition({
       id: "edition-earlier",
+      runId: "run-earlier",
       title: "Earlier edition",
       frontPageSummary: "Earlier signal.",
       createdAt: "2026-04-15T12:00:00Z",
@@ -488,6 +502,35 @@ describe("App", () => {
 
     expect(screen.getByRole("heading", { name: "Earlier edition" })).toBeInTheDocument();
     expect(screen.getByText("Earlier signal.")).toBeInTheDocument();
+  });
+
+  it("clears all archived editions from the archive", async () => {
+    deleteAllEditionsMock.mockResolvedValue(createBootstrapState());
+
+    await renderLoadedApp({
+      bootstrap: createBootstrapState({
+        editions: [createEdition()],
+        runHistory: [createRun()],
+        latestRun: createRun()
+      })
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete all editions" }));
+
+    expect(deleteAllEditionsMock).not.toHaveBeenCalled();
+    expect(
+      await screen.findByText("Click Delete all again to remove every archived edition.")
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Confirm delete all editions" }));
+
+    await waitFor(() => {
+      expect(deleteAllEditionsMock).toHaveBeenCalledTimes(1);
+    });
+
+    expect(await screen.findByText("All archived editions deleted.")).toBeInTheDocument();
+    expect(screen.getByText("Once your first issue is generated, it will land here.")).toBeInTheDocument();
   });
 
   it("opens source posts from edition cards", async () => {
@@ -682,7 +725,7 @@ describe("App", () => {
     expect(screen.getByLabelText("Reddit pages to browse")).toBeInTheDocument();
   });
 
-  it("includes Reddit when saving newsroom settings", async () => {
+  it("includes Reddit when autosaving newsroom settings", async () => {
     await renderLoadedApp();
 
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
@@ -690,19 +733,21 @@ describe("App", () => {
       .getAllByText("Reddit")
       .find((element) => element.className === "settings-source-tile__title");
     fireEvent.click(redditSourceTitle!.closest("section")!.querySelector("input[type='checkbox']")!);
-    fireEvent.click(screen.getByRole("button", { name: "Save newsroom settings" }));
 
-    await waitFor(() => {
-      expect(saveSettingsMock).toHaveBeenCalledWith(
-        expect.objectContaining({
-          capture: expect.objectContaining({
-            sources: expect.objectContaining({
-              reddit: true
+    await waitFor(
+      () => {
+        expect(saveSettingsMock).toHaveBeenCalledWith(
+          expect.objectContaining({
+            capture: expect.objectContaining({
+              sources: expect.objectContaining({
+                reddit: true
+              })
             })
           })
-        })
-      );
-    });
+        );
+      },
+      { timeout: 2000 }
+    );
   });
 
   it("keeps the current edition visible when a refresh finds no newer posts", async () => {
@@ -1024,7 +1069,7 @@ describe("App", () => {
       await screen.findByText("The X session is hidden. Your sign-in stays alive in the background.")
     ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Clear legacy connection" }));
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
 
     await waitFor(() => {
       expect(disconnectXMock).toHaveBeenCalled();
