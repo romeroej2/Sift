@@ -1354,39 +1354,28 @@ pub async fn maybe_run_scheduled_sync(state: &AppState) -> Result<(), AppError> 
         return Ok(());
     }
 
-    if settings.capture.sources.x {
-        let session_window = state.app.get_webview_window(crate::X_SESSION_WINDOW_LABEL);
-        if let Some(window) = &session_window {
-            let _ = window.show();
-            let _ = window.set_focus();
-        }
-        if session_window.is_none() || !*state.x_session_authenticated.read().await {
-            return Ok(());
-        }
+    if settings.capture.sources.x
+        && (state.app.get_webview_window(crate::X_SESSION_WINDOW_LABEL).is_none()
+            || !*state.x_session_authenticated.read().await)
+    {
+        return Ok(());
     }
 
-    if settings.capture.sources.linkedin {
-        let session_window = state
+    if settings.capture.sources.linkedin
+        && (state
             .app
-            .get_webview_window(crate::LINKEDIN_SESSION_WINDOW_LABEL);
-        if let Some(window) = &session_window {
-            let _ = window.show();
-            let _ = window.set_focus();
-        }
-        if session_window.is_none() || !*state.linkedin_session_authenticated.read().await {
-            return Ok(());
-        }
+            .get_webview_window(crate::LINKEDIN_SESSION_WINDOW_LABEL)
+            .is_none()
+            || !*state.linkedin_session_authenticated.read().await)
+    {
+        return Ok(());
     }
 
-    if settings.capture.sources.reddit {
-        let session_window = state.app.get_webview_window(crate::REDDIT_SESSION_WINDOW_LABEL);
-        if let Some(window) = &session_window {
-            let _ = window.show();
-            let _ = window.set_focus();
-        }
-        if session_window.is_none() || !*state.reddit_session_authenticated.read().await {
-            return Ok(());
-        }
+    if settings.capture.sources.reddit
+        && (state.app.get_webview_window(crate::REDDIT_SESSION_WINDOW_LABEL).is_none()
+            || !*state.reddit_session_authenticated.read().await)
+    {
+        return Ok(());
     }
 
     for scheduled_run in due_rules {
@@ -1982,7 +1971,8 @@ async fn collect_items_from_enabled_sources(
     let mut total_resurfaced_count = 0usize;
 
     for source in &enabled_sources {
-        let temporarily_shown = show_source_session_for_refresh(state, *source).await?;
+        hide_all_source_sessions_for_refresh(state)?;
+        show_source_session_for_refresh(state, *source).await?;
         let capture = collect_items_from_source_live_session(
             state,
             settings,
@@ -1994,11 +1984,9 @@ async fn collect_items_from_enabled_sources(
         )
         .await;
 
-        if temporarily_shown {
-            if let Err(hide_error) = hide_source_session_after_refresh(state, *source) {
-                capture?;
-                return Err(hide_error);
-            }
+        if let Err(hide_error) = hide_source_session_after_refresh(state, *source) {
+            capture?;
+            return Err(hide_error);
         }
 
         let capture = capture?;
@@ -2049,6 +2037,18 @@ fn hide_source_session_after_refresh(
         CaptureSourceKind::Linkedin => state.hide_linkedin_session_after_refresh(),
         CaptureSourceKind::Reddit => state.hide_reddit_session_after_refresh(),
     }
+}
+
+fn hide_all_source_sessions_for_refresh(state: &AppState) -> Result<(), AppError> {
+    for source in [
+        CaptureSourceKind::X,
+        CaptureSourceKind::Linkedin,
+        CaptureSourceKind::Reddit,
+    ] {
+        hide_source_session_after_refresh(state, source)?;
+    }
+
+    Ok(())
 }
 
 async fn collect_items_from_source_live_session(

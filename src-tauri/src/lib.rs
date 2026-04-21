@@ -232,13 +232,7 @@ impl AppState {
     }
 
     pub(crate) fn hide_x_session_after_refresh(&self) -> Result<(), AppError> {
-        if let Some(window) = self.app.get_webview_window(X_SESSION_WINDOW_LABEL) {
-            window
-                .hide()
-                .map_err(|error| AppError::Message(error.to_string()))?;
-        }
-
-        Ok(())
+        hide_x_session_windows(&self.app).map_err(AppError::Message)
     }
 
     pub(crate) async fn ensure_linkedin_session_visible_for_refresh(
@@ -279,13 +273,7 @@ impl AppState {
     }
 
     pub(crate) fn hide_linkedin_session_after_refresh(&self) -> Result<(), AppError> {
-        if let Some(window) = self.app.get_webview_window(LINKEDIN_SESSION_WINDOW_LABEL) {
-            window
-                .hide()
-                .map_err(|error| AppError::Message(error.to_string()))?;
-        }
-
-        Ok(())
+        hide_linkedin_session_windows(&self.app).map_err(AppError::Message)
     }
 
     pub(crate) async fn ensure_reddit_session_visible_for_refresh(&self) -> Result<bool, AppError> {
@@ -324,13 +312,7 @@ impl AppState {
     }
 
     pub(crate) fn hide_reddit_session_after_refresh(&self) -> Result<(), AppError> {
-        if let Some(window) = self.app.get_webview_window(REDDIT_SESSION_WINDOW_LABEL) {
-            window
-                .hide()
-                .map_err(|error| AppError::Message(error.to_string()))?;
-        }
-
-        Ok(())
+        hide_reddit_session_windows(&self.app).map_err(AppError::Message)
     }
 
     async fn remember_x_session(
@@ -2547,6 +2529,16 @@ fn close_x_session_windows(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn hide_x_session_windows(app: &tauri::AppHandle) -> Result<(), String> {
+    for label in x_session_window_labels(app) {
+        if let Some(window) = app.get_webview_window(&label) {
+            window.hide().map_err(|error| error.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
 fn close_linkedin_session_windows(app: &tauri::AppHandle) -> Result<(), String> {
     for label in linkedin_session_window_labels(app) {
         if let Some(window) = app.get_webview_window(&label) {
@@ -2557,10 +2549,30 @@ fn close_linkedin_session_windows(app: &tauri::AppHandle) -> Result<(), String> 
     Ok(())
 }
 
+fn hide_linkedin_session_windows(app: &tauri::AppHandle) -> Result<(), String> {
+    for label in linkedin_session_window_labels(app) {
+        if let Some(window) = app.get_webview_window(&label) {
+            window.hide().map_err(|error| error.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
 fn close_reddit_session_windows(app: &tauri::AppHandle) -> Result<(), String> {
     for label in reddit_session_window_labels(app) {
         if let Some(window) = app.get_webview_window(&label) {
             window.close().map_err(|error| error.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
+fn hide_reddit_session_windows(app: &tauri::AppHandle) -> Result<(), String> {
+    for label in reddit_session_window_labels(app) {
+        if let Some(window) = app.get_webview_window(&label) {
+            window.hide().map_err(|error| error.to_string())?;
         }
     }
 
