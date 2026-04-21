@@ -910,7 +910,7 @@ mod tests {
         );
         assert_eq!(loaded.schedule.rules.len(), 1);
         assert_eq!(loaded.schedule.rules[0].time_of_day, "07:30");
-        assert_eq!(loaded.capture.browse_page_count.x, 12);
+        assert!(loaded.capture.sources.x);
     }
 
     #[test]

@@ -42,8 +42,6 @@ pub struct CaptureSourcesSettings {
 pub struct CaptureSettings {
     #[serde(default)]
     pub sources: CaptureSourcesSettings,
-    #[serde(default)]
-    pub browse_page_count: CaptureBrowsePageCount,
 }
 
 fn default_true() -> bool {
@@ -97,7 +95,6 @@ impl Default for CaptureSettings {
     fn default() -> Self {
         Self {
             sources: CaptureSourcesSettings::default(),
-            browse_page_count: CaptureBrowsePageCount::default(),
         }
     }
 }

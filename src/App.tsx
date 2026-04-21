@@ -1153,17 +1153,6 @@ function SettingsPanel({
     settings.capture.sources.x
     || settings.capture.sources.linkedin
     || settings.capture.sources.reddit;
-  const updateBrowseCount = (source: BrowserSource, fallback: number) => (rawValue: string) =>
-    onChange({
-      ...settings,
-      capture: {
-        ...settings.capture,
-        browsePageCount: {
-          ...settings.capture.browsePageCount,
-          [source]: Math.max(1, Number.parseInt(rawValue || String(fallback), 10) || fallback)
-        }
-      }
-    });
   const updateScheduleRule = (ruleId: string, updater: (rule: ScheduleRule) => ScheduleRule) =>
     onChange({
       ...settings,
@@ -1370,7 +1359,7 @@ function SettingsPanel({
               <h3>Source desk</h3>
             </div>
             <p className="settings-card__copy">
-              Choose where the paper should pull from and how deep each live feed should be browsed before drafting.
+              Choose where the paper should pull from. Browse depth now lives inside each schedule rule so shorter auto-runs can stay lighter than the daily brief.
             </p>
           </div>
 
@@ -1403,15 +1392,6 @@ function SettingsPanel({
               <p className="settings-source-tile__copy">
                 Fast, denser posts. Good when you want more breadth and chatter.
               </p>
-              <label className="field">
-                <span>X pages to browse</span>
-                <input
-                  type="number"
-                  min={1}
-                  value={settings.capture.browsePageCount.x}
-                  onChange={(event) => updateBrowseCount("x", 12)(event.target.value)}
-                />
-              </label>
             </section>
 
             <section
@@ -1442,15 +1422,6 @@ function SettingsPanel({
               <p className="settings-source-tile__copy">
                 Larger, slower cards. Tune this separately when you want fewer but heavier LinkedIn pages.
               </p>
-              <label className="field">
-                <span>LinkedIn pages to browse</span>
-                <input
-                  type="number"
-                  min={1}
-                  value={settings.capture.browsePageCount.linkedin}
-                  onChange={(event) => updateBrowseCount("linkedin", 8)(event.target.value)}
-                />
-              </label>
             </section>
 
             <section
@@ -1481,21 +1452,14 @@ function SettingsPanel({
               <p className="settings-source-tile__copy">
                 Conversation-heavy posts from your signed-in Reddit home feed, tuned separately from the faster social streams.
               </p>
-              <label className="field">
-                <span>Reddit pages to browse</span>
-                <input
-                  type="number"
-                  min={1}
-                  value={settings.capture.browsePageCount.reddit}
-                  onChange={(event) => updateBrowseCount("reddit", 10)(event.target.value)}
-                />
-              </label>
             </section>
           </div>
 
           {!hasEnabledSources ? (
             <p className="field-help">Pick at least one source before saving.</p>
-          ) : null}
+          ) : (
+            <p className="field-help">Per-source page counts are configured inside each schedule below.</p>
+          )}
         </section>
 
         <section className="settings-card">

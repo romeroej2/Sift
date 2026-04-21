@@ -63,7 +63,6 @@ export const DEFAULT_SETTINGS: UserSettings = {
       x: true,
       linkedin: false,
       reddit: false
-    },
-    browsePageCount: DEFAULT_BROWSE_PAGE_COUNT
+    }
   }
 };

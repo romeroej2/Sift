@@ -1938,7 +1938,16 @@ fn browse_page_count_for_source(
 ) -> usize {
     let browse_page_count = scheduled_run
         .map(|value| &value.browse_page_count)
-        .unwrap_or(&settings.capture.browse_page_count);
+        .or_else(|| {
+            settings
+                .schedule
+                .rules
+                .iter()
+                .find(|rule| rule.enabled)
+                .map(|rule| &rule.browse_page_count)
+        })
+        .or_else(|| settings.schedule.rules.first().map(|rule| &rule.browse_page_count))
+        .expect("default schedule rule should always exist");
 
     match source {
         CaptureSourceKind::X => browse_page_count.x.max(1),

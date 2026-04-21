@@ -251,16 +251,12 @@ describe("App", () => {
     await renderLoadedApp({
       bootstrap: createBootstrapState({
         editions: [edition],
-        latestRun: {
+        latestRun: createRun({
           id: "run-1",
-          startedAt: "2026-04-16T12:05:00Z",
-          finishedAt: "2026-04-16T12:06:00Z",
-          status: "success",
           itemCount: 4,
           keptCount: 2,
-          errorMessage: null,
           editionId: edition.id
-        }
+        })
       })
     });
 
@@ -291,16 +287,14 @@ describe("App", () => {
     runSyncMock.mockResolvedValue(
       createBootstrapState({
         editions: [freshEdition],
-        latestRun: {
+        latestRun: createRun({
           id: "run-from-closed",
           startedAt: "2026-04-16T13:00:00Z",
           finishedAt: "2026-04-16T13:01:00Z",
-          status: "success",
           itemCount: 8,
           keptCount: 4,
-          errorMessage: null,
           editionId: freshEdition.id
-        }
+        })
       })
     );
 
@@ -434,7 +428,7 @@ describe("App", () => {
     fireEvent.change(screen.getByLabelText("Run every hours"), {
       target: { value: "2" }
     });
-    fireEvent.change(screen.getAllByLabelText("X pages to browse")[1], {
+    fireEvent.change(screen.getByLabelText("X pages to browse"), {
       target: { value: "5" }
     });
     fireEvent.click(screen.getByRole("button", { name: "Save newsroom settings" }));
@@ -566,16 +560,14 @@ describe("App", () => {
     runSyncMock.mockResolvedValue(
       createBootstrapState({
         editions: [freshEdition],
-        latestRun: {
+        latestRun: createRun({
           id: "run-fresh",
           startedAt: "2026-04-16T13:00:00Z",
           finishedAt: "2026-04-16T13:01:00Z",
-          status: "success",
           itemCount: 8,
           keptCount: 4,
-          errorMessage: null,
           editionId: freshEdition.id
-        }
+        })
       })
     );
 
@@ -623,16 +615,14 @@ describe("App", () => {
       createBootstrapState({
         settings: dualSourceSettings,
         editions: [freshEdition],
-        latestRun: {
+        latestRun: createRun({
           id: "run-mixed-source-visibility",
           startedAt: "2026-04-16T13:00:00Z",
           finishedAt: "2026-04-16T13:01:00Z",
-          status: "success",
           itemCount: 8,
           keptCount: 4,
-          errorMessage: null,
           editionId: freshEdition.id
-        }
+        })
       })
     );
 
@@ -689,17 +679,17 @@ describe("App", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
 
-    expect(screen.getAllByLabelText("Reddit pages to browse")[0]).toBeInTheDocument();
+    expect(screen.getByLabelText("Reddit pages to browse")).toBeInTheDocument();
   });
 
   it("includes Reddit when saving newsroom settings", async () => {
     await renderLoadedApp();
 
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
-    fireEvent.click(screen.getAllByLabelText("Reddit pages to browse")[0].closest("section")!.querySelector("input[type='checkbox']")!);
-    fireEvent.change(screen.getAllByLabelText("Reddit pages to browse")[0], {
-      target: { value: "11" }
-    });
+    const redditSourceTitle = screen
+      .getAllByText("Reddit")
+      .find((element) => element.className === "settings-source-tile__title");
+    fireEvent.click(redditSourceTitle!.closest("section")!.querySelector("input[type='checkbox']")!);
     fireEvent.click(screen.getByRole("button", { name: "Save newsroom settings" }));
 
     await waitFor(() => {
@@ -708,9 +698,6 @@ describe("App", () => {
           capture: expect.objectContaining({
             sources: expect.objectContaining({
               reddit: true
-            }),
-            browsePageCount: expect.objectContaining({
-              reddit: 11
             })
           })
         })
@@ -730,16 +717,15 @@ describe("App", () => {
     runSyncMock.mockResolvedValue(
       createBootstrapState({
         editions: [currentEdition],
-        latestRun: {
+        latestRun: createRun({
           id: "run-no-fresh",
           startedAt: "2026-04-16T13:05:00Z",
           finishedAt: "2026-04-16T13:06:00Z",
-          status: "success",
           itemCount: 0,
           keptCount: 0,
           errorMessage: noFreshMessage,
           editionId: null
-        }
+        })
       })
     );
 
@@ -783,31 +769,27 @@ describe("App", () => {
 
     runSyncMock.mockResolvedValue(
       createBootstrapState({
-        latestRun: {
+        latestRun: createRun({
           id: "run-reloaded",
           startedAt: "2026-04-16T13:00:00Z",
           finishedAt: "2026-04-16T13:01:00Z",
-          status: "success",
           itemCount: 6,
           keptCount: 3,
-          errorMessage: null,
           editionId: freshEdition.id
-        }
+        })
       })
     );
     getBootstrapStateMock.mockResolvedValueOnce(
       createBootstrapState({
         editions: [freshEdition],
-        latestRun: {
+        latestRun: createRun({
           id: "run-reloaded",
           startedAt: "2026-04-16T13:00:00Z",
           finishedAt: "2026-04-16T13:01:00Z",
-          status: "success",
           itemCount: 6,
           keptCount: 3,
-          errorMessage: null,
           editionId: freshEdition.id
-        }
+        })
       })
     );
 
@@ -963,16 +945,14 @@ describe("App", () => {
     getBootstrapStateMock.mockResolvedValueOnce(
       createBootstrapState({
         editions: [edition],
-        latestRun: {
+        latestRun: createRun({
           id: "run-progress",
           startedAt: "2026-04-16T13:10:00Z",
           finishedAt: "2026-04-16T13:11:00Z",
-          status: "success",
           itemCount: 5,
           keptCount: 2,
-          errorMessage: null,
           editionId: edition.id
-        }
+        })
       })
     );
 

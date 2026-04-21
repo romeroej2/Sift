@@ -34,7 +34,6 @@ export interface CaptureSourcesSettings {
 
 export interface CaptureSettings {
   sources: CaptureSourcesSettings;
-  browsePageCount: Record<BrowserSource, number>;
 }
 
 export type ScheduleCadence = "daily" | "interval";
