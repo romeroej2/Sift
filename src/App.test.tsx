@@ -333,7 +333,7 @@ describe("App", () => {
     await renderLoadedApp();
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
     fireEvent.click(screen.getByRole("button", { name: /Model desk/i }));
-    fireEvent.click(screen.getByRole("button", { name: "Verify" }));
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
 
     await waitFor(() => {
       expect(verifyLmStudioMock).toHaveBeenCalledWith("http://127.0.0.1:1234", null);
@@ -871,7 +871,7 @@ describe("App", () => {
       target: { value: "secret-token" }
     });
     fireEvent.click(screen.getByLabelText("Use attached post images during ranking"));
-    fireEvent.click(screen.getByRole("button", { name: "Verify" }));
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
 
     await waitFor(() => {
       expect(verifyLmStudioMock).toHaveBeenCalledWith("http://127.0.0.1:4321", "secret-token");
