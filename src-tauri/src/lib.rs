@@ -3430,7 +3430,7 @@ async fn run_sync(
     } else {
         models::SyncReason::Manual
     };
-    generate_paper(state.inner(), sync_reason)
+    generate_paper(state.inner(), sync_reason, None)
         .await
         .map_err(|error| error.to_string())
 }
@@ -3514,7 +3514,7 @@ fn build_tray(app: &tauri::AppHandle, state: &AppState) -> Result<(), AppError> 
                 "sync" => {
                     let state = state.clone();
                     tauri::async_runtime::spawn(async move {
-                        let _ = generate_paper(&state, models::SyncReason::Manual).await;
+                        let _ = generate_paper(&state, models::SyncReason::Manual, None).await;
                     });
                 }
                 "quit" => {

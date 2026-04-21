@@ -11,7 +11,7 @@ import {
   pickFreshEdition,
   withTimeout
 } from "./app-utils";
-import type { BootstrapState, Edition, LmStudioHealth, SyncProgressEvent } from "./types";
+import type { BootstrapState, Edition, LmStudioHealth, SyncProgressEvent, SyncRun } from "./types";
 
 function createEdition(id: string, title: string): Edition {
   return {
@@ -20,8 +20,34 @@ function createEdition(id: string, title: string): Edition {
     title,
     frontPageSummary: `${title} summary`,
     createdAt: "2026-04-16T12:00:00Z",
+    runId: "run-1",
     view: "x",
     sections: []
+  };
+}
+
+function createRun(overrides: Partial<SyncRun> = {}): SyncRun {
+  return {
+    id: "run-1",
+    reason: "manual",
+    scheduleRuleId: null,
+    scheduleRuleLabel: null,
+    scheduleSlotKey: null,
+    startedAt: "2026-04-16T12:05:00Z",
+    finishedAt: "2026-04-16T12:06:00Z",
+    status: "success",
+    itemCount: 3,
+    keptCount: 2,
+    errorMessage: null,
+    editionId: "edition-1",
+    timings: {
+      captureMs: 1000,
+      rankingMs: 2000,
+      frontPageMs: 500,
+      savingMs: 250,
+      totalMs: 3750
+    },
+    ...overrides
   };
 }
 
@@ -30,6 +56,7 @@ function createBootstrapState(overrides: Partial<BootstrapState> = {}): Bootstra
     settings: DEFAULT_SETTINGS,
     editions: [],
     latestRun: null,
+    runHistory: [],
     xConnection: null,
     ...overrides
   };
@@ -56,16 +83,7 @@ describe("pickFreshEdition", () => {
       pickFreshEdition(
         createBootstrapState({
           editions,
-          latestRun: {
-            id: "run-1",
-            startedAt: "2026-04-16T12:05:00Z",
-            finishedAt: "2026-04-16T12:06:00Z",
-            status: "success",
-            itemCount: 3,
-            keptCount: 2,
-            errorMessage: null,
-            editionId: "edition-2"
-          }
+          latestRun: createRun({ editionId: "edition-2" })
         })
       )
     ).toEqual(editions[1]);
@@ -78,16 +96,7 @@ describe("pickFreshEdition", () => {
       pickFreshEdition(
         createBootstrapState({
           editions,
-          latestRun: {
-            id: "run-1",
-            startedAt: "2026-04-16T12:05:00Z",
-            finishedAt: "2026-04-16T12:06:00Z",
-            status: "success",
-            itemCount: 3,
-            keptCount: 2,
-            errorMessage: null,
-            editionId: "missing-edition"
-          }
+          latestRun: createRun({ editionId: "missing-edition" })
         })
       )
     ).toEqual(editions[0]);
@@ -201,8 +210,8 @@ describe("getScheduleSummary", () => {
         new Date("2026-04-16T06:30:00")
       )
     ).toMatchObject({
-      title: expect.stringContaining("Next run Thu"),
-      detail: "Ready. SIFT will try automatically while the app is running in the background."
+      title: expect.stringContaining("Next Morning brief"),
+      detail: "1 schedule armed. SIFT will try automatically while the app is running in the background."
     });
   });
 
@@ -220,8 +229,36 @@ describe("getScheduleSummary", () => {
         new Date("2026-04-16T08:30:00")
       )
     ).toEqual({
-      title: "Run is due now",
-      detail: "The schedule time has passed, but SIFT is waiting for you to open X Session."
+      title: "1 run due now",
+      detail: "A scheduled run window is open, but SIFT is waiting for you to open X Session."
+    });
+  });
+
+  it("describes interval auto-runs with the short-run label", () => {
+    expect(
+      getScheduleSummary(
+        {
+          ...DEFAULT_SETTINGS.schedule,
+          rules: [
+            {
+              ...DEFAULT_SETTINGS.schedule.rules[0],
+              cadence: "interval",
+              intervalHours: 2
+            }
+          ]
+        },
+        {
+          isOpen: true,
+          isVisible: false,
+          isAuthenticated: true,
+          lastKnownUrl: "https://x.com/home",
+          mode: "native-webview"
+        },
+        new Date("2026-04-16T05:30:00")
+      )
+    ).toMatchObject({
+      title: expect.stringContaining("Next Morning brief"),
+      detail: "1 schedule armed. SIFT will try automatically while the app is running in the background."
     });
   });
 });

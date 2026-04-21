@@ -6,6 +6,7 @@ import type {
   Edition,
   EditionView,
   LmStudioHealth,
+  ScheduleRule,
   ScheduleSettings,
   SyncProgressEvent,
   UserSettings
@@ -17,6 +18,7 @@ export const EMPTY_BOOTSTRAP: BootstrapState = {
   settings: DEFAULT_SETTINGS,
   editions: [],
   latestRun: null,
+  runHistory: [],
   xConnection: null
 };
 
@@ -180,6 +182,10 @@ export interface ScheduleSummary {
   detail: string;
 }
 
+function clampIntervalHours(value: number) {
+  return Number.isFinite(value) ? Math.min(24, Math.max(1, Math.round(value))) : 1;
+}
+
 function scheduledDate(now: Date, timeOfDay: string, dayOffset = 0) {
   const [rawHours = "7", rawMinutes = "30"] = timeOfDay.split(":");
   const hours = Number.parseInt(rawHours, 10);
@@ -193,6 +199,72 @@ function scheduledDate(now: Date, timeOfDay: string, dayOffset = 0) {
   );
   next.setDate(next.getDate() + dayOffset);
   return next;
+}
+
+function withClock(base: Date, timeOfDay: string) {
+  const [rawHours = "0", rawMinutes = "0"] = timeOfDay.split(":");
+  const hours = Number.parseInt(rawHours, 10);
+  const minutes = Number.parseInt(rawMinutes, 10);
+  const next = new Date(base);
+  next.setHours(
+    Number.isFinite(hours) ? hours : 0,
+    Number.isFinite(minutes) ? minutes : 0,
+    0,
+    0
+  );
+  return next;
+}
+
+function resolveRuleWindow(now: Date, rule: ScheduleRule) {
+  if (rule.cadence === "daily") {
+    const dueAt = scheduledDate(now, rule.timeOfDay);
+    return {
+      isDue: now >= dueAt,
+      nextRunAt: now >= dueAt ? scheduledDate(now, rule.timeOfDay, 1) : dueAt
+    };
+  }
+
+  const intervalHours = clampIntervalHours(rule.intervalHours);
+  const windowStart = withClock(now, rule.windowStart);
+  const windowEnd = withClock(now, rule.windowEnd);
+  const currentDayStart = new Date(windowStart);
+
+  if (windowEnd < windowStart) {
+    windowEnd.setDate(windowEnd.getDate() + 1);
+  }
+
+  if (now < currentDayStart) {
+    return {
+      isDue: false,
+      nextRunAt: currentDayStart
+    };
+  }
+
+  let slot = new Date(currentDayStart);
+  let latestDue: Date | null = null;
+  let nextFuture: Date | null = null;
+
+  while (slot <= windowEnd) {
+    if (slot <= now) {
+      latestDue = new Date(slot);
+    } else {
+      nextFuture = new Date(slot);
+      break;
+    }
+    slot.setHours(slot.getHours() + intervalHours);
+  }
+
+  if (latestDue) {
+    return {
+      isDue: true,
+      nextRunAt: nextFuture ?? withClock(new Date(now.getTime() + 24 * 60 * 60 * 1000), rule.windowStart)
+    };
+  }
+
+  return {
+    isDue: false,
+    nextRunAt: nextFuture ?? currentDayStart
+  };
 }
 
 function formatScheduledDate(value: Date) {
@@ -232,54 +304,68 @@ export function getScheduleSummary(
     .join(" and ");
   const allOpen = enabledSources.every((source) => sessions[source]?.isOpen);
   const allAuthenticated = enabledSources.every((source) => sessions[source]?.isAuthenticated);
+  const enabledRules = schedule.rules.filter((rule) => rule.enabled);
 
-  if (!schedule.enabled) {
+  if (!enabledRules.length) {
     return {
       title: "Auto-run is off",
-      detail: "Turn on morning auto-run to have SIFT publish automatically."
+      detail: "Turn on auto-run to have SIFT publish automatically."
     };
   }
 
-  const todayRunAt = scheduledDate(resolvedNow, schedule.timeOfDay);
+  const windows = enabledRules.map((rule) => ({
+    rule,
+    ...resolveRuleWindow(resolvedNow, rule)
+  }));
+  const dueRules = windows.filter((window) => window.isDue);
+  const nextRule = windows
+    .slice()
+    .sort((left, right) => left.nextRunAt.getTime() - right.nextRunAt.getTime())[0];
 
-  if (resolvedNow < todayRunAt) {
+  if (!dueRules.length && nextRule) {
+    const titleLabel = enabledRules.length === 1
+      ? `Next ${nextRule.rule.label}`
+      : `Next run ${nextRule.rule.label}`;
+
     if (!allOpen) {
       return {
-        title: `Next run ${formatScheduledDate(todayRunAt)}`,
+        title: `${titleLabel} ${formatScheduledDate(nextRule.nextRunAt)}`,
         detail: `Open ${blockedSourceLabel} before then. Scheduled runs need each enabled SIFT-managed session to be available.`
       };
     }
 
     if (!allAuthenticated) {
       return {
-        title: `Next run ${formatScheduledDate(todayRunAt)}`,
+        title: `${titleLabel} ${formatScheduledDate(nextRule.nextRunAt)}`,
         detail: `Finish signing in to ${blockedSourceLabel} in SIFT before then or the auto-run will stay blocked.`
       };
     }
 
     return {
-      title: `Next run ${formatScheduledDate(todayRunAt)}`,
-      detail: "Ready. SIFT will try automatically while the app is running in the background."
+      title: `${titleLabel} ${formatScheduledDate(nextRule.nextRunAt)}`,
+      detail: `${enabledRules.length} schedule${enabledRules.length === 1 ? "" : "s"} armed. SIFT will try automatically while the app is running in the background.`
     };
   }
 
   if (!allOpen) {
     return {
-      title: "Run is due now",
-      detail: `The schedule time has passed, but SIFT is waiting for you to open ${blockedSourceLabel}.`
+      title: `${dueRules.length} run${dueRules.length === 1 ? "" : "s"} due now`,
+      detail: `A scheduled run window is open, but SIFT is waiting for you to open ${blockedSourceLabel}.`
     };
   }
 
   if (!allAuthenticated) {
     return {
-      title: "Run is due now",
-      detail: `The schedule time has passed, but SIFT is waiting for you to finish signing in to ${blockedSourceLabel}.`
+      title: `${dueRules.length} run${dueRules.length === 1 ? "" : "s"} due now`,
+      detail: `A scheduled run window is open, but SIFT is waiting for you to finish signing in to ${blockedSourceLabel}.`
     };
   }
 
   return {
-    title: "Run is due now",
-    detail: "The schedule time has passed and SIFT should pick it up on the next scheduler check while the app is running."
+    title: `${dueRules.length} run${dueRules.length === 1 ? "" : "s"} due now`,
+    detail: dueRules.length === 1
+      ? `${dueRules[0]?.rule.label} is active and SIFT should pick it up on the next scheduler check while the app is running.`
+      : `${dueRules.length} schedule windows are active and SIFT should pick them up on the next scheduler check while the app is running.`
   };
 }
 

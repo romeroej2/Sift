@@ -6,6 +6,7 @@ import type {
   BootstrapState,
   Edition,
   LmStudioHealth,
+  SyncRun,
   SyncProgressEvent,
   UserSettings
 } from "./lib/types";
@@ -106,8 +107,34 @@ function createEdition(overrides: Partial<Edition> = {}): Edition {
     title: "Your SIFT for 2026-04-16",
     frontPageSummary: "A good local-first shipping day.",
     createdAt: "2026-04-16T12:00:00Z",
+    runId: "run-1",
     view: "x",
     sections: [],
+    ...overrides
+  };
+}
+
+function createRun(overrides: Partial<SyncRun> = {}): SyncRun {
+  return {
+    id: "run-1",
+    reason: "manual",
+    scheduleRuleId: null,
+    scheduleRuleLabel: null,
+    scheduleSlotKey: null,
+    startedAt: "2026-04-16T12:05:00Z",
+    finishedAt: "2026-04-16T12:06:00Z",
+    status: "success",
+    itemCount: 3,
+    keptCount: 2,
+    errorMessage: null,
+    editionId: "edition-1",
+    timings: {
+      captureMs: 1000,
+      rankingMs: 2000,
+      frontPageMs: 500,
+      savingMs: 250,
+      totalMs: 3750
+    },
     ...overrides
   };
 }
@@ -143,6 +170,7 @@ function createBootstrapState(overrides: Partial<BootstrapState> = {}): Bootstra
     settings: DEFAULT_SETTINGS,
     editions: [],
     latestRun: null,
+    runHistory: [],
     xConnection: null,
     ...overrides
   };
@@ -247,10 +275,10 @@ describe("App", () => {
     await renderLoadedApp();
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
 
-    expect(screen.getByText("Morning auto-run")).toBeInTheDocument();
-    expect(screen.getByText("Run is due now")).toBeInTheDocument();
+    expect(screen.getByText("Scheduler overview")).toBeInTheDocument();
+    expect(screen.getByText("1 run due now")).toBeInTheDocument();
     expect(
-      screen.getByText("The schedule time has passed, but SIFT is waiting for you to open X Session.")
+      screen.getByText("A scheduled run window is open, but SIFT is waiting for you to open X Session.")
     ).toBeInTheDocument();
   });
 
@@ -329,10 +357,9 @@ describe("App", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
 
-    fireEvent.change(screen.getByLabelText("Morning publish time"), {
+    fireEvent.change(screen.getByLabelText("Daily publish time"), {
       target: { value: "09:15" }
     });
-    fireEvent.click(screen.getByLabelText("Enable morning auto-run"));
     fireEvent.click(screen.getByLabelText("Drop replies"));
     fireEvent.click(screen.getByLabelText("Drop reposts"));
     fireEvent.click(screen.getByLabelText("Filter common engagement bait"));
@@ -348,8 +375,13 @@ describe("App", () => {
       expect(saveSettingsMock).toHaveBeenCalledWith({
         ...DEFAULT_SETTINGS,
         schedule: {
-          enabled: false,
-          timeOfDay: "09:15",
+          ...DEFAULT_SETTINGS.schedule,
+          rules: [
+            {
+              ...DEFAULT_SETTINGS.schedule.rules[0],
+              timeOfDay: "09:15"
+            }
+          ],
           timezone: expect.any(String)
         },
         cleanup: {
@@ -369,7 +401,7 @@ describe("App", () => {
     await renderLoadedApp();
 
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
-    fireEvent.change(screen.getByLabelText("Morning publish time"), {
+    fireEvent.change(screen.getByLabelText("Daily publish time"), {
       target: { value: "09:15" }
     });
 
@@ -377,14 +409,53 @@ describe("App", () => {
       expect(saveSettingsMock).toHaveBeenCalledWith({
         ...DEFAULT_SETTINGS,
         schedule: {
-          enabled: true,
-          timeOfDay: "09:15",
+          ...DEFAULT_SETTINGS.schedule,
+          rules: [
+            {
+              ...DEFAULT_SETTINGS.schedule.rules[0],
+              timeOfDay: "09:15"
+            }
+          ],
           timezone: expect.any(String)
         }
       });
     }, { timeout: 2000 });
 
     expect(await screen.findByText("Settings autosaved.")).toBeInTheDocument();
+  });
+
+  it("shows interval schedule controls and saves short-run browse depth", async () => {
+    await renderLoadedApp();
+
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    fireEvent.change(screen.getAllByLabelText("Cadence")[0], {
+      target: { value: "interval" }
+    });
+    fireEvent.change(screen.getByLabelText("Run every hours"), {
+      target: { value: "2" }
+    });
+    fireEvent.change(screen.getAllByLabelText("X pages to browse")[1], {
+      target: { value: "5" }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save newsroom settings" }));
+
+    await waitFor(() => {
+      expect(saveSettingsMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          schedule: expect.objectContaining({
+            rules: expect.arrayContaining([
+              expect.objectContaining({
+                cadence: "interval",
+                intervalHours: 2,
+                browsePageCount: expect.objectContaining({
+                  x: 5
+                })
+              })
+            ])
+          })
+        })
+      );
+    });
   });
 
   it("shows an empty archive state when there are no saved editions", async () => {
@@ -618,15 +689,15 @@ describe("App", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
 
-    expect(screen.getByLabelText("Reddit pages to browse")).toBeInTheDocument();
+    expect(screen.getAllByLabelText("Reddit pages to browse")[0]).toBeInTheDocument();
   });
 
   it("includes Reddit when saving newsroom settings", async () => {
     await renderLoadedApp();
 
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
-    fireEvent.click(screen.getByLabelText("Reddit pages to browse").closest("section")!.querySelector("input[type='checkbox']")!);
-    fireEvent.change(screen.getByLabelText("Reddit pages to browse"), {
+    fireEvent.click(screen.getAllByLabelText("Reddit pages to browse")[0].closest("section")!.querySelector("input[type='checkbox']")!);
+    fireEvent.change(screen.getAllByLabelText("Reddit pages to browse")[0], {
       target: { value: "11" }
     });
     fireEvent.click(screen.getByRole("button", { name: "Save newsroom settings" }));

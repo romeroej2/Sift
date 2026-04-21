@@ -6,8 +6,8 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::AppError;
 use crate::models::{
-    BootstrapState, CleanedItem, Edition, PersistedBrowserSession, SyncRun, TweetDbEntry,
-    UserSettings, XConnectionSummary,
+    BootstrapState, CleanedItem, Edition, PersistedBrowserSession, SyncRun, SyncRunTimings,
+    TweetDbEntry, UserSettings, XConnectionSummary,
 };
 
 fn normalize_schema_sql(value: &str) -> String {
@@ -133,6 +133,7 @@ impl Database {
       "#,
         )?;
         self.migrate_editions_table(&conn)?;
+        self.migrate_sync_runs_table(&conn)?;
 
         if self.load_settings()?.lm_studio.base_url.is_empty() {
             self.save_settings(&UserSettings::default())?;
@@ -195,6 +196,39 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_sync_runs_table(&self, conn: &Connection) -> Result<(), AppError> {
+        let mut stmt = conn.prepare("PRAGMA table_info(sync_runs)")?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<HashSet<_>, _>>()?;
+
+        if !columns.contains("reason") {
+            conn.execute("ALTER TABLE sync_runs ADD COLUMN reason TEXT NOT NULL DEFAULT 'manual'", [])?;
+        }
+        if !columns.contains("schedule_rule_id") {
+            conn.execute("ALTER TABLE sync_runs ADD COLUMN schedule_rule_id TEXT", [])?;
+        }
+        if !columns.contains("schedule_rule_label") {
+            conn.execute("ALTER TABLE sync_runs ADD COLUMN schedule_rule_label TEXT", [])?;
+        }
+        if !columns.contains("schedule_slot_key") {
+            conn.execute("ALTER TABLE sync_runs ADD COLUMN schedule_slot_key TEXT", [])?;
+        }
+        if !columns.contains("timings_json") {
+            conn.execute(
+                "ALTER TABLE sync_runs ADD COLUMN timings_json TEXT NOT NULL DEFAULT '{\"captureMs\":0,\"rankingMs\":0,\"frontPageMs\":0,\"savingMs\":0,\"totalMs\":0}'",
+                [],
+            )?;
+        }
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS sync_runs_schedule_slot_idx ON sync_runs(schedule_rule_id, schedule_slot_key)",
+            [],
+        )?;
+
+        Ok(())
+    }
+
     pub fn load_settings(&self) -> Result<UserSettings, AppError> {
         let conn = self.connect()?;
         let raw = conn
@@ -236,6 +270,7 @@ impl Database {
             settings: self.load_settings()?,
             editions: self.load_editions()?,
             latest_run: self.load_latest_run()?,
+            run_history: self.load_run_history()?,
             x_connection: self.load_x_connection()?,
         })
     }
@@ -271,33 +306,73 @@ impl Database {
         let conn = self.connect()?;
         conn
       .query_row(
-        "SELECT id, started_at, finished_at, status, item_count, kept_count, error_message, edition_id
+        "SELECT id, reason, schedule_rule_id, schedule_rule_label, schedule_slot_key, started_at, finished_at, status, item_count, kept_count, error_message, edition_id, timings_json
          FROM sync_runs
          ORDER BY started_at DESC
          LIMIT 1",
         [],
-        |row| {
-          Ok(SyncRun {
-            id: row.get(0)?,
-            started_at: row.get(1)?,
-            finished_at: row.get(2)?,
-            status: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(3)?))
-              .map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                  3,
-                  rusqlite::types::Type::Text,
-                  Box::new(error),
-                )
-              })?,
-            item_count: row.get(4)?,
-            kept_count: row.get(5)?,
-            error_message: row.get(6)?,
-            edition_id: row.get(7)?,
-          })
-        },
+        Self::map_sync_run_row,
       )
       .optional()
       .map_err(AppError::from)
+    }
+
+    pub fn load_run_history(&self) -> Result<Vec<SyncRun>, AppError> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, reason, schedule_rule_id, schedule_rule_label, schedule_slot_key, started_at, finished_at, status, item_count, kept_count, error_message, edition_id, timings_json
+             FROM sync_runs
+             ORDER BY started_at DESC
+             LIMIT 40",
+        )?;
+        let rows = stmt.query_map([], Self::map_sync_run_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+    }
+
+    pub fn has_run_for_schedule_slot(
+        &self,
+        schedule_rule_id: &str,
+        schedule_slot_key: &str,
+    ) -> Result<bool, AppError> {
+        let conn = self.connect()?;
+        let exists: i64 = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sync_runs
+                WHERE schedule_rule_id = ?1 AND schedule_slot_key = ?2
+            )",
+            params![schedule_rule_id, schedule_slot_key],
+            |row| row.get(0),
+        )?;
+        Ok(exists > 0)
+    }
+
+    fn map_sync_run_row(row: &rusqlite::Row<'_>) -> Result<SyncRun, rusqlite::Error> {
+        Ok(SyncRun {
+            id: row.get(0)?,
+            reason: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(1)?)).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error))
+            })?,
+            schedule_rule_id: row.get(2)?,
+            schedule_rule_label: row.get(3)?,
+            schedule_slot_key: row.get(4)?,
+            started_at: row.get(5)?,
+            finished_at: row.get(6)?,
+            status: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(7)?)).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error))
+            })?,
+            item_count: row.get(8)?,
+            kept_count: row.get(9)?,
+            error_message: row.get(10)?,
+            edition_id: row.get(11)?,
+            timings: row
+                .get::<_, Option<String>>(12)?
+                .map(|raw| serde_json::from_str::<SyncRunTimings>(&raw))
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(error))
+                })?
+                .unwrap_or_default(),
+        })
     }
 
     pub fn load_x_connection(&self) -> Result<Option<XConnectionSummary>, AppError> {
@@ -448,24 +523,34 @@ impl Database {
     pub fn insert_sync_run(&self, run: &SyncRun) -> Result<(), AppError> {
         let conn = self.connect()?;
         conn.execute(
-      "INSERT INTO sync_runs(id, started_at, finished_at, status, item_count, kept_count, error_message, edition_id)
-       VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+      "INSERT INTO sync_runs(id, reason, schedule_rule_id, schedule_rule_label, schedule_slot_key, started_at, finished_at, status, item_count, kept_count, error_message, edition_id, timings_json)
+       VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
        ON CONFLICT(id) DO UPDATE SET
+         reason = excluded.reason,
+         schedule_rule_id = excluded.schedule_rule_id,
+         schedule_rule_label = excluded.schedule_rule_label,
+         schedule_slot_key = excluded.schedule_slot_key,
          finished_at = excluded.finished_at,
          status = excluded.status,
          item_count = excluded.item_count,
          kept_count = excluded.kept_count,
          error_message = excluded.error_message,
-         edition_id = excluded.edition_id",
+         edition_id = excluded.edition_id,
+         timings_json = excluded.timings_json",
       params![
         run.id,
+        run.reason.as_str(),
+        run.schedule_rule_id,
+        run.schedule_rule_label,
+        run.schedule_slot_key,
         run.started_at,
         run.finished_at,
         serde_json::to_string(&run.status)?.replace('\"', ""),
         run.item_count,
         run.kept_count,
         run.error_message,
-        run.edition_id
+        run.edition_id,
+        serde_json::to_string(&run.timings)?
       ],
     )?;
         Ok(())
@@ -689,9 +774,27 @@ mod tests {
 
     use super::Database;
     use crate::models::{
-        Edition, EditionSection, EditionView, FeedItem, PersistedBrowserSession, SyncRun,
-        SyncStatus, UserSettings,
+        Edition, EditionSection, EditionView, FeedItem, PersistedBrowserSession, SyncReason,
+        SyncRun, SyncRunTimings, SyncStatus, UserSettings,
     };
+
+    fn sample_sync_run(id: &str) -> SyncRun {
+        SyncRun {
+            id: id.into(),
+            reason: SyncReason::Manual,
+            schedule_rule_id: None,
+            schedule_rule_label: None,
+            schedule_slot_key: None,
+            started_at: "2026-04-16T12:10:00Z".into(),
+            finished_at: Some("2026-04-16T12:11:00Z".into()),
+            status: SyncStatus::Success,
+            item_count: 0,
+            kept_count: 0,
+            error_message: None,
+            edition_id: None,
+            timings: SyncRunTimings::default(),
+        }
+    }
 
     #[test]
     fn persisted_x_session_round_trips_and_clears() {
@@ -805,6 +908,9 @@ mod tests {
             loaded.lm_studio.selected_model.as_deref(),
             Some("vision-model")
         );
+        assert_eq!(loaded.schedule.rules.len(), 1);
+        assert_eq!(loaded.schedule.rules[0].time_of_day, "07:30");
+        assert_eq!(loaded.capture.browse_page_count.x, 12);
     }
 
     #[test]
@@ -826,16 +932,10 @@ mod tests {
         db.insert_feed_items(&[feed_item])
             .expect("insert feed item");
 
-        let success_run = SyncRun {
-            id: "run-success".into(),
-            started_at: "2026-04-16T12:10:00Z".into(),
-            finished_at: Some("2026-04-16T12:11:00Z".into()),
-            status: SyncStatus::Success,
-            item_count: 1,
-            kept_count: 1,
-            error_message: None,
-            edition_id: Some("edition-1".into()),
-        };
+        let mut success_run = sample_sync_run("run-success");
+        success_run.item_count = 1;
+        success_run.kept_count = 1;
+        success_run.edition_id = Some("edition-1".into());
         db.insert_sync_run(&success_run)
             .expect("insert successful sync run");
 
@@ -845,6 +945,7 @@ mod tests {
             title: "Your SIFT for 2026-04-16".into(),
             front_page_summary: "A solid shipping day.".into(),
             created_at: "2026-04-16T12:11:00Z".into(),
+            run_id: success_run.id.clone(),
             view: EditionView::X,
             sections: vec![EditionSection {
                 id: "releases".into(),
@@ -869,16 +970,12 @@ mod tests {
         db.save_edition(&edition, &[decision], &success_run)
             .expect("save edition");
 
-        let pending_run = SyncRun {
-            id: "run-pending".into(),
-            started_at: "2026-04-16T13:00:00Z".into(),
-            finished_at: Some("2026-04-16T13:01:00Z".into()),
-            status: SyncStatus::Error,
-            item_count: 1,
-            kept_count: 0,
-            error_message: Some("LM Studio crashed".into()),
-            edition_id: None,
-        };
+        let mut pending_run = sample_sync_run("run-pending");
+        pending_run.started_at = "2026-04-16T13:00:00Z".into();
+        pending_run.finished_at = Some("2026-04-16T13:01:00Z".into());
+        pending_run.status = SyncStatus::Error;
+        pending_run.item_count = 1;
+        pending_run.error_message = Some("LM Studio crashed".into());
         db.insert_sync_run(&pending_run)
             .expect("insert error sync run");
 
@@ -935,6 +1032,7 @@ mod tests {
             title: "Older".into(),
             front_page_summary: "Yesterday".into(),
             created_at: "2026-04-15T08:00:00Z".into(),
+            run_id: "run-older".into(),
             view: EditionView::Consolidated,
             sections: vec![],
         };
@@ -944,29 +1042,18 @@ mod tests {
             title: "Newer".into(),
             front_page_summary: "Today".into(),
             created_at: "2026-04-16T08:00:00Z".into(),
+            run_id: "run-newer".into(),
             view: EditionView::Consolidated,
             sections: vec![],
         };
-        let older_run = SyncRun {
-            id: "run-older".into(),
-            started_at: "2026-04-15T08:00:00Z".into(),
-            finished_at: Some("2026-04-15T08:01:00Z".into()),
-            status: SyncStatus::Success,
-            item_count: 0,
-            kept_count: 0,
-            error_message: None,
-            edition_id: Some(older.id.clone()),
-        };
-        let newer_run = SyncRun {
-            id: "run-newer".into(),
-            started_at: "2026-04-16T08:00:00Z".into(),
-            finished_at: Some("2026-04-16T08:01:00Z".into()),
-            status: SyncStatus::Success,
-            item_count: 0,
-            kept_count: 0,
-            error_message: None,
-            edition_id: Some(newer.id.clone()),
-        };
+        let mut older_run = sample_sync_run("run-older");
+        older_run.started_at = "2026-04-15T08:00:00Z".into();
+        older_run.finished_at = Some("2026-04-15T08:01:00Z".into());
+        older_run.edition_id = Some(older.id.clone());
+        let mut newer_run = sample_sync_run("run-newer");
+        newer_run.started_at = "2026-04-16T08:00:00Z".into();
+        newer_run.finished_at = Some("2026-04-16T08:01:00Z".into());
+        newer_run.edition_id = Some(newer.id.clone());
 
         db.insert_sync_run(&older_run).expect("insert older run");
         db.insert_sync_run(&newer_run).expect("insert newer run");
@@ -990,6 +1077,7 @@ mod tests {
             title: "Your SIFT for 2026-04-16".into(),
             front_page_summary: "Morning digest".into(),
             created_at: "2026-04-16T08:00:00Z".into(),
+            run_id: "run-morning".into(),
             view: EditionView::Consolidated,
             sections: vec![],
         };
@@ -999,29 +1087,22 @@ mod tests {
             title: "Your SIFT for 2026-04-16".into(),
             front_page_summary: "Afternoon digest".into(),
             created_at: "2026-04-16T15:30:00Z".into(),
+            run_id: "run-afternoon".into(),
             view: EditionView::Consolidated,
             sections: vec![],
         };
-        let earlier_run = SyncRun {
-            id: "run-morning".into(),
-            started_at: "2026-04-16T08:00:00Z".into(),
-            finished_at: Some("2026-04-16T08:02:00Z".into()),
-            status: SyncStatus::Success,
-            item_count: 5,
-            kept_count: 3,
-            error_message: None,
-            edition_id: Some(earlier.id.clone()),
-        };
-        let later_run = SyncRun {
-            id: "run-afternoon".into(),
-            started_at: "2026-04-16T15:30:00Z".into(),
-            finished_at: Some("2026-04-16T15:32:00Z".into()),
-            status: SyncStatus::Success,
-            item_count: 7,
-            kept_count: 4,
-            error_message: None,
-            edition_id: Some(later.id.clone()),
-        };
+        let mut earlier_run = sample_sync_run("run-morning");
+        earlier_run.started_at = "2026-04-16T08:00:00Z".into();
+        earlier_run.finished_at = Some("2026-04-16T08:02:00Z".into());
+        earlier_run.item_count = 5;
+        earlier_run.kept_count = 3;
+        earlier_run.edition_id = Some(earlier.id.clone());
+        let mut later_run = sample_sync_run("run-afternoon");
+        later_run.started_at = "2026-04-16T15:30:00Z".into();
+        later_run.finished_at = Some("2026-04-16T15:32:00Z".into());
+        later_run.item_count = 7;
+        later_run.kept_count = 4;
+        later_run.edition_id = Some(later.id.clone());
 
         db.insert_sync_run(&earlier_run)
             .expect("insert earlier run");
@@ -1042,16 +1123,12 @@ mod tests {
         let temp_dir = tempdir().expect("temporary database directory");
         let db = Database::new(temp_dir.path().join("sift.sqlite")).expect("database");
 
-        db.insert_sync_run(&SyncRun {
-            id: "run-stale".into(),
-            started_at: "2026-04-16T08:00:00Z".into(),
-            finished_at: None,
-            status: SyncStatus::Running,
-            item_count: 0,
-            kept_count: 0,
-            error_message: None,
-            edition_id: None,
-        })
+        let mut stale_run = sample_sync_run("run-stale");
+        stale_run.started_at = "2026-04-16T08:00:00Z".into();
+        stale_run.finished_at = None;
+        stale_run.status = SyncStatus::Running;
+        stale_run.edition_id = None;
+        db.insert_sync_run(&stale_run)
         .expect("insert stale running run");
 
         let bootstrap = db.load_bootstrap().expect("load bootstrap");
@@ -1100,6 +1177,7 @@ mod tests {
             title: "Your SIFT for 2026-04-16".into(),
             front_page_summary: "First run".into(),
             created_at: "2026-04-16T09:00:00Z".into(),
+            run_id: "run-first".into(),
             view: EditionView::Consolidated,
             sections: vec![],
         };
@@ -1109,29 +1187,22 @@ mod tests {
             title: "Your SIFT for 2026-04-16".into(),
             front_page_summary: "Second run".into(),
             created_at: "2026-04-16T10:00:00Z".into(),
+            run_id: "run-second".into(),
             view: EditionView::Consolidated,
             sections: vec![],
         };
-        let first_run = SyncRun {
-            id: "run-first".into(),
-            started_at: "2026-04-16T09:00:00Z".into(),
-            finished_at: Some("2026-04-16T09:01:00Z".into()),
-            status: SyncStatus::Success,
-            item_count: 3,
-            kept_count: 2,
-            error_message: None,
-            edition_id: Some(first.id.clone()),
-        };
-        let second_run = SyncRun {
-            id: "run-second".into(),
-            started_at: "2026-04-16T10:00:00Z".into(),
-            finished_at: Some("2026-04-16T10:01:00Z".into()),
-            status: SyncStatus::Success,
-            item_count: 4,
-            kept_count: 3,
-            error_message: None,
-            edition_id: Some(second.id.clone()),
-        };
+        let mut first_run = sample_sync_run("run-first");
+        first_run.started_at = "2026-04-16T09:00:00Z".into();
+        first_run.finished_at = Some("2026-04-16T09:01:00Z".into());
+        first_run.item_count = 3;
+        first_run.kept_count = 2;
+        first_run.edition_id = Some(first.id.clone());
+        let mut second_run = sample_sync_run("run-second");
+        second_run.started_at = "2026-04-16T10:00:00Z".into();
+        second_run.finished_at = Some("2026-04-16T10:01:00Z".into());
+        second_run.item_count = 4;
+        second_run.kept_count = 3;
+        second_run.edition_id = Some(second.id.clone());
 
         db.insert_sync_run(&first_run).expect("insert first run");
         db.insert_sync_run(&second_run).expect("insert second run");

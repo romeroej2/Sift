@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine;
-use chrono::{DateTime, NaiveTime, Utc};
+use chrono::{DateTime, NaiveTime, Timelike, Utc};
 use chrono_tz::Tz;
 use regex::Regex;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -22,9 +22,10 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::models::{
-    CleanedItem, Edition, EditionCard, EditionImage, EditionSection, EditionView, FeedItem,
-    LmStudioHealth, ModelDescriptor, OAuthSession, PollStatus, SyncReason, SyncRun, SyncStatus,
-    UserSettings, XClientConfigDraft, XConnectLaunch, XConnectPayload, XConnectPollResult,
+    CaptureBrowsePageCount, CleanedItem, Edition, EditionCard, EditionImage, EditionSection,
+    EditionView, FeedItem, LmStudioHealth, ModelDescriptor, OAuthSession, PollStatus,
+    ScheduleCadence, ScheduleRule, SyncReason, SyncRun, SyncRunTimings, SyncStatus, UserSettings,
+    XClientConfigDraft, XConnectLaunch, XConnectPayload, XConnectPollResult,
 };
 use crate::{AppError, AppState, is_linkedin_domain, is_reddit_domain, is_x_domain};
 
@@ -172,6 +173,14 @@ struct ViewBuildSpec {
     view: EditionView,
     label: &'static str,
     items: Vec<FeedItem>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScheduledRunContext {
+    rule_id: String,
+    rule_label: String,
+    slot_key: String,
+    browse_page_count: CaptureBrowsePageCount,
 }
 
 impl CaptureBoundary {
@@ -1077,14 +1086,20 @@ impl LmStudioClient {
 pub async fn generate_paper(
     state: &AppState,
     reason: SyncReason,
+    scheduled_run: Option<&ScheduledRunContext>,
 ) -> Result<crate::models::BootstrapState, AppError> {
     let _sync_guard = state.sync_guard.lock().await;
     let settings = state.db.load_settings()?;
     let lm_studio_auth_token = state.lm_studio_auth_token().await;
     let _edition_date = current_edition_date(&settings)?;
+    let run_started = Instant::now();
 
     let mut run = SyncRun {
         id: Uuid::new_v4().to_string(),
+        reason: reason.clone(),
+        schedule_rule_id: scheduled_run.map(|value| value.rule_id.clone()),
+        schedule_rule_label: scheduled_run.map(|value| value.rule_label.clone()),
+        schedule_slot_key: scheduled_run.map(|value| value.slot_key.clone()),
         started_at: Utc::now().to_rfc3339(),
         finished_at: None,
         status: SyncStatus::Running,
@@ -1092,6 +1107,7 @@ pub async fn generate_paper(
         kept_count: 0,
         error_message: None,
         edition_id: None,
+        timings: SyncRunTimings::default(),
     };
     state.db.insert_sync_run(&run)?;
     emit_sync_progress(
@@ -1108,12 +1124,23 @@ pub async fn generate_paper(
     );
 
     let sync_result = async {
+        let capture_started = Instant::now();
         let capture =
-            match collect_items_from_enabled_sources(state, &settings, &run.id, &reason).await {
+            match collect_items_from_enabled_sources(
+                state,
+                &settings,
+                &run.id,
+                &reason,
+                scheduled_run,
+            )
+            .await
+            {
             Ok(capture) => capture,
             Err(AppError::NoFreshItems { message }) => {
                 run.status = SyncStatus::Success;
                 run.finished_at = Some(Utc::now().to_rfc3339());
+                run.timings.capture_ms = capture_started.elapsed().as_millis() as u64;
+                run.timings.total_ms = run_started.elapsed().as_millis() as u64;
                 run.error_message = Some(message.clone());
                 state.db.insert_sync_run(&run)?;
                 emit_sync_progress(
@@ -1132,6 +1159,7 @@ pub async fn generate_paper(
             }
             Err(error) => return Err(error),
         };
+        run.timings.capture_ms = capture_started.elapsed().as_millis() as u64;
         let provider = LmStudioClient::default();
         let mut image_cache = SyncImageCache::default();
         let view_specs = build_view_specs(&capture);
@@ -1162,6 +1190,7 @@ pub async fn generate_paper(
                 None,
             );
 
+            let ranking_started = Instant::now();
             let decisions = batch_decide(
                 state,
                 &run.id,
@@ -1173,8 +1202,9 @@ pub async fn generate_paper(
                 &mut image_cache,
             )
             .await?;
+            run.timings.ranking_ms += ranking_started.elapsed().as_millis() as u64;
             let kept = keep_useful(&decisions);
-            let (_edition_date, edition) = build_edition(
+            let (_edition_date, edition, front_page_ms) = build_edition(
                 state,
                 &run.id,
                 &reason,
@@ -1184,13 +1214,17 @@ pub async fn generate_paper(
                 &kept,
                 &mut image_cache,
                 spec.view,
+                &run.id,
             )
             .await?;
+            run.timings.front_page_ms += front_page_ms;
             let decision_items = decisions
                 .iter()
                 .map(ClusterEditorialRecord::to_cleaned_item)
                 .collect::<Vec<_>>();
+            let saving_started = Instant::now();
             state.db.save_edition(&edition, &decision_items, &run)?;
+            run.timings.saving_ms += saving_started.elapsed().as_millis() as u64;
             if spec.view == EditionView::Consolidated
                 || (view_specs.len() == 1 && run.edition_id.is_none())
             {
@@ -1217,6 +1251,7 @@ pub async fn generate_paper(
         run.kept_count = consolidated_kept_count;
         run.status = SyncStatus::Success;
         run.finished_at = Some(Utc::now().to_rfc3339());
+        run.timings.total_ms = run_started.elapsed().as_millis() as u64;
         state.db.insert_sync_run(&run)?;
         let primary_title = saved_editions
             .iter()
@@ -1256,6 +1291,7 @@ pub async fn generate_paper(
         Err(error) => {
             run.status = SyncStatus::Error;
             run.finished_at = Some(Utc::now().to_rfc3339());
+            run.timings.total_ms = run_started.elapsed().as_millis() as u64;
             run.error_message = Some(error.to_string());
             state.db.insert_sync_run(&run)?;
             notify_failure(state, &error.to_string()).await;
@@ -1302,12 +1338,19 @@ async fn notify_failure(state: &AppState, message: &str) {
 
 pub async fn maybe_run_scheduled_sync(state: &AppState) -> Result<(), AppError> {
     let settings = state.db.load_settings()?;
-    if !settings.schedule.enabled || !should_run_now(&settings)? {
-        return Ok(());
+    let mut due_rules = Vec::new();
+    for rule in settings.schedule.rules.iter().filter(|rule| rule.enabled) {
+        if let Some(slot_key) = current_schedule_slot(rule)? {
+            due_rules.push(ScheduledRunContext {
+                rule_id: rule.id.clone(),
+                rule_label: rule.label.clone(),
+                slot_key,
+                browse_page_count: rule.browse_page_count.clone(),
+            });
+        }
     }
 
-    let edition_date = current_edition_date(&settings)?;
-    if state.db.has_edition_for_date(&edition_date)? {
+    if due_rules.is_empty() {
         return Ok(());
     }
 
@@ -1346,7 +1389,16 @@ pub async fn maybe_run_scheduled_sync(state: &AppState) -> Result<(), AppError> 
         }
     }
 
-    let _ = generate_paper(state, SyncReason::Scheduled).await?;
+    for scheduled_run in due_rules {
+        if state
+            .db
+            .has_run_for_schedule_slot(&scheduled_run.rule_id, &scheduled_run.slot_key)?
+        {
+            continue;
+        }
+
+        let _ = generate_paper(state, SyncReason::Scheduled, Some(&scheduled_run)).await?;
+    }
 
     Ok(())
 }
@@ -1508,7 +1560,8 @@ async fn build_edition(
     records: &[ClusterEditorialRecord],
     image_cache: &mut SyncImageCache,
     view: EditionView,
-) -> Result<(String, Edition), AppError> {
+    edition_run_id: &str,
+) -> Result<(String, Edition, u64), AppError> {
     let edition_date = current_edition_date(settings)?;
     let edition_id = Uuid::new_v4().to_string();
     let mut sections = BTreeMap::<String, Vec<EditionCard>>::new();
@@ -1577,6 +1630,7 @@ async fn build_edition(
             .join("\n")
     );
 
+    let front_page_started = Instant::now();
     let front_page_summary = match provider
         .generate_text(settings, auth_token, &front_page_prompt)
         .await
@@ -1611,6 +1665,7 @@ async fn build_edition(
         EditionView::Linkedin => format!("Your SIFT for {} · LinkedIn", edition_date),
         EditionView::Reddit => format!("Your SIFT for {} · Reddit", edition_date),
     };
+    let front_page_ms = front_page_started.elapsed().as_millis() as u64;
     Ok((
         edition_date.clone(),
         Edition {
@@ -1619,19 +1674,84 @@ async fn build_edition(
             title,
             front_page_summary,
             created_at: Utc::now().to_rfc3339(),
+            run_id: edition_run_id.to_string(),
             view,
             sections: section_list,
         },
+        front_page_ms,
     ))
 }
 
-pub fn should_run_now(settings: &UserSettings) -> Result<bool, AppError> {
+fn normalized_schedule_interval_hours(rule: &ScheduleRule) -> u32 {
+    rule.interval_hours.clamp(1, 24) as u32
+}
+
+fn parse_schedule_time(value: &str, fallback_hour: u32, fallback_minute: u32) -> NaiveTime {
+    NaiveTime::parse_from_str(value, "%H:%M").unwrap_or_else(|_| {
+        NaiveTime::from_hms_opt(fallback_hour, fallback_minute, 0).expect("default time")
+    })
+}
+
+#[allow(dead_code)]
+pub fn should_run_now(rule: &ScheduleRule) -> Result<bool, AppError> {
     let timezone = machine_timezone();
     let now = Utc::now().with_timezone(&timezone);
-    let schedule_time = NaiveTime::parse_from_str(&settings.schedule.time_of_day, "%H:%M")
-        .unwrap_or_else(|_| NaiveTime::from_hms_opt(7, 30, 0).expect("default time"));
 
-    Ok(now.time() >= schedule_time)
+    match rule.cadence {
+        ScheduleCadence::Daily => {
+            let schedule_time = parse_schedule_time(&rule.time_of_day, 7, 30);
+            Ok(now.time() >= schedule_time)
+        }
+        ScheduleCadence::Interval => Ok(current_schedule_slot(rule)?.is_some()),
+    }
+}
+
+fn current_schedule_slot(rule: &ScheduleRule) -> Result<Option<String>, AppError> {
+    if !rule.enabled {
+        return Ok(None);
+    }
+
+    let timezone = machine_timezone();
+    let now = Utc::now().with_timezone(&timezone);
+
+    match rule.cadence {
+        ScheduleCadence::Daily => {
+            let schedule_time = parse_schedule_time(&rule.time_of_day, 7, 30);
+            if now.time() < schedule_time {
+                return Ok(None);
+            }
+            Ok(Some(format!("daily:{}:{}", rule.id, now.date_naive())))
+        }
+        ScheduleCadence::Interval => {
+            let interval_hours = normalized_schedule_interval_hours(rule);
+            let window_start = parse_schedule_time(&rule.window_start, 9, 0);
+            let window_end = parse_schedule_time(&rule.window_end, 17, 0);
+            let current_minutes = (now.hour() * 60 + now.minute()) as i64;
+            let start_minutes = (window_start.hour() * 60 + window_start.minute()) as i64;
+            let end_minutes = (window_end.hour() * 60 + window_end.minute()) as i64;
+
+            if current_minutes < start_minutes {
+                return Ok(None);
+            }
+
+            let effective_minutes = current_minutes.min(end_minutes);
+            let elapsed_minutes = effective_minutes - start_minutes;
+            let interval_minutes = (interval_hours * 60) as i64;
+            let slot_index = elapsed_minutes / interval_minutes;
+            let slot_minutes = start_minutes + slot_index * interval_minutes;
+            if slot_minutes > end_minutes {
+                return Ok(None);
+            }
+
+            Ok(Some(format!(
+                "interval:{}:{}:{:02}:{:02}",
+                rule.id,
+                now.date_naive(),
+                slot_minutes / 60,
+                slot_minutes % 60
+            )))
+        }
+    }
 }
 
 pub fn current_edition_date(_settings: &UserSettings) -> Result<String, AppError> {
@@ -1811,11 +1931,19 @@ fn build_view_specs(capture: &MultiCaptureOutcome) -> Vec<ViewBuildSpec> {
     }]
 }
 
-fn browse_page_count_for_source(settings: &UserSettings, source: CaptureSourceKind) -> usize {
+fn browse_page_count_for_source(
+    settings: &UserSettings,
+    source: CaptureSourceKind,
+    scheduled_run: Option<&ScheduledRunContext>,
+) -> usize {
+    let browse_page_count = scheduled_run
+        .map(|value| &value.browse_page_count)
+        .unwrap_or(&settings.capture.browse_page_count);
+
     match source {
-        CaptureSourceKind::X => settings.capture.browse_page_count.x.max(1),
-        CaptureSourceKind::Linkedin => settings.capture.browse_page_count.linkedin.max(1),
-        CaptureSourceKind::Reddit => settings.capture.browse_page_count.reddit.max(1),
+        CaptureSourceKind::X => browse_page_count.x.max(1),
+        CaptureSourceKind::Linkedin => browse_page_count.linkedin.max(1),
+        CaptureSourceKind::Reddit => browse_page_count.reddit.max(1),
     }
 }
 
@@ -1824,6 +1952,7 @@ async fn collect_items_from_enabled_sources(
     settings: &UserSettings,
     run_id: &str,
     reason: &SyncReason,
+    scheduled_run: Option<&ScheduledRunContext>,
 ) -> Result<MultiCaptureOutcome, AppError> {
     let enabled_sources = enabled_capture_sources(settings);
     if enabled_sources.is_empty() {
@@ -1850,6 +1979,7 @@ async fn collect_items_from_enabled_sources(
             settings,
             run_id,
             reason,
+            scheduled_run,
             &boundary,
             *source,
         )
@@ -1917,6 +2047,7 @@ async fn collect_items_from_source_live_session(
     settings: &UserSettings,
     run_id: &str,
     reason: &SyncReason,
+    scheduled_run: Option<&ScheduledRunContext>,
     boundary: &CaptureBoundary,
     source: CaptureSourceKind,
 ) -> Result<CaptureOutcome, AppError> {
@@ -1968,7 +2099,7 @@ async fn collect_items_from_source_live_session(
             "timeZone": timezone.name(),
             "maxItems": CAPTURE_MAX_ITEMS,
             "targetFreshItems": CAPTURE_TARGET_FRESH_ITEMS,
-            "maxPasses": browse_page_count_for_source(settings, source),
+            "maxPasses": browse_page_count_for_source(settings, source, scheduled_run),
             "stablePasses": CAPTURE_STABLE_PASSES,
             "exhaustedPasses": CAPTURE_EXHAUSTED_PASSES,
             "waitForAdvanceMs": CAPTURE_WAIT_FOR_ADVANCE_MS,
@@ -3470,7 +3601,20 @@ mod tests {
     fn schedule_due_checks_timezone_and_hour() {
         let settings = UserSettings::default();
         assert!(current_edition_date(&settings).is_ok());
-        assert!(should_run_now(&settings).is_ok());
+        assert!(should_run_now(&settings.schedule.rules[0]).is_ok());
+    }
+
+    #[test]
+    fn interval_schedule_uses_hour_slots() {
+        let mut rule = ScheduleRule::default();
+        rule.cadence = ScheduleCadence::Interval;
+        rule.interval_hours = 3;
+        rule.window_start = "00:00".into();
+        rule.window_end = "23:00".into();
+
+        let slot = current_schedule_slot(&rule).expect("schedule slot");
+        assert!(slot.is_some());
+        assert!(slot.expect("slot").starts_with("interval:"));
     }
 
     #[test]

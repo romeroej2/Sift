@@ -37,9 +37,22 @@ export interface CaptureSettings {
   browsePageCount: Record<BrowserSource, number>;
 }
 
-export interface ScheduleSettings {
+export type ScheduleCadence = "daily" | "interval";
+
+export interface ScheduleRule {
+  id: string;
+  label: string;
   enabled: boolean;
+  cadence: ScheduleCadence;
   timeOfDay: string;
+  intervalHours: number;
+  windowStart: string;
+  windowEnd: string;
+  browsePageCount: Record<BrowserSource, number>;
+}
+
+export interface ScheduleSettings {
+  rules: ScheduleRule[];
   timezone: string;
 }
 
@@ -98,12 +111,25 @@ export interface Edition {
   title: string;
   frontPageSummary: string;
   createdAt: string;
+  runId: string;
   view: EditionView;
   sections: EditionSection[];
 }
 
+export interface SyncRunTimings {
+  captureMs: number;
+  rankingMs: number;
+  frontPageMs: number;
+  savingMs: number;
+  totalMs: number;
+}
+
 export interface SyncRun {
   id: string;
+  reason: "manual" | "scheduled";
+  scheduleRuleId: string | null;
+  scheduleRuleLabel: string | null;
+  scheduleSlotKey: string | null;
   startedAt: string;
   finishedAt: string | null;
   status: SyncStatus;
@@ -111,6 +137,7 @@ export interface SyncRun {
   keptCount: number;
   errorMessage: string | null;
   editionId: string | null;
+  timings: SyncRunTimings;
 }
 
 export interface SyncProgressEvent {
@@ -136,6 +163,7 @@ export interface BootstrapState {
   settings: UserSettings;
   editions: Edition[];
   latestRun: SyncRun | null;
+  runHistory: SyncRun[];
   xConnection: XConnectionSummary | null;
 }
 

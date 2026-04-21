@@ -14,11 +14,19 @@ import type {
   Edition,
   EditionView,
   LmStudioHealth,
+  ScheduleRule,
+  SyncRun,
   SyncProgressEvent,
   UserSettings
 } from "./lib/types";
-import { DEFAULT_MODEL, DEFAULT_SETTINGS, getMachineTimeZone } from "./lib/defaults";
-import { formatEditionDate, formatTime } from "./lib/format";
+import {
+  createScheduleRule,
+  DEFAULT_MODEL,
+  DEFAULT_SETTINGS,
+  DEFAULT_SHORT_BROWSE_PAGE_COUNT,
+  getMachineTimeZone
+} from "./lib/defaults";
+import { formatDuration, formatEditionDate, formatTime } from "./lib/format";
 import {
   EMPTY_BROWSER_SESSION,
   EMPTY_BOOTSTRAP,
@@ -357,7 +365,7 @@ export default function App() {
     : bootstrap.latestRun
       ? bootstrap.latestRun.status === "success" && !bootstrap.latestRun.editionId && bootstrap.latestRun.errorMessage
         ? bootstrap.latestRun.errorMessage
-        : `${latestEditionTitle ? `${latestEditionTitle} · ` : ""}Last run ${formatTime(bootstrap.latestRun.startedAt)} · ${bootstrap.latestRun.status}`
+        : `${latestEditionTitle ? `${latestEditionTitle} · ` : ""}Last run ${formatTime(bootstrap.latestRun.startedAt)} · ${bootstrap.latestRun.status}${bootstrap.latestRun.timings ? ` · ${formatDuration(bootstrap.latestRun.timings.totalMs)}` : ""}`
       : "No edition generated yet.";
   const scheduleSummary = useMemo(
     () => getScheduleSummary(bootstrap.settings.schedule, sessionStates, bootstrap.settings, new Date(clockNow)),
@@ -375,6 +383,10 @@ export default function App() {
       visibleEditions[0]
     );
   }, [bootstrap.editions, selectedEditionId, selectedView]);
+  const selectedRun = useMemo(
+    () => (bootstrap.runHistory ?? []).find((run) => run.id === selectedEdition?.runId) ?? null,
+    [bootstrap.runHistory, selectedEdition]
+  );
 
   function resolveSelectedEditionId(
     state: BootstrapState,
@@ -1083,6 +1095,7 @@ export default function App() {
                 />
               )}
               editions={bootstrap.editions.filter((edition) => edition.view === selectedView)}
+              runHistory={bootstrap.runHistory}
               selectedEditionId={selectedEditionId}
               onSelect={setSelectedEditionId}
             />
@@ -1097,6 +1110,7 @@ export default function App() {
                 />
               )}
               edition={selectedEdition}
+              run={selectedRun}
               onOpenSourcePost={handleOpenSourcePost}
             />
           )}
@@ -1148,6 +1162,37 @@ function SettingsPanel({
           ...settings.capture.browsePageCount,
           [source]: Math.max(1, Number.parseInt(rawValue || String(fallback), 10) || fallback)
         }
+      }
+    });
+  const updateScheduleRule = (ruleId: string, updater: (rule: ScheduleRule) => ScheduleRule) =>
+    onChange({
+      ...settings,
+      schedule: {
+        ...settings.schedule,
+        rules: settings.schedule.rules.map((rule) => (rule.id === ruleId ? updater(rule) : rule))
+      }
+    });
+  const addScheduleRule = () =>
+    onChange({
+      ...settings,
+      schedule: {
+        ...settings.schedule,
+        rules: [
+          ...settings.schedule.rules,
+          createScheduleRule({
+            label: `Schedule ${settings.schedule.rules.length + 1}`,
+            cadence: "interval",
+            browsePageCount: DEFAULT_SHORT_BROWSE_PAGE_COUNT
+          })
+        ]
+      }
+    });
+  const removeScheduleRule = (ruleId: string) =>
+    onChange({
+      ...settings,
+      schedule: {
+        ...settings.schedule,
+        rules: settings.schedule.rules.filter((rule) => rule.id !== ruleId)
       }
     });
 
@@ -1457,54 +1502,194 @@ function SettingsPanel({
           <div className="settings-card__header">
             <div>
               <p className="kicker">Schedule</p>
-              <h3>Morning run</h3>
+              <h3>Auto-run</h3>
             </div>
             <p className="settings-card__copy">
               SIFT uses this machine&apos;s timezone automatically for scheduling and edition boundaries.
             </p>
           </div>
 
-          <div className="settings-schedule-grid">
-            <label className="field">
-              <span>Morning publish time</span>
-              <input
-                type="time"
-                value={settings.schedule.timeOfDay}
-                onChange={(event) =>
-                  onChange({
-                    ...settings,
-                    schedule: {
-                      ...settings.schedule,
-                      timeOfDay: event.target.value
-                    }
-                  })
-                }
-              />
-            </label>
-
-            <div className="mini-card">
-              <strong>Morning auto-run</strong>
-              <span>{scheduleSummary.title}</span>
-              <span>{scheduleSummary.detail}</span>
-            </div>
+          <div className="mini-card">
+            <strong>Scheduler overview</strong>
+            <span>{scheduleSummary.title}</span>
+            <span>{scheduleSummary.detail}</span>
           </div>
 
-          <label className="field field--checkbox">
-            <input
-              type="checkbox"
-              checked={settings.schedule.enabled}
-              onChange={(event) =>
-                onChange({
-                  ...settings,
-                  schedule: {
-                    ...settings.schedule,
-                    enabled: event.target.checked
-                  }
-                })
-              }
-            />
-            <span>Enable morning auto-run</span>
-          </label>
+          <div className="settings-stack">
+            {settings.schedule.rules.map((rule, index) => (
+              <section key={rule.id} className="settings-source-tile settings-source-tile--enabled">
+                <div className="settings-source-tile__top">
+                  <div>
+                    <span className="settings-source-tile__title">{rule.label || `Schedule ${index + 1}`}</span>
+                    <span className="settings-source-tile__eyebrow">
+                      {rule.cadence === "daily" ? "One daily pass" : "Recurring daytime pass"}
+                    </span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={rule.enabled}
+                    onChange={(event) =>
+                      updateScheduleRule(rule.id, (current) => ({
+                        ...current,
+                        enabled: event.target.checked
+                      }))
+                    }
+                  />
+                </div>
+
+                <div className="settings-schedule-grid">
+                  <label className="field">
+                    <span>Schedule label</span>
+                    <input
+                      value={rule.label}
+                      onChange={(event) =>
+                        updateScheduleRule(rule.id, (current) => ({
+                          ...current,
+                          label: event.target.value
+                        }))
+                      }
+                    />
+                  </label>
+
+                  <label className="field">
+                    <span>Cadence</span>
+                    <select
+                      value={rule.cadence}
+                      onChange={(event) =>
+                        updateScheduleRule(rule.id, (current) => ({
+                          ...current,
+                          cadence: event.target.value as ScheduleRule["cadence"]
+                        }))
+                      }
+                    >
+                      <option value="daily">Once a day</option>
+                      <option value="interval">Every few hours</option>
+                    </select>
+                  </label>
+
+                  {rule.cadence === "daily" ? (
+                    <label className="field">
+                      <span>Daily publish time</span>
+                      <input
+                        type="time"
+                        value={rule.timeOfDay}
+                        onChange={(event) =>
+                          updateScheduleRule(rule.id, (current) => ({
+                            ...current,
+                            timeOfDay: event.target.value
+                          }))
+                        }
+                      />
+                    </label>
+                  ) : (
+                    <>
+                      <label className="field">
+                        <span>Run every hours</span>
+                        <input
+                          type="number"
+                          min={1}
+                          max={24}
+                          value={rule.intervalHours}
+                          onChange={(event) =>
+                            updateScheduleRule(rule.id, (current) => ({
+                              ...current,
+                              intervalHours: Math.min(
+                                24,
+                                Math.max(1, Number.parseInt(event.target.value || "1", 10) || 1)
+                              )
+                            }))
+                          }
+                        />
+                      </label>
+
+                      <label className="field">
+                        <span>Window start</span>
+                        <input
+                          type="time"
+                          value={rule.windowStart}
+                          onChange={(event) =>
+                            updateScheduleRule(rule.id, (current) => ({
+                              ...current,
+                              windowStart: event.target.value
+                            }))
+                          }
+                        />
+                      </label>
+
+                      <label className="field">
+                        <span>Window end</span>
+                        <input
+                          type="time"
+                          value={rule.windowEnd}
+                          onChange={(event) =>
+                            updateScheduleRule(rule.id, (current) => ({
+                              ...current,
+                              windowEnd: event.target.value
+                            }))
+                          }
+                        />
+                      </label>
+                    </>
+                  )}
+                </div>
+
+                <div className="settings-source-grid">
+                  {(["x", "linkedin", "reddit"] as BrowserSource[]).map((source) => (
+                    <section key={source} className="settings-source-tile settings-source-tile--enabled">
+                      <div className="settings-source-tile__top">
+                        <div>
+                          <span className="settings-source-tile__title">
+                            {source === "x" ? "X" : source === "linkedin" ? "LinkedIn" : "Reddit"}
+                          </span>
+                          <span className="settings-source-tile__eyebrow">Pages for this schedule</span>
+                        </div>
+                      </div>
+                      <label className="field">
+                        <span>
+                          {source === "x" ? "X" : source === "linkedin" ? "LinkedIn" : "Reddit"} pages to browse
+                        </span>
+                        <input
+                          type="number"
+                          min={1}
+                          value={rule.browsePageCount[source]}
+                          onChange={(event) =>
+                            updateScheduleRule(rule.id, (current) => ({
+                              ...current,
+                              browsePageCount: {
+                                ...current.browsePageCount,
+                                [source]: Math.max(
+                                  1,
+                                  Number.parseInt(event.target.value || String(current.browsePageCount[source]), 10)
+                                  || current.browsePageCount[source]
+                                )
+                              }
+                            }))
+                          }
+                        />
+                      </label>
+                    </section>
+                  ))}
+                </div>
+
+                <div className="button-row">
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => removeScheduleRule(rule.id)}
+                    disabled={settings.schedule.rules.length === 1}
+                  >
+                    Remove schedule
+                  </button>
+                </div>
+              </section>
+            ))}
+          </div>
+
+          <div className="button-row">
+            <button className="secondary-button" type="button" onClick={addScheduleRule}>
+              Add schedule
+            </button>
+          </div>
         </section>
 
         <section className="settings-card">
@@ -1622,14 +1807,18 @@ function SettingsPanel({
 function ArchivePanel({
   tabs,
   editions,
+  runHistory,
   selectedEditionId,
   onSelect
 }: {
   tabs?: ReactNode;
   editions: Edition[];
+  runHistory: SyncRun[];
   selectedEditionId: string | null;
   onSelect: (value: string) => void;
 }) {
+  const runById = new Map(runHistory.map((run) => [run.id, run]));
+
   return (
     <section className="panel content-panel archive-panel">
       {tabs}
@@ -1640,7 +1829,9 @@ function ArchivePanel({
 
       <div className="archive-list">
         {editions.length ? (
-          editions.map((edition) => (
+          editions.map((edition) => {
+            const run = runById.get(edition.runId);
+            return (
             <button
               key={edition.id}
               className={
@@ -1652,9 +1843,14 @@ function ArchivePanel({
             >
               <strong>{formatEditionDate(edition.editionDate)}</strong>
               <span>{edition.title}</span>
-              <small>Saved {formatTime(edition.createdAt)}</small>
+              <small>
+                Saved {formatTime(edition.createdAt)}
+                {run?.scheduleRuleLabel ? ` · ${run.scheduleRuleLabel}` : ""}
+                {run ? ` · ${formatDuration(run.timings.totalMs)}` : ""}
+              </small>
             </button>
-          ))
+            );
+          })
         ) : (
           <p className="empty-copy">Once your first issue is generated, it will land here.</p>
         )}
@@ -1666,10 +1862,12 @@ function ArchivePanel({
 function EditionPanel({
   tabs,
   edition,
+  run,
   onOpenSourcePost
 }: {
   tabs?: ReactNode;
   edition: Edition | null;
+  run: SyncRun | null;
   onOpenSourcePost: (url: string) => void;
 }) {
   if (!edition) {
@@ -1696,6 +1894,12 @@ function EditionPanel({
         <p className="paper-date">
           {formatEditionDate(edition.editionDate)} · Saved {formatTime(edition.createdAt)}
         </p>
+        {run ? (
+          <p className="paper-date">
+            {run.scheduleRuleLabel ? `${run.scheduleRuleLabel} · ` : ""}
+            Total {formatDuration(run.timings.totalMs)} · Read {formatDuration(run.timings.captureMs)} · Summaries {formatDuration(run.timings.rankingMs)} · Front page {formatDuration(run.timings.frontPageMs)}
+          </p>
+        ) : null}
       </div>
 
       <p className="paper-summary">{edition.frontPageSummary}</p>
