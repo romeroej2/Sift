@@ -1779,6 +1779,10 @@ fn heuristically_clean_items(items: Vec<FeedItem>, settings: &UserSettings) -> V
             continue;
         }
 
+        if is_low_signal_linkedin_item(&item) {
+            continue;
+        }
+
         cleaned.push(item);
     }
 
@@ -1805,6 +1809,51 @@ fn is_engagement_bait(text: &str) -> bool {
         })
         .iter()
         .any(|pattern| pattern.is_match(&text.to_lowercase()))
+}
+
+fn is_low_signal_linkedin_item(item: &FeedItem) -> bool {
+    if item.source != CaptureSourceKind::Linkedin.as_feed_source() {
+        return false;
+    }
+
+    let text = item.text.trim();
+    if text.is_empty() {
+        return true;
+    }
+
+    static LINKEDIN_LOW_SIGNAL_PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    let lowered = text.to_lowercase();
+    let has_explicit_noise = LINKEDIN_LOW_SIGNAL_PATTERNS
+        .get_or_init(|| {
+            [
+                r"\bpromoted\b",
+                r"\bapply for\b",
+                r"\bview job\b",
+                r"\bjob alert\b",
+                r"\bmessage the job poster\b",
+                r"\bwe(?:'|’)re hiring\b",
+                r"\bhiring now\b",
+                r"\blike\s+comment\s+repost\s+send\b",
+                r"\bfollowers\b",
+                r"\bconnections\b",
+                r"\bschool alumni work here\b",
+            ]
+            .into_iter()
+            .map(|pattern| Regex::new(pattern).expect("linkedin low-signal regex"))
+            .collect()
+        })
+        .iter()
+        .any(|pattern| pattern.is_match(&lowered));
+    if has_explicit_noise {
+        return true;
+    }
+
+    text.matches('|').count() >= 2
+        && shared_urls_from_item(item).is_empty()
+        && !text.contains("http")
+        && !text.contains('.')
+        && !text.contains('!')
+        && !text.contains('?')
 }
 
 fn format_fresh_post_breakdown(
@@ -2754,20 +2803,41 @@ fn sanitize_linkedin_capture_text(
     author_name: &str,
     social_context: Option<&str>,
 ) -> String {
-    let mut cleaned = text.trim().replace('\u{a0}', " ");
+    let mut cleaned = normalize_linkedin_collapsed_tokens(text.trim().replace('\u{a0}', " ").as_str());
+    cleaned = Regex::new(r"[.]{2,}")
+        .expect("valid regex")
+        .replace_all(&cleaned, " ")
+        .to_string();
     cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
 
     let author_name = author_name.trim();
+    let author_name = if author_name.eq_ignore_ascii_case("LinkedIn author") {
+        ""
+    } else {
+        author_name
+    };
     let social_context = social_context.map(str::trim).filter(|value| !value.is_empty());
 
     let noise_patterns = [
         Regex::new(r"(?i)^feed\s*post\b[:\s-]*").expect("valid regex"),
+        Regex::new(r"(?i)^linkedin\s+author\b[:\s-]*").expect("valid regex"),
+        Regex::new(r"(?i)^[^\d]{2,100}?\s+\d[\d,.]*\s+followers\b(?:\s*[•·]\s*)?")
+            .expect("valid regex"),
+        Regex::new(r"(?i)^[^\d]{2,100}?\s+\d[\d,.]*\s+connections\b(?:\s*[•·]\s*)?")
+            .expect("valid regex"),
         Regex::new(r"(?i)^\d[\d,.]*\s+followers\b(?:\s*[•·]\s*)?").expect("valid regex"),
         Regex::new(r"(?i)^\d[\d,.]*\s+connections\b(?:\s*[•·]\s*)?").expect("valid regex"),
         Regex::new(r"(?i)^[0-9]+\s*(?:m|h|d|w|mo|yr|y)\b(?:\s*[•·]\s*edited)?\s*")
             .expect("valid regex"),
         Regex::new(r"(?i)^edited\b(?:\s*[•·]\s*)?").expect("valid regex"),
         Regex::new(r"(?i)^(?:follow|message)\b\s*").expect("valid regex"),
+        Regex::new(r"(?i)^promoted\b(?:\s*[•·]\s*)?").expect("valid regex"),
+    ];
+    let trailing_noise_patterns = [
+        Regex::new(r"(?i)\bview job\b.*$").expect("valid regex"),
+        Regex::new(r"(?i)\blike\s+comment\s+repost\s+send\b.*$").expect("valid regex"),
+        Regex::new(r"(?i)\b\d+\s+(?:school|company)\s+alumni work here\b.*$")
+            .expect("valid regex"),
     ];
 
     let mut changed = true;
@@ -2807,10 +2877,35 @@ fn sanitize_linkedin_capture_text(
         }
     }
 
+    for pattern in &trailing_noise_patterns {
+        cleaned = pattern.replace(&cleaned, "").trim().to_string();
+    }
+
     cleaned
         .trim_matches(|char: char| matches!(char, '•' | '·' | '-' | '|' | ':'))
         .trim()
         .to_string()
+}
+
+fn normalize_linkedin_collapsed_tokens(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len() + 16);
+    let mut previous: Option<char> = None;
+
+    for current in text.chars() {
+        if let Some(last) = previous {
+            let split_boundary =
+                (last.is_ascii_lowercase() && current.is_ascii_uppercase())
+                    || (last.is_ascii_alphabetic() && current.is_ascii_digit())
+                    || (last.is_ascii_digit() && current.is_ascii_alphabetic());
+            if split_boundary && !normalized.ends_with(' ') {
+                normalized.push(' ');
+            }
+        }
+        normalized.push(current);
+        previous = Some(current);
+    }
+
+    normalized
 }
 
 fn media_from_item(item: &FeedItem) -> Vec<FeedMedia> {
@@ -3098,7 +3193,8 @@ fn fallback_decision(cluster: &TweetCluster) -> ClusterDecision {
     let repeated = cluster.repeat_count();
     ClusterDecision {
         cluster_id: cluster.id.clone(),
-        keep: repeated > 1 || !is_engagement_bait(&item.text),
+        keep: !is_low_signal_linkedin_cluster(cluster)
+            && (repeated > 1 || !is_engagement_bait(&item.text)),
         category: if item.text.to_lowercase().contains("release")
             || item.text.to_lowercase().contains("ships")
         {
@@ -3133,18 +3229,19 @@ fn fallback_decision(cluster: &TweetCluster) -> ClusterDecision {
 
 fn build_structured_prompt(clusters: &[TweetCluster]) -> String {
     let mut prompt = String::from(
-        "You are SIFT, a calm editor that turns repeated X chatter into a concise daily briefing.\n",
+        "You are SIFT, a calm editor that turns noisy social feeds into a concise daily briefing.\n",
     );
     prompt.push_str("Return strict JSON with this shape: {\"items\":[{\"clusterId\":\"...\",\"keep\":true,\"category\":\"Releases|Tools|Infrastructure|Ideas|People\",\"headline\":\"...\",\"summary\":\"...\",\"whyItMatters\":\"...\",\"reasons\":[\"...\"],\"imageImportant\":false,\"imageAlt\":null}]}\n");
-    prompt.push_str("Rules: keep only the most important clusters. Prefer repeated topics across independent authors, concrete releases, notable tools, useful ideas, and things that feel widely discussed for a reason. It is good to drop most clusters. Avoid outrage, bait, empty self-promotion, and duplicates.\n");
+    prompt.push_str("Rules: keep only the most important clusters. Prefer repeated topics across independent authors, concrete releases, notable tools, useful operating ideas, and things that feel widely discussed for a reason. It is good to drop most clusters. Avoid outrage, bait, empty self-promotion, duplicates, sponsored/promoted posts, hiring posts, job listings, profile blurbs, and feed chrome.\n");
     prompt.push_str("Use neutral headlines under 14 words and summaries under 42 words. Set imageImportant to true only when an attached image genuinely adds important context to the digest. When imageImportant is true, provide concise factual alt text in imageAlt. Otherwise set imageImportant to false and imageAlt to null.\n");
     prompt.push_str("Input clusters:\n");
 
     for cluster in clusters {
         let _ = writeln!(
             prompt,
-            "- clusterId: {}\n  repeats: {}\n  uniqueAuthors: {}\n  sharedUrls: {}\n  keywords: {}\n  attachedPhoto: {}\n  representative: {} (@{})\n  sampleTweets:\n{}",
+            "- clusterId: {}\n  source: {}\n  repeats: {}\n  uniqueAuthors: {}\n  sharedUrls: {}\n  keywords: {}\n  attachedPhoto: {}\n  representative: {} (@{})\n  sampleTweets:\n{}",
             cluster.id,
+            cluster.representative.source,
             cluster.repeat_count(),
             cluster.unique_author_count(),
             if cluster.shared_urls.is_empty() {
@@ -3185,6 +3282,26 @@ fn build_structured_prompt(clusters: &[TweetCluster]) -> String {
     }
 
     prompt
+}
+
+fn is_low_signal_linkedin_cluster(cluster: &TweetCluster) -> bool {
+    if cluster.representative.source != CaptureSourceKind::Linkedin.as_feed_source() {
+        return false;
+    }
+
+    if cluster
+        .members
+        .iter()
+        .any(|item| is_low_signal_linkedin_item(item))
+    {
+        return true;
+    }
+
+    cluster.repeat_count() == 1
+        && cluster.unique_author_count() == 1
+        && shared_urls_from_item(&cluster.representative).is_empty()
+        && first_photo_url(&cluster.representative).is_none()
+        && cluster.representative.text.matches('|').count() >= 2
 }
 
 fn parse_cluster_decisions(
@@ -3937,6 +4054,72 @@ mod tests {
             cleaned[0].fingerprint,
             fingerprint("We shipped a much better search workflow for teams.")
         );
+    }
+
+    #[test]
+    fn sanitize_linkedin_capture_text_strips_promoted_prefix_without_author_name() {
+        let cleaned = sanitize_linkedin_capture_text(
+            "Nord Anglia Education 108,536 followers Promoted What matters most for children growing up with AI?",
+            "LinkedIn author",
+            None,
+        );
+
+        assert_eq!(cleaned, "What matters most for children growing up with AI?");
+    }
+
+    #[test]
+    fn sanitize_linkedin_capture_text_handles_collapsed_feed_post_tokens() {
+        let cleaned = sanitize_linkedin_capture_text(
+            "Feed postJohn....... 108,536FollowersPromoted What matters most for children growing up with AI?",
+            "LinkedIn author",
+            None,
+        );
+
+        assert_eq!(cleaned, "What matters most for children growing up with AI?");
+    }
+
+    #[test]
+    fn heuristics_drop_low_signal_linkedin_job_posts() {
+        let settings = UserSettings::default();
+        let items = vec![FeedItem {
+            id: "linkedin-session:job-1".into(),
+            source: "linkedin-session".into(),
+            author_name: "LinkedIn author".into(),
+            author_handle: "confidential-career".into(),
+            text: "Confidential 7m Apply for newly listed role. Logistics Manager. View job 5 school alumni work here Like Comment Repost Send".into(),
+            source_url: "https://www.linkedin.com/feed/update/urn:li:activity:1/".into(),
+            posted_at: "2026-04-22T12:00:00Z".into(),
+            raw_json: serde_json::json!({}),
+            fingerprint: fingerprint("Confidential 7m Apply for newly listed role. Logistics Manager. View job 5 school alumni work here Like Comment Repost Send"),
+        }];
+
+        let cleaned = heuristically_clean_items(items, &settings);
+        assert!(cleaned.is_empty());
+    }
+
+    #[test]
+    fn linkedin_profile_blurb_clusters_are_treated_as_low_signal() {
+        let item = FeedItem {
+            id: "linkedin-session:profile-1".into(),
+            source: "linkedin-session".into(),
+            author_name: "LinkedIn author".into(),
+            author_handle: "angelajaramillo12".into(),
+            text: "Angela Jaramillo | Speaker | Coach de Marcas y Talentos | Directora de RRPP".into(),
+            source_url: "https://www.linkedin.com/feed/update/urn:li:activity:2/".into(),
+            posted_at: "2026-04-22T12:00:00Z".into(),
+            raw_json: serde_json::json!({}),
+            fingerprint: fingerprint("Angela Jaramillo | Speaker | Coach de Marcas y Talentos | Directora de RRPP"),
+        };
+        let cluster = TweetCluster {
+            id: "cluster-1".into(),
+            representative: item.clone(),
+            members: vec![item],
+            shared_urls: HashSet::new(),
+            keywords: HashSet::new(),
+        };
+
+        assert!(is_low_signal_linkedin_cluster(&cluster));
+        assert!(!fallback_decision(&cluster).keep);
     }
 
     #[test]
