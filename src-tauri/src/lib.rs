@@ -389,6 +389,7 @@ impl AppState {
 const X_SESSION_WINDOW_LABEL: &str = "x-session";
 const X_SESSION_POPUP_LABEL_PREFIX: &str = "x-session-popup";
 const X_AUTH_POPUP_LABEL_PREFIX: &str = "x-auth-popup";
+const X_AUTH_POPUP_CLOSE_DELAY_MS: u64 = 750;
 const X_SESSION_HOME_URL: &str = "https://x.com/home";
 const X_SESSION_DATA_STORE_ID: [u8; 16] = *b"SIFTXSESSION0001";
 const LINKEDIN_SESSION_WINDOW_LABEL: &str = "linkedin-session";
@@ -400,9 +401,18 @@ const REDDIT_SESSION_POPUP_LABEL_PREFIX: &str = "reddit-session-popup";
 const REDDIT_SESSION_HOME_URL: &str = "https://www.reddit.com/";
 const REDDIT_SESSION_DATA_STORE_ID: [u8; 16] = *b"SIFTREDDIT000001";
 const X_SESSION_BRIDGE_SCRIPT: &str = r#"
+(() => {
+const siftIsTopFrame = (() => {
+  try {
+    return window.top === window.self;
+  } catch {
+    return true;
+  }
+})();
+
 if (
-  ["x.com", "www.x.com", "twitter.com", "www.twitter.com"].includes(window.location.hostname)
-  && !window.__SIFT_COLLECT_FEED__
+  siftIsTopFrame
+  && ["x.com", "www.x.com", "twitter.com", "www.twitter.com"].includes(window.location.hostname)
 ) {
   const siftReadText = (node) =>
     (node?.innerText || "")
@@ -418,6 +428,9 @@ if (
     logout:
       '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><path d="M16 17l5-5-5-5"></path><path d="M21 12H9"></path></svg>',
   };
+
+  const siftIconDataUrl = (icon, color) =>
+    `data:image/svg+xml;utf8,${encodeURIComponent(icon.replace(/currentColor/g, color))}`;
 
   const siftDateKey = (value, timeZone) => {
     const date = new Date(value);
@@ -533,8 +546,14 @@ if (
       return;
     }
 
-    if (!document.getElementById("sift-x-session-controls-style")) {
-      const style = document.createElement("style");
+    const styleRoot = document.head || document.documentElement;
+    if (!styleRoot) {
+      return;
+    }
+
+    let style = document.getElementById("sift-x-session-controls-style");
+    if (!style) {
+      style = document.createElement("style");
       style.id = "sift-x-session-controls-style";
       style.textContent = `
         #sift-x-session-controls {
@@ -544,7 +563,7 @@ if (
           display: inline-flex;
           align-items: center;
           gap: 8px;
-          padding: 10px;
+          padding: 10px 12px;
           border-radius: 999px;
           background: rgba(19, 19, 24, 0.88);
           border: 1px solid rgba(255, 255, 255, 0.12);
@@ -567,16 +586,25 @@ if (
         }
 
         .sift-x-session-controls__button {
+          appearance: none;
+          -webkit-appearance: none;
           width: 36px;
           height: 36px;
+          min-width: 36px;
+          min-height: 36px;
+          padding: 0;
           border: 0;
           border-radius: 999px;
           display: inline-flex;
+          flex: 0 0 auto;
           align-items: center;
           justify-content: center;
           background: rgba(255, 255, 255, 0.08);
           color: inherit;
           cursor: pointer;
+          line-height: 0;
+          font-size: 0;
+          vertical-align: middle;
           transition: background 140ms ease, transform 140ms ease, opacity 140ms ease;
           pointer-events: auto;
           touch-action: manipulation;
@@ -603,21 +631,46 @@ if (
         }
 
         .sift-x-session-controls__button svg {
-          width: 18px;
-          height: 18px;
+          width: 18px !important;
+          height: 18px !important;
+          min-width: 18px !important;
+          min-height: 18px !important;
+          display: block !important;
+          flex: 0 0 auto;
+          overflow: visible;
+          fill: none !important;
+          stroke: currentColor !important;
+          stroke-width: 1.9 !important;
+          stroke-linecap: round !important;
+          stroke-linejoin: round !important;
+          opacity: 1 !important;
+          visibility: visible !important;
           pointer-events: none;
         }
+
+        .sift-x-session-controls__button svg * {
+          fill: none !important;
+          stroke: currentColor !important;
+          vector-effect: non-scaling-stroke;
+          opacity: 1 !important;
+          visibility: visible !important;
+        }
       `;
-      (document.head || document.documentElement).appendChild(style);
     }
+    styleRoot.appendChild(style);
 
     const attach = () => {
-      if (!document.body) {
+      const root = document.body || document.documentElement;
+      if (!root) {
         window.setTimeout(attach, 120);
         return;
       }
 
-      if (document.getElementById("sift-x-session-controls")) {
+      const existingDock = document.getElementById("sift-x-session-controls");
+      if (existingDock) {
+        if (existingDock.parentElement !== root) {
+          root.appendChild(existingDock);
+        }
         return;
       }
 
@@ -626,7 +679,7 @@ if (
 
       const badge = document.createElement("span");
       badge.className = "sift-x-session-controls__badge";
-      badge.textContent = "SIFT";
+      badge.textContent = "SIFT X";
       dock.appendChild(badge);
 
       const buildButton = (command, label, icon, tone = "neutral", requiresConfirm = false) => {
@@ -639,6 +692,31 @@ if (
         button.setAttribute("aria-label", label);
         button.setAttribute("title", label);
         button.innerHTML = icon;
+        const iconColor = tone === "danger" ? '#ffd7d7' : '#f5f7fa';
+        button.style.setProperty("color", iconColor, "important");
+        button.style.setProperty("-webkit-text-fill-color", iconColor, "important");
+
+        const iconNode = button.querySelector("svg");
+        if (iconNode) {
+          iconNode.style.setProperty("width", "18px", "important");
+          iconNode.style.setProperty("height", "18px", "important");
+          iconNode.style.setProperty("min-width", "18px", "important");
+          iconNode.style.setProperty("min-height", "18px", "important");
+          iconNode.style.setProperty("display", "block", "important");
+          iconNode.style.setProperty("fill", "none", "important");
+          iconNode.style.setProperty("stroke", "currentColor", "important");
+          iconNode.style.setProperty("stroke-width", "1.9", "important");
+          iconNode.style.setProperty("stroke-linecap", "round", "important");
+          iconNode.style.setProperty("stroke-linejoin", "round", "important");
+          iconNode.style.setProperty("opacity", "1", "important");
+          iconNode.style.setProperty("visibility", "visible", "important");
+          iconNode.querySelectorAll("*").forEach((child) => {
+            child.style.setProperty("fill", "none", "important");
+            child.style.setProperty("stroke", "currentColor", "important");
+            child.style.setProperty("opacity", "1", "important");
+            child.style.setProperty("visibility", "visible", "important");
+          });
+        }
 
         const stopEvent = (event) => {
           event.preventDefault();
@@ -653,21 +731,6 @@ if (
             requiresConfirm
             && !window.confirm("Log out of X in SIFT and clear this browser session?")
           ) {
-            return;
-          }
-
-          if (command === "hide_x_session_window") {
-            try {
-              window.close();
-            } catch {
-              // Fall through to the Tauri invoke fallback below.
-            }
-
-            window.setTimeout(() => {
-              void window.__TAURI_INTERNALS__.invoke(command, {}).catch((error) => {
-                console.error("[SIFT] X session hide failed.", error);
-              });
-            }, 32);
             return;
           }
 
@@ -714,7 +777,7 @@ if (
         ),
       );
 
-      document.body.appendChild(dock);
+      root.appendChild(dock);
     };
 
     attach();
@@ -973,8 +1036,43 @@ if (
 
   siftEnsureSessionControls();
 
+  if (!window.__SIFT_X_SESSION_CONTROLS_WATCHDOG__) {
+    window.__SIFT_X_SESSION_CONTROLS_WATCHDOG__ = window.setInterval(() => {
+      try {
+        siftEnsureSessionControls();
+      } catch {
+        // Keep the session controls best-effort during X feed navigations.
+      }
+    }, 1500);
+  }
+
+  if (!window.__SIFT_X_SESSION_CONTROLS_EVENTS_BOUND__) {
+    window.__SIFT_X_SESSION_CONTROLS_EVENTS_BOUND__ = true;
+
+    window.addEventListener("pageshow", () => {
+      try {
+        siftEnsureSessionControls();
+      } catch {
+        // Keep the session controls best-effort after X page restores.
+      }
+    });
+
+    window.addEventListener("focus", () => {
+      try {
+        siftEnsureSessionControls();
+      } catch {
+        // Keep the session controls best-effort after focus changes.
+      }
+    });
+  }
+
+  if (window.__SIFT_COLLECT_FEED__) {
+    return;
+  }
+
   window.__SIFT_COLLECT_FEED__ = async (requestId, options = {}) => {
     try {
+      siftEnsureSessionControls();
       if (!/^\/home(?:$|[/?#])/.test(window.location.pathname)) {
         throw new Error("X session is not on the home timeline yet.");
       }
@@ -1167,12 +1265,22 @@ if (
     }
   };
 }
+})();
 "#;
 
 const LINKEDIN_SESSION_BRIDGE_SCRIPT: &str = r#"
+(() => {
+const siftIsTopFrame = (() => {
+  try {
+    return window.top === window.self;
+  } catch {
+    return true;
+  }
+})();
+
 if (
-  ["linkedin.com", "www.linkedin.com"].includes(window.location.hostname)
-  && !window.__SIFT_COLLECT_LINKEDIN_FEED__
+  siftIsTopFrame
+  && ["linkedin.com", "www.linkedin.com"].includes(window.location.hostname)
 ) {
   const siftReadText = (node) =>
     (node?.innerText || "")
@@ -1212,8 +1320,14 @@ if (
       return;
     }
 
-    if (!document.getElementById("sift-linkedin-session-controls-style")) {
-      const style = document.createElement("style");
+    const styleRoot = document.head || document.documentElement;
+    if (!styleRoot) {
+      return;
+    }
+
+    let style = document.getElementById("sift-linkedin-session-controls-style");
+    if (!style) {
+      style = document.createElement("style");
       style.id = "sift-linkedin-session-controls-style";
       style.textContent = `
         #sift-linkedin-session-controls {
@@ -1223,7 +1337,7 @@ if (
           display: inline-flex;
           align-items: center;
           gap: 8px;
-          padding: 10px;
+          padding: 10px 12px;
           border-radius: 999px;
           background: rgba(14, 25, 44, 0.88);
           border: 1px solid rgba(255, 255, 255, 0.12);
@@ -1243,11 +1357,11 @@ if (
         .sift-linkedin-session-controls__button {
           appearance: none;
           -webkit-appearance: none;
-          width: 36px;
+          width: auto;
           height: 36px;
-          min-width: 36px;
+          min-width: 0;
           min-height: 36px;
-          padding: 0;
+          padding: 0 12px;
           border: 0;
           border-radius: 999px;
           display: inline-flex;
@@ -1257,8 +1371,11 @@ if (
           background: rgba(255, 255, 255, 0.08);
           color: inherit;
           cursor: pointer;
-          line-height: 0;
-          font-size: 0;
+          line-height: 1;
+          font-size: 12px;
+          font-weight: 600;
+          letter-spacing: 0.01em;
+          white-space: nowrap;
           vertical-align: middle;
           transition: background 140ms ease, transform 140ms ease, opacity 140ms ease;
           pointer-events: auto;
@@ -1280,32 +1397,21 @@ if (
         .sift-linkedin-session-controls__button--danger:hover {
           background: rgba(205, 76, 76, 0.3);
         }
-        .sift-linkedin-session-controls__button svg {
-          width: 18px;
-          height: 18px;
-          min-width: 18px;
-          min-height: 18px;
-          display: block;
-          flex: 0 0 auto;
-          overflow: visible;
-          fill: none;
-          stroke: currentColor;
-          stroke-width: 1.9;
-          stroke-linecap: round;
-          stroke-linejoin: round;
-          pointer-events: none;
-        }
-        .sift-linkedin-session-controls__button svg * {
-          fill: none;
-          stroke: currentColor;
-          vector-effect: non-scaling-stroke;
-        }
       `;
-      (document.head || document.documentElement).appendChild(style);
     }
+    styleRoot.appendChild(style);
 
     const attach = () => {
-      if (!document.body || document.getElementById("sift-linkedin-session-controls")) {
+      const root = document.body || document.documentElement;
+      if (!root) {
+        return;
+      }
+
+      const existingDock = document.getElementById("sift-linkedin-session-controls");
+      if (existingDock) {
+        if (existingDock.parentElement !== root) {
+          root.appendChild(existingDock);
+        }
         return;
       }
 
@@ -1314,10 +1420,10 @@ if (
 
       const badge = document.createElement("span");
       badge.className = "sift-linkedin-session-controls__badge";
-      badge.textContent = "SIFT";
+      badge.textContent = "SIFT LinkedIn";
       dock.appendChild(badge);
 
-      const buildButton = (command, label, icon, requiresConfirm = false) => {
+      const buildButton = (command, label, text, requiresConfirm = false) => {
         const button = document.createElement("button");
         button.type = "button";
         button.className = "sift-linkedin-session-controls__button";
@@ -1326,7 +1432,11 @@ if (
         }
         button.setAttribute("aria-label", label);
         button.setAttribute("title", label);
-        button.innerHTML = icon;
+        // LinkedIn keeps suppressing the toolbar SVGs, so this session intentionally uses text buttons for now.
+        const iconColor = requiresConfirm ? '#ffd7d7' : '#f5f7fa';
+        button.textContent = text;
+        button.style.setProperty("color", iconColor, "important");
+        button.style.setProperty("-webkit-text-fill-color", iconColor, "important");
 
         const stopEvent = (event) => {
           event.preventDefault();
@@ -1338,21 +1448,6 @@ if (
 
         const runCommand = async () => {
           if (requiresConfirm && !window.confirm("Log out of LinkedIn in SIFT and clear this browser session?")) {
-            return;
-          }
-
-          if (command === "hide_linkedin_session_window") {
-            try {
-              window.close();
-            } catch {
-              // Ignore window.close() failures in browser sessions.
-            }
-
-            window.setTimeout(() => {
-              void window.__TAURI_INTERNALS__.invoke(command, {}).catch((error) => {
-                console.error("[SIFT] LinkedIn session hide failed.", error);
-              });
-            }, 32);
             return;
           }
 
@@ -1382,12 +1477,12 @@ if (
         return button;
       };
 
-      dock.appendChild(buildButton("hide_linkedin_session_window", "Hide this LinkedIn window", siftControlIcons.hide));
-      dock.appendChild(buildButton("logout_linkedin_session_window", "Log out of LinkedIn in SIFT", siftControlIcons.logout, true));
-      document.body.appendChild(dock);
+      dock.appendChild(buildButton("hide_linkedin_session_window", "Hide this LinkedIn window", "Hide"));
+      dock.appendChild(buildButton("logout_linkedin_session_window", "Log out of LinkedIn in SIFT", "Log out", true));
+      root.appendChild(dock);
     };
 
-    if (document.body) {
+    if (document.body || document.documentElement) {
       attach();
     } else {
       window.setTimeout(attach, 200);
@@ -1402,6 +1497,22 @@ if (
         // Keep the session controls best-effort during LinkedIn feed navigations.
       }
     }, 1500);
+  }
+
+  if (!window.__SIFT_LINKEDIN_SESSION_CONTROLS_EVENTS_BOUND__) {
+    window.__SIFT_LINKEDIN_SESSION_CONTROLS_EVENTS_BOUND__ = true;
+
+    window.addEventListener("pageshow", () => {
+      try {
+        siftEnsureSessionControls();
+      } catch {
+        // Keep the session controls best-effort after LinkedIn page restores.
+      }
+    });
+  }
+
+  if (window.__SIFT_COLLECT_LINKEDIN_FEED__) {
+    return;
   }
 
   const siftFeedSelector = "main article";
@@ -2121,11 +2232,21 @@ if (
     }
   };
 }
+})();
 "#;
 
 const REDDIT_SESSION_BRIDGE_SCRIPT: &str = r#"
+const siftIsTopFrame = (() => {
+  try {
+    return window.top === window.self;
+  } catch {
+    return true;
+  }
+})();
+
 if (
-  ["reddit.com", "www.reddit.com"].includes(window.location.hostname)
+  siftIsTopFrame
+  && ["reddit.com", "www.reddit.com"].includes(window.location.hostname)
   && !window.__SIFT_COLLECT_REDDIT_FEED__
 ) {
   const siftWait = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -2484,10 +2605,18 @@ fn is_google_auth_url(url: &Url) -> bool {
     matches!(url.host_str(), Some("accounts.google.com"))
 }
 
+fn is_blank_page_url(url: &Url) -> bool {
+    url.scheme() == "about" && url.path() == "blank"
+}
+
+fn is_x_auth_popup_label(label: &str) -> bool {
+    label.starts_with(X_AUTH_POPUP_LABEL_PREFIX)
+}
+
 fn is_x_session_related_label(label: &str) -> bool {
     label == X_SESSION_WINDOW_LABEL
         || label.starts_with(X_SESSION_POPUP_LABEL_PREFIX)
-        || label.starts_with(X_AUTH_POPUP_LABEL_PREFIX)
+        || is_x_auth_popup_label(label)
 }
 
 fn is_linkedin_session_related_label(label: &str) -> bool {
@@ -2502,6 +2631,13 @@ fn x_session_window_labels(app: &tauri::AppHandle) -> Vec<String> {
     app.webview_windows()
         .into_keys()
         .filter(|label| is_x_session_related_label(label))
+        .collect()
+}
+
+fn x_auth_popup_window_labels(app: &tauri::AppHandle) -> Vec<String> {
+    app.webview_windows()
+        .into_keys()
+        .filter(|label| is_x_auth_popup_label(label))
         .collect()
 }
 
@@ -2521,6 +2657,16 @@ fn reddit_session_window_labels(app: &tauri::AppHandle) -> Vec<String> {
 
 fn close_x_session_windows(app: &tauri::AppHandle) -> Result<(), String> {
     for label in x_session_window_labels(app) {
+        if let Some(window) = app.get_webview_window(&label) {
+            window.close().map_err(|error| error.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
+fn close_x_auth_popup_windows(app: &tauri::AppHandle) -> Result<(), String> {
+    for label in x_auth_popup_window_labels(app) {
         if let Some(window) = app.get_webview_window(&label) {
             window.close().map_err(|error| error.to_string())?;
         }
@@ -2590,6 +2736,10 @@ fn is_completed_x_session_url(url: &Url) -> bool {
         && !path.starts_with("/account/access")
 }
 
+fn should_close_x_auth_popup_for_url(url: &Url) -> bool {
+    is_completed_x_session_url(url) || is_blank_page_url(url)
+}
+
 fn default_x_session_url() -> Url {
     Url::parse(X_SESSION_HOME_URL).expect("valid x home url")
 }
@@ -2632,6 +2782,7 @@ fn build_x_session_window(
 ) -> Result<tauri::WebviewWindow, String> {
     let popup_app = app.clone();
     let popup_state = state.clone();
+    let page_app = app.clone();
     let page_state = state.clone();
 
     WebviewWindowBuilder::new(
@@ -2677,19 +2828,33 @@ fn build_x_session_window(
                 return;
             }
 
-            if is_auth_popup && is_completed_x_session_url(payload.url()) {
+            let should_close_popup = should_close_x_auth_popup_for_url(payload.url());
+            let completed_x_session = is_completed_x_session_url(payload.url());
+
+            if is_auth_popup && should_close_popup {
                 let window = window.clone();
                 let parent_window = parent_app.get_webview_window(X_SESSION_WINDOW_LABEL);
                 let popup_state = popup_state.clone();
                 let completed_url = payload.url().to_string();
                 tauri::async_runtime::spawn(async move {
-                    if let Err(error) = popup_state.remember_x_session(completed_url, true).await {
-                        eprintln!("failed to persist X auth popup state: {error}");
+                    if completed_x_session {
+                        if let Err(error) = popup_state.remember_x_session(completed_url, true).await
+                        {
+                            eprintln!("failed to persist X auth popup state: {error}");
+                        }
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-                    if let Some(parent_window) = parent_window {
-                        let _ = parent_window.navigate(default_x_session_url());
+
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        X_AUTH_POPUP_CLOSE_DELAY_MS,
+                    ))
+                    .await;
+
+                    if completed_x_session {
+                        if let Some(parent_window) = parent_window {
+                            let _ = parent_window.navigate(default_x_session_url());
+                        }
                     }
+
                     let _ = window.close();
                 });
             }
@@ -2701,14 +2866,27 @@ fn build_x_session_window(
             window: popup_window,
         }
     })
-    .on_page_load(move |_window, payload| {
+    .on_page_load(move |window, payload| {
         if payload.event() == tauri::webview::PageLoadEvent::Finished {
+            let _ = window.eval(X_SESSION_BRIDGE_SCRIPT);
+            let page_app = page_app.clone();
             let page_state = page_state.clone();
             let url = payload.url().to_string();
             let is_authenticated = is_completed_x_session_url(payload.url());
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = page_state.remember_x_session(url, is_authenticated).await {
                     eprintln!("failed to persist X session page state: {error}");
+                }
+
+                if is_authenticated {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        X_AUTH_POPUP_CLOSE_DELAY_MS,
+                    ))
+                    .await;
+
+                    if let Err(error) = close_x_auth_popup_windows(&page_app) {
+                        eprintln!("failed to close X auth popups after login: {error}");
+                    }
                 }
             });
         }
@@ -2784,8 +2962,9 @@ fn build_linkedin_session_window(
             window: popup_window,
         }
     })
-    .on_page_load(move |_window, payload| {
+    .on_page_load(move |window, payload| {
         if payload.event() == tauri::webview::PageLoadEvent::Finished {
+            let _ = window.eval(LINKEDIN_SESSION_BRIDGE_SCRIPT);
             let page_state = page_state.clone();
             let url = payload.url().to_string();
             let is_authenticated = is_completed_linkedin_session_url(payload.url());
@@ -3758,4 +3937,29 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running SIFT");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn x_auth_popup_detection_covers_blank_google_fallback() {
+        let home = Url::parse("https://x.com/home").expect("valid x url");
+        let login = Url::parse("https://x.com/i/flow/login").expect("valid x login url");
+        let blank = Url::parse("about:blank").expect("valid blank url");
+
+        assert!(should_close_x_auth_popup_for_url(&home));
+        assert!(!should_close_x_auth_popup_for_url(&login));
+        assert!(should_close_x_auth_popup_for_url(&blank));
+    }
+
+    #[test]
+    fn x_auth_popup_labels_stay_scoped_to_google_auth_windows() {
+        assert!(is_x_auth_popup_label("x-auth-popup-123"));
+        assert!(is_x_session_related_label("x-auth-popup-123"));
+        assert!(is_x_session_related_label("x-session-popup-123"));
+        assert!(!is_x_auth_popup_label("x-session-popup-123"));
+        assert!(!is_x_auth_popup_label(X_SESSION_WINDOW_LABEL));
+    }
 }
