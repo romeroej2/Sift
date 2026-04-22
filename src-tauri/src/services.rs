@@ -1559,8 +1559,7 @@ async fn build_edition(
     for record in records {
         let item = record.to_cleaned_item();
         let lead_image =
-            maybe_persist_important_image(state, &edition_id, provider, image_cache, record)
-                .await?;
+            maybe_persist_lead_image(state, &edition_id, provider, image_cache, record).await?;
         sections
             .entry(normalize_category(&item.category))
             .or_default()
@@ -2622,6 +2621,14 @@ fn normalize_session_capture(
         .filter(|item| !(settings.cleanup.hide_replies && item.is_reply))
         .map(|item| {
             let media = normalize_capture_media(&item.media);
+            let normalized_text = match source {
+                CaptureSourceKind::Linkedin => sanitize_linkedin_capture_text(
+                    &item.text,
+                    &item.author_name,
+                    item.social_context.as_deref(),
+                ),
+                _ => item.text.trim().to_string(),
+            };
             FeedItem {
                 id: format!("{}:{}", source.as_feed_source(), item.id.trim()),
                 source: source.as_feed_source().into(),
@@ -2631,7 +2638,7 @@ fn normalize_session_capture(
                     .trim_start_matches('@')
                     .trim()
                     .to_string(),
-                text: item.text.trim().to_string(),
+                text: normalized_text.clone(),
                 source_url: item.source_url.clone(),
                 posted_at: item.posted_at.clone(),
                 raw_json: serde_json::json!({
@@ -2643,7 +2650,7 @@ fn normalize_session_capture(
                   "sharedUrls": item.shared_urls,
                   "media": media,
                 }),
-                fingerprint: fingerprint(&item.text),
+                fingerprint: fingerprint(&normalized_text),
             }
         })
         .collect::<Vec<_>>();
@@ -2740,6 +2747,70 @@ fn normalize_capture_media(media: &[XSessionCaptureMedia]) -> Vec<FeedMedia> {
     }
 
     normalized
+}
+
+fn sanitize_linkedin_capture_text(
+    text: &str,
+    author_name: &str,
+    social_context: Option<&str>,
+) -> String {
+    let mut cleaned = text.trim().replace('\u{a0}', " ");
+    cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    let author_name = author_name.trim();
+    let social_context = social_context.map(str::trim).filter(|value| !value.is_empty());
+
+    let noise_patterns = [
+        Regex::new(r"(?i)^feed\s*post\b[:\s-]*").expect("valid regex"),
+        Regex::new(r"(?i)^\d[\d,.]*\s+followers\b(?:\s*[•·]\s*)?").expect("valid regex"),
+        Regex::new(r"(?i)^\d[\d,.]*\s+connections\b(?:\s*[•·]\s*)?").expect("valid regex"),
+        Regex::new(r"(?i)^[0-9]+\s*(?:m|h|d|w|mo|yr|y)\b(?:\s*[•·]\s*edited)?\s*")
+            .expect("valid regex"),
+        Regex::new(r"(?i)^edited\b(?:\s*[•·]\s*)?").expect("valid regex"),
+        Regex::new(r"(?i)^(?:follow|message)\b\s*").expect("valid regex"),
+    ];
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+
+        if !author_name.is_empty() {
+            let next = cleaned
+                .strip_prefix(author_name)
+                .map(str::trim)
+                .unwrap_or(cleaned.as_str())
+                .to_string();
+            if next != cleaned {
+                cleaned = next;
+                changed = true;
+            }
+        }
+
+        if let Some(context) = social_context {
+            let next = cleaned
+                .strip_prefix(context)
+                .map(str::trim)
+                .unwrap_or(cleaned.as_str())
+                .to_string();
+            if next != cleaned {
+                cleaned = next;
+                changed = true;
+            }
+        }
+
+        for pattern in &noise_patterns {
+            let next = pattern.replace(&cleaned, "").trim().to_string();
+            if next != cleaned {
+                cleaned = next;
+                changed = true;
+            }
+        }
+    }
+
+    cleaned
+        .trim_matches(|char: char| matches!(char, '•' | '·' | '-' | '|' | ':'))
+        .trim()
+        .to_string()
 }
 
 fn media_from_item(item: &FeedItem) -> Vec<FeedMedia> {
@@ -3151,43 +3222,68 @@ fn parse_cluster_decisions(
         .collect())
 }
 
-async fn maybe_persist_important_image(
+async fn maybe_persist_lead_image(
     state: &AppState,
     edition_id: &str,
     provider: &LmStudioClient,
     image_cache: &mut SyncImageCache,
     record: &ClusterEditorialRecord,
 ) -> Result<Option<EditionImage>, AppError> {
-    if !record.decision.image_important {
-        return Ok(None);
-    }
-
-    let Some(media_url) = first_photo_url(&record.cluster.representative) else {
-        return Ok(None);
-    };
-    let Some(image) = image_cache.get_or_fetch(&provider.http, &media_url).await else {
-        return Ok(None);
-    };
-
     let base_dir = state
         .app
         .path()
         .app_local_data_dir()
         .map_err(|error| AppError::Message(error.to_string()))?;
-    let alt = record
-        .decision
-        .image_alt
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| record.decision.headline.clone());
+    persist_record_lead_image(
+        &base_dir,
+        &provider.http,
+        edition_id,
+        image_cache,
+        record,
+    )
+    .await
+}
+
+async fn persist_record_lead_image(
+    base_dir: &Path,
+    http: &reqwest::Client,
+    edition_id: &str,
+    image_cache: &mut SyncImageCache,
+    record: &ClusterEditorialRecord,
+) -> Result<Option<EditionImage>, AppError> {
+    let Some(media_url) = first_photo_url(&record.cluster.representative) else {
+        return Ok(None);
+    };
+    let Some(image) = image_cache.get_or_fetch(http, &media_url).await else {
+        return Ok(None);
+    };
+
+    let alt = lead_image_alt(record);
 
     Ok(Some(persist_downloaded_image(
-        &base_dir,
+        base_dir,
         edition_id,
         &record.cluster.representative.id,
         &image,
         &alt,
     )?))
+}
+
+fn lead_image_alt(record: &ClusterEditorialRecord) -> String {
+    if let Some(alt) = record
+        .decision
+        .image_alt
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return alt;
+    }
+
+    if record.decision.image_important && !record.decision.summary.trim().is_empty() {
+        return record.decision.summary.clone();
+    }
+
+    record.decision.headline.clone()
 }
 
 fn truncate_words(text: &str, limit: usize) -> String {
@@ -3800,6 +3896,50 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_linkedin_capture_text_removes_feed_chrome() {
+        let cleaned = sanitize_linkedin_capture_text(
+            "Feedpost Dio 113,123 followers 2d Edited We shipped a much better search workflow for teams.",
+            "Dio",
+            None,
+        );
+
+        assert_eq!(
+            cleaned,
+            "We shipped a much better search workflow for teams."
+        );
+    }
+
+    #[test]
+    fn live_session_capture_cleans_linkedin_text_before_headlines() {
+        let settings = UserSettings::default();
+        let items = vec![XSessionCaptureItem {
+            id: "1".into(),
+            author_name: "Dio".into(),
+            author_handle: "dio".into(),
+            text: "Feed post Dio 113123 followers 2d Edited We shipped a much better search workflow for teams.".into(),
+            source_url: "https://www.linkedin.com/feed/update/urn:li:activity:1/".into(),
+            posted_at: "2026-04-22T12:00:00Z".into(),
+            is_repost: false,
+            is_reply: false,
+            social_context: None,
+            shared_urls: Vec::new(),
+            media: Vec::new(),
+        }];
+
+        let cleaned = normalize_session_capture(items, &settings, CaptureSourceKind::Linkedin);
+
+        assert_eq!(cleaned.len(), 1);
+        assert_eq!(
+            cleaned[0].text,
+            "We shipped a much better search workflow for teams."
+        );
+        assert_eq!(
+            cleaned[0].fingerprint,
+            fingerprint("We shipped a much better search workflow for teams.")
+        );
+    }
+
+    #[test]
     fn home_timeline_refresh_url_targets_home_with_refresh_nonce() {
         let url = build_home_timeline_refresh_url();
         let refresh_nonce = url
@@ -4119,5 +4259,90 @@ mod tests {
         assert_eq!(persisted.source_url, image.source_url);
         assert_eq!(persisted.mime_type, "image/jpeg");
         assert_eq!(persisted.alt, "Screenshot of the release UI");
+    }
+
+    #[test]
+    fn lead_image_alt_prefers_model_alt_when_present() {
+        let record = ClusterEditorialRecord {
+            cluster: sample_cluster(vec![]),
+            decision: ClusterDecision {
+                cluster_id: "cluster-1".into(),
+                keep: true,
+                category: "Tools".into(),
+                headline: "Fallback headline".into(),
+                summary: "Summary".into(),
+                why_it_matters: "Why".into(),
+                reasons: vec!["reason".into()],
+                image_important: true,
+                image_alt: Some("Screenshot of the release UI".into()),
+            },
+        };
+
+        assert_eq!(lead_image_alt(&record), "Screenshot of the release UI");
+    }
+
+    #[test]
+    fn lead_image_alt_falls_back_to_headline_without_analysis_alt() {
+        let record = ClusterEditorialRecord {
+            cluster: sample_cluster(vec![]),
+            decision: ClusterDecision {
+                cluster_id: "cluster-1".into(),
+                keep: true,
+                category: "Tools".into(),
+                headline: "Fallback headline".into(),
+                summary: "Summary".into(),
+                why_it_matters: "Why".into(),
+                reasons: vec!["reason".into()],
+                image_important: false,
+                image_alt: None,
+            },
+        };
+
+        assert_eq!(lead_image_alt(&record), "Fallback headline");
+    }
+
+    #[tokio::test]
+    async fn persist_record_lead_image_keeps_post_image_without_analysis_flag() {
+        let server = MockServer::start();
+        let image = server.mock(|when, then| {
+            when.method(GET).path("/media/story.jpg");
+            then.status(200)
+                .header("content-type", "image/jpeg")
+                .body(vec![1_u8, 2, 3]);
+        });
+        let temp_dir = tempdir().expect("temporary dir");
+        let record = ClusterEditorialRecord {
+            cluster: sample_cluster(vec![FeedMedia {
+                url: format!("{}/media/story.jpg", server.base_url()),
+                kind: "photo".into(),
+            }]),
+            decision: ClusterDecision {
+                cluster_id: "cluster-1".into(),
+                keep: true,
+                category: "Tools".into(),
+                headline: "Fallback headline".into(),
+                summary: "Summary".into(),
+                why_it_matters: "Why".into(),
+                reasons: vec!["reason".into()],
+                image_important: false,
+                image_alt: None,
+            },
+        };
+        let mut image_cache = SyncImageCache::default();
+
+        let persisted = persist_record_lead_image(
+            temp_dir.path(),
+            &reqwest::Client::new(),
+            "edition-1",
+            &mut image_cache,
+            &record,
+        )
+        .await
+        .expect("persist lead image")
+        .expect("lead image to exist");
+
+        assert_eq!(image.hits(), 1);
+        assert!(Path::new(&persisted.path).exists());
+        assert_eq!(persisted.alt, "Fallback headline");
     }
 }

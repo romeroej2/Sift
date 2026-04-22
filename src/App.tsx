@@ -1037,17 +1037,9 @@ export default function App() {
       <header className="masthead">
         <div className="masthead-identity">
           <div className="masthead-brand">
-            <span className="masthead-mark" aria-hidden="true">
-              <svg viewBox="0 0 32 32" fill="none">
-                <circle cx="16" cy="16" r="14" stroke="currentColor" strokeWidth="1.5" opacity="0.3" />
-                <circle cx="16" cy="16" r="8" stroke="currentColor" strokeWidth="1.5" opacity="0.5" />
-                <circle cx="16" cy="16" r="2.5" fill="currentColor" />
-              </svg>
+            <span className="masthead-logo-frame" aria-hidden="true">
+              <img className="masthead-logo" src="/sift-logo.png" alt="" />
             </span>
-            <div className="masthead-titles">
-              <span className="masthead-title">SIFT</span>
-              <span className="masthead-subtitle">Daily Briefing</span>
-            </div>
           </div>
 
           <div className="masthead-utility">

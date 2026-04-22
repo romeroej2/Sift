@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="public/sift-mark.png" alt="SIFT logo" width="160" />
+  <img src="public/sift-logo.png" alt="SIFT logo" width="280" />
 </p>
 
 # SIFT
