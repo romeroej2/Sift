@@ -3808,10 +3808,6 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None::<Vec<&str>>,
-        ))
         .setup(|app| {
             let app_handle = app.handle().clone();
             let base_dir = data_dir(&app_handle)?;

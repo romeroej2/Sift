@@ -4,7 +4,6 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "autostart:default",
     "notification:default",
     "log:default"
   ]

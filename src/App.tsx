@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { enable as enableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
 import {
   isPermissionGranted as isNotificationPermissionGranted,
   requestPermission as requestNotificationPermission
@@ -502,7 +501,7 @@ export default function App() {
           "SIFT is ready. Your enabled browser sessions are standing by."
         );
 
-        void ensureDesktopRuntime().catch((error) => {
+        void ensureNotificationPermission().catch((error) => {
           const detail = getErrorMessage(error, "desktop integrations are not ready yet");
           setMessage(`SIFT is ready, but ${detail}.`);
         });
@@ -616,11 +615,7 @@ export default function App() {
     };
   }, []);
 
-  async function ensureDesktopRuntime() {
-    if (!(await isAutostartEnabled())) {
-      await enableAutostart();
-    }
-
+  async function ensureNotificationPermission() {
     if (!(await isNotificationPermissionGranted())) {
       await requestNotificationPermission();
     }

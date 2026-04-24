@@ -33,8 +33,6 @@ const {
   deleteAllEditionsMock,
   openExternalUrlMock,
   listenMock,
-  enableAutostartMock,
-  isAutostartEnabledMock,
   isNotificationPermissionGrantedMock,
   requestNotificationPermissionMock
 } = vi.hoisted(() => ({
@@ -61,8 +59,6 @@ const {
   deleteAllEditionsMock: vi.fn(),
   openExternalUrlMock: vi.fn(),
   listenMock: vi.fn(),
-  enableAutostartMock: vi.fn(),
-  isAutostartEnabledMock: vi.fn(),
   isNotificationPermissionGrantedMock: vi.fn(),
   requestNotificationPermissionMock: vi.fn()
 }));
@@ -92,11 +88,6 @@ vi.mock("./lib/api", () => ({
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: listenMock
-}));
-
-vi.mock("@tauri-apps/plugin-autostart", () => ({
-  enable: enableAutostartMock,
-  isEnabled: isAutostartEnabledMock
 }));
 
 vi.mock("@tauri-apps/plugin-notification", () => ({
@@ -217,8 +208,6 @@ async function renderLoadedApp({
 beforeEach(() => {
   vi.clearAllMocks();
   listenMock.mockResolvedValue(() => undefined);
-  isAutostartEnabledMock.mockResolvedValue(true);
-  enableAutostartMock.mockResolvedValue(undefined);
   isNotificationPermissionGrantedMock.mockResolvedValue(true);
   requestNotificationPermissionMock.mockResolvedValue("granted");
   saveSettingsMock.mockImplementation(async (settings) => ({
