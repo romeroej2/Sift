@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{Emitter, Manager};
 use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep, timeout};
 use url::Url;
 use uuid::Uuid;
@@ -76,6 +77,8 @@ pub struct XSessionCaptureItem {
     pub posted_at: String,
     pub is_repost: bool,
     pub is_reply: bool,
+    #[serde(default)]
+    pub is_promoted: bool,
     pub social_context: Option<String>,
     pub shared_urls: Vec<String>,
     #[serde(default)]
@@ -164,7 +167,6 @@ enum CaptureSourceKind {
 struct MultiCaptureOutcome {
     items: Vec<FeedItem>,
     brand_new_count: usize,
-    resurfaced_count: usize,
     enabled_sources: Vec<CaptureSourceKind>,
 }
 
@@ -173,6 +175,16 @@ struct ViewBuildSpec {
     view: EditionView,
     label: &'static str,
     items: Vec<FeedItem>,
+}
+
+struct BuiltView {
+    index: usize,
+    view: EditionView,
+    decisions: Vec<ClusterEditorialRecord>,
+    kept_count: usize,
+    edition: Edition,
+    ranking_ms: u64,
+    front_page_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +229,23 @@ impl CaptureSourceKind {
             Self::Reddit => "Reddit",
         }
     }
+
+    fn as_edition_view(self) -> EditionView {
+        match self {
+            Self::X => EditionView::X,
+            Self::Linkedin => EditionView::Linkedin,
+            Self::Reddit => EditionView::Reddit,
+        }
+    }
+}
+
+fn source_view_index(enabled_sources: &[CaptureSourceKind], source: CaptureSourceKind) -> usize {
+    let offset = usize::from(enabled_sources.len() > 1);
+    enabled_sources
+        .iter()
+        .position(|candidate| *candidate == source)
+        .map(|index| index + offset)
+        .unwrap_or(offset)
 }
 
 #[derive(Debug, Clone)]
@@ -400,15 +429,12 @@ fn format_capture_progress_message(
     let mut message = if progress.fresh_count > 0 {
         format!(
             "Collecting posts from the live {source_label} session. Pass {}/{} · {} fresh so far.",
-            progress.pass,
-            progress.total_passes,
-            progress.fresh_count
+            progress.pass, progress.total_passes, progress.fresh_count
         )
     } else {
         format!(
             "Collecting posts from the live {source_label} session. Pass {}/{} · still scanning for fresh posts.",
-            progress.pass,
-            progress.total_passes
+            progress.pass, progress.total_passes
         )
     };
 
@@ -462,7 +488,9 @@ fn format_capture_idle_timeout_message(
             progress.current_url
         )
     } else {
-        format!("Timed out waiting for the live {source_label} session to start returning feed items.")
+        format!(
+            "Timed out waiting for the live {source_label} session to start returning feed items."
+        )
     }
 }
 
@@ -1125,17 +1153,17 @@ pub async fn generate_paper(
 
     let sync_result = async {
         let capture_started = Instant::now();
-        let capture =
-            match collect_items_from_enabled_sources(
-                state,
-                &settings,
-                &run.id,
-                &reason,
-                scheduled_run,
-            )
-            .await
-            {
-            Ok(capture) => capture,
+        let (capture, built_views) = match collect_items_and_build_views(
+            state,
+            &settings,
+            &run.id,
+            &reason,
+            scheduled_run,
+            lm_studio_auth_token.clone(),
+        )
+        .await
+        {
+            Ok(result) => result,
             Err(AppError::NoFreshItems { message }) => {
                 run.status = SyncStatus::Success;
                 run.finished_at = Some(Utc::now().to_rfc3339());
@@ -1160,78 +1188,30 @@ pub async fn generate_paper(
             Err(error) => return Err(error),
         };
         run.timings.capture_ms = capture_started.elapsed().as_millis() as u64;
-        let provider = LmStudioClient::default();
-        let mut image_cache = SyncImageCache::default();
         let view_specs = build_view_specs(&capture);
         let mut saved_editions = Vec::new();
         let mut consolidated_kept_count = 0usize;
 
-        for spec in &view_specs {
-            let fresh_breakdown = format_fresh_post_breakdown(
-                spec.items.len(),
-                capture.brand_new_count.min(spec.items.len()),
-                capture.resurfaced_count.min(spec.items.len()),
-            );
-            let clusters = group_tweets(&spec.items);
-            emit_sync_progress(
-                state,
-                &run.id,
-                &reason,
-                SyncStatus::Running,
-                "ranking-items",
-                format!(
-                    "Prepared {fresh_breakdown} in the {} view into {} topic clusters. Sending them to LM Studio for ranking.",
-                    spec.label,
-                    clusters.len()
-                ),
-                Some(capture.items.len()),
-                Some(capture.brand_new_count),
-                None,
-                None,
-            );
-
-            let ranking_started = Instant::now();
-            let decisions = batch_decide(
-                state,
-                &run.id,
-                &reason,
-                &provider,
-                &settings,
-                lm_studio_auth_token.as_deref(),
-                &clusters,
-                &mut image_cache,
-            )
-            .await?;
-            run.timings.ranking_ms += ranking_started.elapsed().as_millis() as u64;
-            let kept = keep_useful(&decisions);
-            let (_edition_date, edition, front_page_ms) = build_edition(
-                state,
-                &run.id,
-                &reason,
-                &provider,
-                &settings,
-                lm_studio_auth_token.as_deref(),
-                &kept,
-                &mut image_cache,
-                spec.view,
-                &run.id,
-            )
-            .await?;
-            run.timings.front_page_ms += front_page_ms;
-            let decision_items = decisions
+        for built_view in built_views {
+            run.timings.ranking_ms += built_view.ranking_ms;
+            run.timings.front_page_ms += built_view.front_page_ms;
+            let decision_items = built_view
+                .decisions
                 .iter()
                 .map(ClusterEditorialRecord::to_cleaned_item)
                 .collect::<Vec<_>>();
             let saving_started = Instant::now();
-            state.db.save_edition(&edition, &decision_items, &run)?;
+            state
+                .db
+                .save_edition(&built_view.edition, &decision_items, &run)?;
             run.timings.saving_ms += saving_started.elapsed().as_millis() as u64;
-            if spec.view == EditionView::Consolidated
+            if built_view.view == EditionView::Consolidated
                 || (view_specs.len() == 1 && run.edition_id.is_none())
             {
-                consolidated_kept_count = kept.len();
-                run.edition_id = Some(edition.id.clone());
+                consolidated_kept_count = built_view.kept_count;
+                run.edition_id = Some(built_view.edition.id.clone());
             }
-            saved_editions.push(edition);
+            saved_editions.push(built_view.edition);
         }
 
         emit_sync_progress(
@@ -1355,7 +1335,10 @@ pub async fn maybe_run_scheduled_sync(state: &AppState) -> Result<(), AppError> 
     }
 
     if settings.capture.sources.x
-        && (state.app.get_webview_window(crate::X_SESSION_WINDOW_LABEL).is_none()
+        && (state
+            .app
+            .get_webview_window(crate::X_SESSION_WINDOW_LABEL)
+            .is_none()
             || !*state.x_session_authenticated.read().await)
     {
         return Ok(());
@@ -1372,7 +1355,10 @@ pub async fn maybe_run_scheduled_sync(state: &AppState) -> Result<(), AppError> 
     }
 
     if settings.capture.sources.reddit
-        && (state.app.get_webview_window(crate::REDDIT_SESSION_WINDOW_LABEL).is_none()
+        && (state
+            .app
+            .get_webview_window(crate::REDDIT_SESSION_WINDOW_LABEL)
+            .is_none()
             || !*state.reddit_session_authenticated.read().await)
     {
         return Ok(());
@@ -1397,6 +1383,83 @@ pub async fn run_scheduler(state: AppState) {
         let _ = maybe_run_scheduled_sync(&state).await;
         sleep(Duration::from_secs(60)).await;
     }
+}
+
+async fn build_view(
+    state: AppState,
+    run_id: String,
+    reason: SyncReason,
+    settings: UserSettings,
+    auth_token: Option<String>,
+    spec: ViewBuildSpec,
+    index: usize,
+    total_item_count: usize,
+    brand_new_count: usize,
+    resurfaced_count: usize,
+) -> Result<BuiltView, AppError> {
+    let provider = LmStudioClient::default();
+    let mut image_cache = SyncImageCache::default();
+    let fresh_breakdown = format_fresh_post_breakdown(
+        spec.items.len(),
+        brand_new_count.min(spec.items.len()),
+        resurfaced_count.min(spec.items.len()),
+    );
+    let clusters = group_tweets(&spec.items);
+    emit_sync_progress(
+        &state,
+        &run_id,
+        &reason,
+        SyncStatus::Running,
+        "ranking-items",
+        format!(
+            "Prepared {fresh_breakdown} in the {} view into {} topic clusters. Sending them to LM Studio for ranking.",
+            spec.label,
+            clusters.len()
+        ),
+        Some(total_item_count),
+        Some(brand_new_count),
+        None,
+        None,
+    );
+
+    let ranking_started = Instant::now();
+    let decisions = batch_decide(
+        &state,
+        &run_id,
+        &reason,
+        &provider,
+        &settings,
+        auth_token.as_deref(),
+        &clusters,
+        &mut image_cache,
+    )
+    .await?;
+    let ranking_ms = ranking_started.elapsed().as_millis() as u64;
+    let kept = keep_useful(&decisions);
+    let kept_count = kept.len();
+    let (_edition_date, edition, front_page_ms) = build_edition(
+        &state,
+        &run_id,
+        &reason,
+        &provider,
+        &settings,
+        auth_token.as_deref(),
+        &kept,
+        &mut image_cache,
+        spec.view,
+        &run_id,
+    )
+    .await?;
+
+    Ok(BuiltView {
+        index,
+        view: spec.view,
+        decisions,
+        kept_count,
+        edition,
+        ranking_ms,
+        front_page_ms,
+    })
 }
 
 async fn batch_decide(
@@ -1779,6 +1842,10 @@ fn heuristically_clean_items(items: Vec<FeedItem>, settings: &UserSettings) -> V
             continue;
         }
 
+        if is_sponsored_item(&item) {
+            continue;
+        }
+
         if is_low_signal_linkedin_item(&item) {
             continue;
         }
@@ -1787,6 +1854,54 @@ fn heuristically_clean_items(items: Vec<FeedItem>, settings: &UserSettings) -> V
     }
 
     cleaned
+}
+
+fn is_sponsored_label(value: &str) -> bool {
+    static SPONSORED_PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    SPONSORED_PATTERNS
+        .get_or_init(|| {
+            [
+                r"(?i)\bpromoted\b",
+                r"(?i)\bsponsored\b",
+                r"(?i)\badvertisement\b",
+                r"(?i)\bpaid\s+partnership\b",
+                r"(?i)\bpatrocinad[oa]s?\b",
+                r"(?i)\bpublicidad\b",
+                r"(?i)\banuncio\b",
+            ]
+            .into_iter()
+            .map(|pattern| Regex::new(pattern).expect("sponsored label regex"))
+            .collect()
+        })
+        .iter()
+        .any(|pattern| pattern.is_match(normalized))
+}
+
+fn is_sponsored_item(item: &FeedItem) -> bool {
+    if item
+        .raw_json
+        .get("isPromoted")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    if item
+        .raw_json
+        .get("socialContext")
+        .and_then(|value| value.as_str())
+        .is_some_and(is_sponsored_label)
+    {
+        return true;
+    }
+
+    is_sponsored_label(&item.text)
 }
 
 fn is_engagement_bait(text: &str) -> bool {
@@ -1983,7 +2098,13 @@ fn browse_page_count_for_source(
                 .find(|rule| rule.enabled)
                 .map(|rule| &rule.browse_page_count)
         })
-        .or_else(|| settings.schedule.rules.first().map(|rule| &rule.browse_page_count))
+        .or_else(|| {
+            settings
+                .schedule
+                .rules
+                .first()
+                .map(|rule| &rule.browse_page_count)
+        })
         .expect("default schedule rule should always exist");
 
     match source {
@@ -1993,13 +2114,14 @@ fn browse_page_count_for_source(
     }
 }
 
-async fn collect_items_from_enabled_sources(
+async fn collect_items_and_build_views(
     state: &AppState,
     settings: &UserSettings,
     run_id: &str,
     reason: &SyncReason,
     scheduled_run: Option<&ScheduledRunContext>,
-) -> Result<MultiCaptureOutcome, AppError> {
+    auth_token: Option<String>,
+) -> Result<(MultiCaptureOutcome, Vec<BuiltView>), AppError> {
     let enabled_sources = enabled_capture_sources(settings);
     if enabled_sources.is_empty() {
         return Err(AppError::Message(
@@ -2017,6 +2139,7 @@ async fn collect_items_from_enabled_sources(
     let mut all_items = Vec::new();
     let mut total_brand_new_count = 0usize;
     let mut total_resurfaced_count = 0usize;
+    let mut build_tasks = JoinSet::new();
 
     for source in &enabled_sources {
         hide_all_source_sessions_for_refresh(state)?;
@@ -2033,17 +2156,59 @@ async fn collect_items_from_enabled_sources(
         .await;
 
         if let Err(hide_error) = hide_source_session_after_refresh(state, *source) {
-            capture?;
+            if let Err(capture_error) = capture {
+                build_tasks.abort_all();
+                return Err(capture_error);
+            }
+            build_tasks.abort_all();
             return Err(hide_error);
         }
 
-        let capture = capture?;
+        let capture = match capture {
+            Ok(capture) => capture,
+            Err(error) => {
+                build_tasks.abort_all();
+                return Err(error);
+            }
+        };
+        let spec = ViewBuildSpec {
+            view: source.as_edition_view(),
+            label: source.as_label(),
+            items: capture.items.clone(),
+        };
+        let state = state.clone();
+        let run_id = run_id.to_string();
+        let reason = reason.clone();
+        let settings = settings.clone();
+        let auth_token = auth_token.clone();
+        let source_item_count = capture.items.len();
+        let source_brand_new_count = capture.brand_new_count;
+        let source_resurfaced_count = capture.resurfaced_count;
+        let index = source_view_index(&enabled_sources, *source);
+
+        build_tasks.spawn(async move {
+            build_view(
+                state,
+                run_id,
+                reason,
+                settings,
+                auth_token,
+                spec,
+                index,
+                source_item_count,
+                source_brand_new_count,
+                source_resurfaced_count,
+            )
+            .await
+        });
+
         total_brand_new_count += capture.brand_new_count;
         total_resurfaced_count += capture.resurfaced_count;
         all_items.extend(capture.items);
     }
 
     if all_items.is_empty() {
+        build_tasks.abort_all();
         return Err(AppError::NoFreshItems {
             message: format!(
                 "SIFT checked {}, but none of the posts were fresh {}.",
@@ -2057,12 +2222,56 @@ async fn collect_items_from_enabled_sources(
         });
     }
 
-    Ok(MultiCaptureOutcome {
-        items: all_items,
-        brand_new_count: total_brand_new_count,
-        resurfaced_count: total_resurfaced_count,
-        enabled_sources,
-    })
+    if enabled_sources.len() > 1 {
+        let state = state.clone();
+        let run_id = run_id.to_string();
+        let reason = reason.clone();
+        let settings = settings.clone();
+        let spec = ViewBuildSpec {
+            view: EditionView::Consolidated,
+            label: "Consolidated",
+            items: all_items.clone(),
+        };
+        let total_item_count = all_items.len();
+        let auth_token = auth_token.clone();
+
+        build_tasks.spawn(async move {
+            build_view(
+                state,
+                run_id,
+                reason,
+                settings,
+                auth_token,
+                spec,
+                0,
+                total_item_count,
+                total_brand_new_count,
+                total_resurfaced_count,
+            )
+            .await
+        });
+    }
+
+    let mut built_views = Vec::with_capacity(if enabled_sources.len() > 1 {
+        enabled_sources.len() + 1
+    } else {
+        enabled_sources.len()
+    });
+    while let Some(result) = build_tasks.join_next().await {
+        built_views.push(result.map_err(|error| {
+            AppError::Message(format!("An edition view build task failed: {error}"))
+        })??);
+    }
+    built_views.sort_by_key(|view| view.index);
+
+    Ok((
+        MultiCaptureOutcome {
+            items: all_items,
+            brand_new_count: total_brand_new_count,
+            enabled_sources,
+        },
+        built_views,
+    ))
 }
 
 async fn show_source_session_for_refresh(
@@ -2114,7 +2323,9 @@ async fn collect_items_from_source_live_session(
         CaptureSourceKind::Linkedin => {
             ensure_live_linkedin_session_on_home(state, run_id, reason).await?
         }
-        CaptureSourceKind::Reddit => ensure_live_reddit_session_on_home(state, run_id, reason).await?,
+        CaptureSourceKind::Reddit => {
+            ensure_live_reddit_session_on_home(state, run_id, reason).await?
+        }
     };
     let request_id = Uuid::new_v4().to_string();
     let (sender, receiver) = oneshot::channel::<Result<XSessionCapturePayload, String>>();
@@ -2135,7 +2346,10 @@ async fn collect_items_from_source_live_session(
         reason,
         SyncStatus::Running,
         "capturing-feed",
-        format!("Collecting posts from the live {} session.", source.as_label()),
+        format!(
+            "Collecting posts from the live {} session.",
+            source.as_label()
+        ),
         None,
         None,
         None,
@@ -2181,12 +2395,10 @@ async fn collect_items_from_source_live_session(
         let (last_progress_at, latest_progress) = {
             let requests = state.x_session_capture_requests.lock().await;
             let request = requests.get(&request_id).ok_or_else(|| {
-                AppError::Message(
-                    format!(
-                        "The live {} capture request disappeared before the page responded.",
-                        source.as_label()
-                    ),
-                )
+                AppError::Message(format!(
+                    "The live {} capture request disappeared before the page responded.",
+                    source.as_label()
+                ))
             })?;
             (request.last_progress_at, request.latest_progress.clone())
         };
@@ -2246,12 +2458,10 @@ async fn collect_items_from_source_live_session(
                     .lock()
                     .await
                     .remove(&request_id);
-                return Err(AppError::Message(
-                    format!(
-                        "The live {} capture finished before SIFT could receive the results.",
-                        source.as_label()
-                    ),
-                ));
+                return Err(AppError::Message(format!(
+                    "The live {} capture finished before SIFT could receive the results.",
+                    source.as_label()
+                )));
             }
             Err(_) => continue,
         }
@@ -2467,12 +2677,8 @@ async fn ensure_live_linkedin_session_on_home(
         *state.linkedin_session_last_known_url.write().await = previous_url;
         return Err(AppError::Message(error.to_string()));
     }
-    wait_for_linkedin_session_url(
-        state,
-        is_linkedin_home_feed_url,
-        Duration::from_secs(15),
-    )
-    .await?;
+    wait_for_linkedin_session_url(state, is_linkedin_home_feed_url, Duration::from_secs(15))
+        .await?;
 
     Ok(window)
 }
@@ -2610,8 +2816,7 @@ fn is_linkedin_home_feed_url(url: &Url) -> bool {
 }
 
 fn build_linkedin_home_feed_refresh_url() -> Url {
-    let mut url =
-        Url::parse("https://www.linkedin.com/feed/").expect("valid linkedin feed url");
+    let mut url = Url::parse("https://www.linkedin.com/feed/").expect("valid linkedin feed url");
     url.query_pairs_mut()
         .append_pair("sift_refresh", &Uuid::new_v4().to_string());
     url
@@ -2646,8 +2851,7 @@ where
 }
 
 fn is_reddit_home_feed_url(url: &Url) -> bool {
-    is_reddit_domain(url)
-        && matches!(url.path(), "/" | "/best/" | "/hot/" | "/new/")
+    is_reddit_domain(url) && matches!(url.path(), "/" | "/best/" | "/hot/" | "/new/")
 }
 
 fn build_reddit_home_feed_refresh_url() -> Url {
@@ -2695,6 +2899,7 @@ fn normalize_session_capture(
                   "source": source.as_feed_source(),
                   "isRepost": item.is_repost,
                   "isReply": item.is_reply,
+                  "isPromoted": item.is_promoted,
                   "socialContext": item.social_context,
                   "sharedUrls": item.shared_urls,
                   "media": media,
@@ -2784,7 +2989,7 @@ fn normalize_capture_media(media: &[XSessionCaptureMedia]) -> Vec<FeedMedia> {
         let Some(url) = normalize_media_url(&item.url) else {
             continue;
         };
-        if !is_story_photo_url(&url) {
+        if !is_supported_story_photo_url(&url) {
             continue;
         }
         if seen.insert(url.clone()) {
@@ -2803,7 +3008,8 @@ fn sanitize_linkedin_capture_text(
     author_name: &str,
     social_context: Option<&str>,
 ) -> String {
-    let mut cleaned = normalize_linkedin_collapsed_tokens(text.trim().replace('\u{a0}', " ").as_str());
+    let mut cleaned =
+        normalize_linkedin_collapsed_tokens(text.trim().replace('\u{a0}', " ").as_str());
     cleaned = Regex::new(r"[.]{2,}")
         .expect("valid regex")
         .replace_all(&cleaned, " ")
@@ -2816,7 +3022,9 @@ fn sanitize_linkedin_capture_text(
     } else {
         author_name
     };
-    let social_context = social_context.map(str::trim).filter(|value| !value.is_empty());
+    let social_context = social_context
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
 
     let noise_patterns = [
         Regex::new(r"(?i)^feed\s*post\b[:\s-]*").expect("valid regex"),
@@ -2836,8 +3044,7 @@ fn sanitize_linkedin_capture_text(
     let trailing_noise_patterns = [
         Regex::new(r"(?i)\bview job\b.*$").expect("valid regex"),
         Regex::new(r"(?i)\blike\s+comment\s+repost\s+send\b.*$").expect("valid regex"),
-        Regex::new(r"(?i)\b\d+\s+(?:school|company)\s+alumni work here\b.*$")
-            .expect("valid regex"),
+        Regex::new(r"(?i)\b\d+\s+(?:school|company)\s+alumni work here\b.*$").expect("valid regex"),
     ];
 
     let mut changed = true;
@@ -2893,10 +3100,9 @@ fn normalize_linkedin_collapsed_tokens(text: &str) -> String {
 
     for current in text.chars() {
         if let Some(last) = previous {
-            let split_boundary =
-                (last.is_ascii_lowercase() && current.is_ascii_uppercase())
-                    || (last.is_ascii_alphabetic() && current.is_ascii_digit())
-                    || (last.is_ascii_digit() && current.is_ascii_alphabetic());
+            let split_boundary = (last.is_ascii_lowercase() && current.is_ascii_uppercase())
+                || (last.is_ascii_alphabetic() && current.is_ascii_digit())
+                || (last.is_ascii_digit() && current.is_ascii_alphabetic());
             if split_boundary && !normalized.ends_with(' ') {
                 normalized.push(' ');
             }
@@ -2944,24 +3150,44 @@ fn normalize_media_url(value: &str) -> Option<String> {
     Some(parsed.to_string())
 }
 
-fn is_story_photo_url(value: &str) -> bool {
+fn is_supported_story_photo_url(value: &str) -> bool {
     let Ok(parsed) = Url::parse(value) else {
         return false;
     };
-    if parsed.host_str() != Some("pbs.twimg.com") {
-        return false;
-    }
+    let host = parsed.host_str().unwrap_or_default().to_lowercase();
+    let path = parsed.path().to_lowercase();
 
-    ![
+    if [
         "profile_images",
         "profile_banners",
         "ext_tw_video_thumb",
         "amplify_video_thumb",
         "media_emoji",
         "semantic_core_img",
+        "profile",
+        "company-logo",
+        "emoji",
+        "icon",
+        "sprite",
+        "badge",
+        "avatar",
+        "award",
+        "snoovatar",
     ]
     .iter()
-    .any(|fragment| parsed.path().contains(fragment))
+    .any(|fragment| path.contains(fragment))
+    {
+        return false;
+    }
+
+    host == "pbs.twimg.com"
+        || host == "i.redd.it"
+        || host == "preview.redd.it"
+        || host == "external-preview.redd.it"
+        || host.ends_with(".redd.it")
+        || host == "i.imgur.com"
+        || host == "media.licdn.com"
+        || host.ends_with(".licdn.com")
 }
 
 fn normalize_shared_url(value: &str) -> Option<String> {
@@ -3351,14 +3577,7 @@ async fn maybe_persist_lead_image(
         .path()
         .app_local_data_dir()
         .map_err(|error| AppError::Message(error.to_string()))?;
-    persist_record_lead_image(
-        &base_dir,
-        &provider.http,
-        edition_id,
-        image_cache,
-        record,
-    )
-    .await
+    persist_record_lead_image(&base_dir, &provider.http, edition_id, image_cache, record).await
 }
 
 async fn persist_record_lead_image(
@@ -3942,6 +4161,7 @@ mod tests {
                 posted_at: "2026-04-16T12:00:00Z".into(),
                 is_repost: true,
                 is_reply: false,
+                is_promoted: false,
                 social_context: Some("Ada reposted".into()),
                 shared_urls: Vec::new(),
                 media: Vec::new(),
@@ -3955,6 +4175,7 @@ mod tests {
                 posted_at: "2026-04-16T12:01:00Z".into(),
                 is_repost: false,
                 is_reply: true,
+                is_promoted: false,
                 social_context: None,
                 shared_urls: Vec::new(),
                 media: Vec::new(),
@@ -3968,6 +4189,7 @@ mod tests {
                 posted_at: "2026-04-16T12:02:00Z".into(),
                 is_repost: false,
                 is_reply: false,
+                is_promoted: false,
                 social_context: None,
                 shared_urls: vec!["https://example.com/release".into()],
                 media: vec![
@@ -4013,6 +4235,100 @@ mod tests {
     }
 
     #[test]
+    fn capture_media_accepts_linkedin_and_reddit_story_images() {
+        let media = normalize_capture_media(&[
+            XSessionCaptureMedia {
+                url: "https://media.licdn.com/dms/image/v2/D4E22AQ/story-image/feedshare-shrink_800/B4EZ.jpg".into(),
+                kind: "photo".into(),
+            },
+            XSessionCaptureMedia {
+                url: "https://preview.redd.it/story-image.jpg?width=1080&crop=smart&auto=webp&s=abc".into(),
+                kind: "photo".into(),
+            },
+            XSessionCaptureMedia {
+                url: "https://styles.redditmedia.com/avatar.png".into(),
+                kind: "photo".into(),
+            },
+        ]);
+
+        assert_eq!(media.len(), 2);
+        assert_eq!(
+            media[0].url,
+            "https://media.licdn.com/dms/image/v2/D4E22AQ/story-image/feedshare-shrink_800/B4EZ.jpg"
+        );
+        assert_eq!(
+            media[1].url,
+            "https://preview.redd.it/story-image.jpg?width=1080&crop=smart&auto=webp&s=abc"
+        );
+    }
+
+    #[test]
+    fn live_session_capture_drops_promoted_posts_across_sources() {
+        let settings = UserSettings::default();
+        let cases = [
+            (
+                CaptureSourceKind::X,
+                XSessionCaptureItem {
+                    id: "x-ad".into(),
+                    author_name: "Advertiser".into(),
+                    author_handle: "ad".into(),
+                    text: "A promoted launch for teams".into(),
+                    source_url: "https://x.com/ad/status/1".into(),
+                    posted_at: "2026-04-16T12:00:00Z".into(),
+                    is_repost: false,
+                    is_reply: false,
+                    is_promoted: true,
+                    social_context: None,
+                    shared_urls: Vec::new(),
+                    media: Vec::new(),
+                },
+            ),
+            (
+                CaptureSourceKind::Linkedin,
+                XSessionCaptureItem {
+                    id: "linkedin-ad".into(),
+                    author_name: "Advertiser".into(),
+                    author_handle: "ad".into(),
+                    text: "Patrocinado We can help your team ship faster.".into(),
+                    source_url: "https://www.linkedin.com/feed/update/urn:li:activity:2/".into(),
+                    posted_at: "2026-04-16T12:00:00Z".into(),
+                    is_repost: false,
+                    is_reply: false,
+                    is_promoted: false,
+                    social_context: Some("Patrocinado".into()),
+                    shared_urls: Vec::new(),
+                    media: Vec::new(),
+                },
+            ),
+            (
+                CaptureSourceKind::Reddit,
+                XSessionCaptureItem {
+                    id: "reddit-ad".into(),
+                    author_name: "r/ad".into(),
+                    author_handle: "ad".into(),
+                    text: "Sponsored developer platform".into(),
+                    source_url: "https://www.reddit.com/r/ad/comments/1/post/".into(),
+                    posted_at: "2026-04-16T12:00:00Z".into(),
+                    is_repost: false,
+                    is_reply: false,
+                    is_promoted: false,
+                    social_context: Some("Promoted".into()),
+                    shared_urls: Vec::new(),
+                    media: Vec::new(),
+                },
+            ),
+        ];
+
+        for (source, item) in cases {
+            let cleaned = normalize_session_capture(vec![item], &settings, source);
+            assert!(
+                cleaned.is_empty(),
+                "{source:?} promoted item should be dropped"
+            );
+        }
+    }
+
+    #[test]
     fn sanitize_linkedin_capture_text_removes_feed_chrome() {
         let cleaned = sanitize_linkedin_capture_text(
             "Feedpost Dio 113,123 followers 2d Edited We shipped a much better search workflow for teams.",
@@ -4038,6 +4354,7 @@ mod tests {
             posted_at: "2026-04-22T12:00:00Z".into(),
             is_repost: false,
             is_reply: false,
+            is_promoted: false,
             social_context: None,
             shared_urls: Vec::new(),
             media: Vec::new(),
@@ -4064,7 +4381,10 @@ mod tests {
             None,
         );
 
-        assert_eq!(cleaned, "What matters most for children growing up with AI?");
+        assert_eq!(
+            cleaned,
+            "What matters most for children growing up with AI?"
+        );
     }
 
     #[test]
@@ -4075,7 +4395,10 @@ mod tests {
             None,
         );
 
-        assert_eq!(cleaned, "What matters most for children growing up with AI?");
+        assert_eq!(
+            cleaned,
+            "What matters most for children growing up with AI?"
+        );
     }
 
     #[test]
@@ -4104,11 +4427,14 @@ mod tests {
             source: "linkedin-session".into(),
             author_name: "LinkedIn author".into(),
             author_handle: "angelajaramillo12".into(),
-            text: "Angela Jaramillo | Speaker | Coach de Marcas y Talentos | Directora de RRPP".into(),
+            text: "Angela Jaramillo | Speaker | Coach de Marcas y Talentos | Directora de RRPP"
+                .into(),
             source_url: "https://www.linkedin.com/feed/update/urn:li:activity:2/".into(),
             posted_at: "2026-04-22T12:00:00Z".into(),
             raw_json: serde_json::json!({}),
-            fingerprint: fingerprint("Angela Jaramillo | Speaker | Coach de Marcas y Talentos | Directora de RRPP"),
+            fingerprint: fingerprint(
+                "Angela Jaramillo | Speaker | Coach de Marcas y Talentos | Directora de RRPP",
+            ),
         };
         let cluster = TweetCluster {
             id: "cluster-1".into(),
@@ -4160,6 +4486,7 @@ mod tests {
             posted_at: "2026-04-16T12:02:00Z".into(),
             is_repost: false,
             is_reply: false,
+            is_promoted: false,
             social_context: None,
             shared_urls: vec!["https://example.com/release".into()],
             media: Vec::new(),
@@ -4186,7 +4513,6 @@ mod tests {
                 fingerprint: fingerprint("Post"),
             }],
             brand_new_count: 1,
-            resurfaced_count: 0,
             enabled_sources: vec![CaptureSourceKind::Reddit],
         };
 

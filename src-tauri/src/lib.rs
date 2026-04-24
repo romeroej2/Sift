@@ -3,8 +3,8 @@ mod models;
 mod services;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::panic;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -262,8 +262,9 @@ impl AppState {
         self.remember_linkedin_session(initial_url.to_string(), is_authenticated)
             .await?;
 
-        let window = build_linkedin_session_window(&self.app, self.clone(), initial_url, true, true)
-            .map_err(AppError::Message)?;
+        let window =
+            build_linkedin_session_window(&self.app, self.clone(), initial_url, true, true)
+                .map_err(AppError::Message)?;
         window
             .show()
             .map_err(|error| AppError::Message(error.to_string()))?;
@@ -369,10 +370,11 @@ impl AppState {
     ) -> Result<(), AppError> {
         *self.reddit_session_last_known_url.write().await = Some(last_known_url.clone());
         *self.reddit_session_authenticated.write().await = is_authenticated;
-        self.db.save_persisted_reddit_session(&PersistedBrowserSession {
-            last_known_url,
-            is_authenticated,
-        })
+        self.db
+            .save_persisted_reddit_session(&PersistedBrowserSession {
+                last_known_url,
+                is_authenticated,
+            })
     }
 
     async fn clear_reddit_session_runtime(&self) {
@@ -494,10 +496,19 @@ if (
   const siftTweetMedia = (article) => {
     const media = [];
     const seen = new Set();
-    const selectors = ['a[href*="/photo/"] img', '[data-testid="tweetPhoto"] img'];
+    const selectors = [
+      'a[href*="/photo/"] img',
+      '[data-testid="tweetPhoto"] img',
+      'img[src*="pbs.twimg.com/media/"]',
+      'img[srcset*="pbs.twimg.com/media/"]',
+    ];
 
     Array.from(article.querySelectorAll(selectors.join(","))).forEach((img) => {
-      const src = img.currentSrc || img.getAttribute("src") || "";
+      const src =
+        img.currentSrc
+        || img.getAttribute("src")
+        || (img.getAttribute("srcset") || "").split(",").map((part) => part.trim().split(/\s+/)[0]).find(Boolean)
+        || "";
       if (!src) {
         return;
       }
@@ -519,7 +530,11 @@ if (
         }
 
         const photoHref = img.closest('a[href*="/photo/"]')?.getAttribute("href") || "";
-        if (!photoHref.includes("/photo/") && !img.closest('[data-testid="tweetPhoto"]')) {
+        if (
+          !photoHref.includes("/photo/")
+          && !img.closest('[data-testid="tweetPhoto"]')
+          && !url.pathname.includes("/media/")
+        ) {
           return;
         }
 
@@ -819,6 +834,10 @@ if (
       )
       || handle;
     const socialContext = siftReadText(article.querySelector('[data-testid="socialContext"]'));
+    const articleText = siftReadText(article);
+    const isPromoted = /\b(promoted|sponsored|advertisement|patrocinad[oa]s?|publicidad|anuncio)\b/i.test(
+      [socialContext, articleText].filter(Boolean).join(" "),
+    );
     const isReply = Array.from(article.querySelectorAll("span"))
       .map((node) => siftReadText(node))
       .some((value) => value.startsWith("Replying to"));
@@ -832,6 +851,7 @@ if (
       postedAt: article.querySelector("time")?.getAttribute("datetime") || new Date().toISOString(),
       isRepost: /retweeted|reposted/i.test(socialContext),
       isReply,
+      isPromoted,
       socialContext: socialContext || null,
       sharedUrls: siftSharedUrls(article),
       media: siftTweetMedia(article),
@@ -1618,6 +1638,54 @@ if (
     return Array.from(urls);
   };
 
+  const siftLinkedInMedia = (article) => {
+    const media = [];
+    const seen = new Set();
+    Array.from(article.querySelectorAll("img")).forEach((img) => {
+      const src =
+        img.currentSrc
+        || img.getAttribute("src")
+        || (img.getAttribute("srcset") || "").split(",").map((part) => part.trim().split(/\s+/)[0]).find(Boolean)
+        || "";
+      if (!src) {
+        return;
+      }
+
+      try {
+        const url = new URL(src, window.location.origin);
+        if (!["http:", "https:"].includes(url.protocol)) {
+          return;
+        }
+        if (!/(^|\.)licdn\.com$/i.test(url.hostname)) {
+          return;
+        }
+        if (/profile|company-logo|emoji|icon|sprite|badge/i.test(url.pathname)) {
+          return;
+        }
+
+        const width = Number(img.naturalWidth || img.width || img.getAttribute("width") || 0);
+        const height = Number(img.naturalHeight || img.height || img.getAttribute("height") || 0);
+        if (width > 0 && height > 0 && (width < 120 || height < 80)) {
+          return;
+        }
+
+        url.hash = "";
+        const normalized = url.toString();
+        if (seen.has(normalized)) {
+          return;
+        }
+        seen.add(normalized);
+        media.push({
+          url: normalized,
+          kind: "photo",
+        });
+      } catch {
+        // Ignore malformed media URLs while scraping.
+      }
+    });
+    return media;
+  };
+
   const siftLinkedInActivityId = (value) => {
     if (!value) {
       return null;
@@ -1838,6 +1906,10 @@ if (
         || target.querySelector(".feed-shared-social-action-bar")
       )
       || null;
+    const targetText = siftReadText(target);
+    const isPromoted = /\b(promoted|sponsored|advertisement|patrocinad[oa]s?|publicidad|anuncio)\b/i.test(
+      [socialContext, targetText].filter(Boolean).join(" "),
+    );
     const postedAt =
       target.querySelector("time")?.getAttribute("datetime")
       || new Date().toISOString();
@@ -1850,9 +1922,10 @@ if (
       postedAt,
       isRepost: /\breposted this\b/i.test(socialContext || ""),
       isReply: false,
+      isPromoted,
       socialContext,
       sharedUrls: siftSharedUrls(target),
-      media: [],
+      media: siftLinkedInMedia(target),
     };
   };
 
@@ -2398,6 +2471,68 @@ if (
     return Array.from(urls);
   };
 
+  const siftRedditMedia = (article) => {
+    const media = [];
+    const seen = new Set();
+    const candidates = [];
+    const pushCandidate = (value) => {
+      if (value) {
+        candidates.push(value);
+      }
+    };
+
+    pushCandidate(article.getAttribute("content-href"));
+    pushCandidate(article.getAttribute("thumbnail"));
+    pushCandidate(article.getAttribute("preview"));
+    Array.from(article.querySelectorAll("img")).forEach((img) => {
+      pushCandidate(img.currentSrc);
+      pushCandidate(img.getAttribute("src"));
+      (img.getAttribute("srcset") || "")
+        .split(",")
+        .map((part) => part.trim().split(/\s+/)[0])
+        .filter(Boolean)
+        .forEach(pushCandidate);
+    });
+
+    for (const candidate of candidates) {
+      try {
+        const url = new URL(candidate, window.location.origin);
+        if (!["http:", "https:"].includes(url.protocol)) {
+          continue;
+        }
+        const host = url.hostname.toLowerCase();
+        if (
+          !(
+            host === "i.redd.it"
+            || host === "preview.redd.it"
+            || host === "external-preview.redd.it"
+            || host.endsWith(".redd.it")
+            || host === "i.imgur.com"
+          )
+        ) {
+          continue;
+        }
+        if (/avatar|emoji|icon|award|snoovatar|styles\.redditmedia/i.test(url.pathname)) {
+          continue;
+        }
+        url.hash = "";
+        const normalized = url.toString();
+        if (seen.has(normalized)) {
+          continue;
+        }
+        seen.add(normalized);
+        media.push({
+          url: normalized,
+          kind: "photo",
+        });
+      } catch {
+        // Ignore malformed media URLs while scraping.
+      }
+    }
+
+    return media;
+  };
+
   const siftParsePost = (article) => {
     const sourceUrl = siftPostUrl(article);
     const postId = sourceUrl?.match(/\/comments\/([^/]+)/i)?.[1]
@@ -2431,6 +2566,10 @@ if (
       || article.querySelector("time")?.getAttribute("datetime")
       || new Date().toISOString();
     const socialContext = siftReadText(article.querySelector('[slot="credit-bar"], [slot="thumbnail"]')) || null;
+    const articleText = siftReadText(article);
+    const isPromoted = /\b(promoted|sponsored|advertisement|patrocinad[oa]s?|publicidad|anuncio)\b/i.test(
+      [socialContext, articleText, article.getAttribute("promoted"), article.getAttribute("is-promoted")].filter(Boolean).join(" "),
+    );
 
     return {
       id: postId,
@@ -2441,9 +2580,10 @@ if (
       postedAt,
       isRepost: false,
       isReply: false,
+      isPromoted,
       socialContext,
       sharedUrls: siftSharedUrls(article, sourceUrl),
-      media: [],
+      media: siftRedditMedia(article),
     };
   };
 
@@ -2838,7 +2978,8 @@ fn build_x_session_window(
                 let completed_url = payload.url().to_string();
                 tauri::async_runtime::spawn(async move {
                     if completed_x_session {
-                        if let Err(error) = popup_state.remember_x_session(completed_url, true).await
+                        if let Err(error) =
+                            popup_state.remember_x_session(completed_url, true).await
                         {
                             eprintln!("failed to persist X auth popup state: {error}");
                         }
@@ -3035,7 +3176,9 @@ fn build_reddit_session_window(
             let url = payload.url().to_string();
             let is_authenticated = is_completed_reddit_session_url(payload.url());
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = page_state.remember_reddit_session(url, is_authenticated).await
+                if let Err(error) = page_state
+                    .remember_reddit_session(url, is_authenticated)
+                    .await
                 {
                     eprintln!("failed to persist Reddit session page state: {error}");
                 }
@@ -3063,10 +3206,12 @@ fn restore_x_session_window(state: &AppState) -> Result<(), AppError> {
     let initial_url_string = initial_url.to_string();
     *state.x_session_last_known_url.blocking_write() = Some(initial_url_string.clone());
     *state.x_session_authenticated.blocking_write() = saved_session.is_authenticated;
-    state.db.save_persisted_x_session(&PersistedBrowserSession {
-        last_known_url: initial_url_string,
-        is_authenticated: saved_session.is_authenticated,
-    })?;
+    state
+        .db
+        .save_persisted_x_session(&PersistedBrowserSession {
+            last_known_url: initial_url_string,
+            is_authenticated: saved_session.is_authenticated,
+        })?;
     build_x_session_window(&state.app, state.clone(), initial_url, false, false)
         .map_err(AppError::Message)?;
     Ok(())
@@ -3106,18 +3251,25 @@ fn restore_reddit_session_window(state: &AppState) -> Result<(), AppError> {
         return Ok(());
     };
 
-    if state.app.get_webview_window(REDDIT_SESSION_WINDOW_LABEL).is_some() {
+    if state
+        .app
+        .get_webview_window(REDDIT_SESSION_WINDOW_LABEL)
+        .is_some()
+    {
         return Ok(());
     }
 
-    let initial_url = resolve_reddit_session_launch_url(Some(saved_session.last_known_url.as_str()));
+    let initial_url =
+        resolve_reddit_session_launch_url(Some(saved_session.last_known_url.as_str()));
     let initial_url_string = initial_url.to_string();
     *state.reddit_session_last_known_url.blocking_write() = Some(initial_url_string.clone());
     *state.reddit_session_authenticated.blocking_write() = saved_session.is_authenticated;
-    state.db.save_persisted_reddit_session(&PersistedBrowserSession {
-        last_known_url: initial_url_string,
-        is_authenticated: saved_session.is_authenticated,
-    })?;
+    state
+        .db
+        .save_persisted_reddit_session(&PersistedBrowserSession {
+            last_known_url: initial_url_string,
+            is_authenticated: saved_session.is_authenticated,
+        })?;
     build_reddit_session_window(&state.app, state.clone(), initial_url, false, false)
         .map_err(AppError::Message)?;
     Ok(())
@@ -3252,13 +3404,8 @@ async fn open_linkedin_session_window(
         .await
         .map_err(|error| error.to_string())?;
 
-    let window = build_linkedin_session_window(
-        &state.app,
-        state.inner().clone(),
-        initial_url,
-        true,
-        true,
-    )?;
+    let window =
+        build_linkedin_session_window(&state.app, state.inner().clone(), initial_url, true, true)?;
 
     let _ = window.show();
     let _ = window.set_focus();
@@ -3386,7 +3533,9 @@ async fn logout_linkedin_session(state: &AppState) -> Result<(), String> {
 }
 
 async fn logout_reddit_session(state: &AppState) -> Result<(), String> {
-    state.reddit_session_force_close.store(true, Ordering::SeqCst);
+    state
+        .reddit_session_force_close
+        .store(true, Ordering::SeqCst);
 
     let result = (|| -> Result<(), String> {
         if let Some(window) = state.app.get_webview_window(REDDIT_SESSION_WINDOW_LABEL) {
@@ -3399,7 +3548,9 @@ async fn logout_reddit_session(state: &AppState) -> Result<(), String> {
     })();
 
     if let Err(error) = result {
-        state.reddit_session_force_close.store(false, Ordering::SeqCst);
+        state
+            .reddit_session_force_close
+            .store(false, Ordering::SeqCst);
         return Err(error);
     }
 
@@ -3408,8 +3559,14 @@ async fn logout_reddit_session(state: &AppState) -> Result<(), String> {
         .await
         .map_err(|error| error.to_string())?;
 
-    if state.app.get_webview_window(REDDIT_SESSION_WINDOW_LABEL).is_none() {
-        state.reddit_session_force_close.store(false, Ordering::SeqCst);
+    if state
+        .app
+        .get_webview_window(REDDIT_SESSION_WINDOW_LABEL)
+        .is_none()
+    {
+        state
+            .reddit_session_force_close
+            .store(false, Ordering::SeqCst);
     }
 
     Ok(())
@@ -3706,7 +3863,14 @@ fn install_panic_hook() {
     panic::set_hook(Box::new(move |panic_info| {
         let location = panic_info
             .location()
-            .map(|location| format!("{}:{}:{}", location.file(), location.line(), location.column()))
+            .map(|location| {
+                format!(
+                    "{}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                )
+            })
             .unwrap_or_else(|| "unknown location".into());
 
         let payload = if let Some(message) = panic_info.payload().downcast_ref::<&str>() {
@@ -3889,7 +4053,9 @@ pub fn run() {
                 } else if window.label() == REDDIT_SESSION_WINDOW_LABEL {
                     if let Some(state) = window.try_state::<AppState>() {
                         let state = state.inner().clone();
-                        state.reddit_session_force_close.store(false, Ordering::SeqCst);
+                        state
+                            .reddit_session_force_close
+                            .store(false, Ordering::SeqCst);
                         tauri::async_runtime::spawn(async move {
                             state.clear_reddit_session_runtime().await;
                         });
