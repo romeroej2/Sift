@@ -26,6 +26,17 @@ export interface LmStudioSettings {
   includeImages: boolean;
 }
 
+export type ModelBackend = "lmStudio" | "codex";
+
+export interface CodexSettings {
+  command: string;
+  model: string | null;
+  profile: string | null;
+  includeImages: boolean;
+  inputCostPerMillionTokens: number | null;
+  outputCostPerMillionTokens: number | null;
+}
+
 export interface CaptureSourcesSettings {
   x: boolean;
   linkedin: boolean;
@@ -73,7 +84,9 @@ export interface BrowserSessionState {
 export interface UserSettings {
   schedule: ScheduleSettings;
   cleanup: CleanupSettings;
+  modelBackend: ModelBackend;
   lmStudio: LmStudioSettings;
+  codex: CodexSettings;
   capture: CaptureSettings;
 }
 
@@ -121,6 +134,16 @@ export interface SyncRunTimings {
   frontPageMs: number;
   savingMs: number;
   totalMs: number;
+  codexUsage?: CodexUsage;
+}
+
+export interface CodexUsage {
+  callCount: number;
+  promptChars: number;
+  outputChars: number;
+  estimatedInputTokens: number;
+  estimatedOutputTokens: number;
+  estimatedCostUsd: number | null;
 }
 
 export interface SyncRun {
@@ -170,5 +193,12 @@ export interface LmStudioHealth {
   ok: boolean;
   serverLabel: string;
   models: ModelDescriptor[];
+  message: string;
+}
+
+export interface CodexHealth {
+  ok: boolean;
+  serverLabel: string;
+  version: string;
   message: string;
 }

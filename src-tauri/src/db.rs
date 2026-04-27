@@ -203,16 +203,25 @@ impl Database {
             .collect::<Result<HashSet<_>, _>>()?;
 
         if !columns.contains("reason") {
-            conn.execute("ALTER TABLE sync_runs ADD COLUMN reason TEXT NOT NULL DEFAULT 'manual'", [])?;
+            conn.execute(
+                "ALTER TABLE sync_runs ADD COLUMN reason TEXT NOT NULL DEFAULT 'manual'",
+                [],
+            )?;
         }
         if !columns.contains("schedule_rule_id") {
             conn.execute("ALTER TABLE sync_runs ADD COLUMN schedule_rule_id TEXT", [])?;
         }
         if !columns.contains("schedule_rule_label") {
-            conn.execute("ALTER TABLE sync_runs ADD COLUMN schedule_rule_label TEXT", [])?;
+            conn.execute(
+                "ALTER TABLE sync_runs ADD COLUMN schedule_rule_label TEXT",
+                [],
+            )?;
         }
         if !columns.contains("schedule_slot_key") {
-            conn.execute("ALTER TABLE sync_runs ADD COLUMN schedule_slot_key TEXT", [])?;
+            conn.execute(
+                "ALTER TABLE sync_runs ADD COLUMN schedule_slot_key TEXT",
+                [],
+            )?;
         }
         if !columns.contains("timings_json") {
             conn.execute(
@@ -349,17 +358,29 @@ impl Database {
     fn map_sync_run_row(row: &rusqlite::Row<'_>) -> Result<SyncRun, rusqlite::Error> {
         Ok(SyncRun {
             id: row.get(0)?,
-            reason: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(1)?)).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error))
-            })?,
+            reason: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(1)?)).map_err(
+                |error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                },
+            )?,
             schedule_rule_id: row.get(2)?,
             schedule_rule_label: row.get(3)?,
             schedule_slot_key: row.get(4)?,
             started_at: row.get(5)?,
             finished_at: row.get(6)?,
-            status: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(7)?)).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error))
-            })?,
+            status: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(7)?)).map_err(
+                |error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        7,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                },
+            )?,
             item_count: row.get(8)?,
             kept_count: row.get(9)?,
             error_message: row.get(10)?,
@@ -369,7 +390,11 @@ impl Database {
                 .map(|raw| serde_json::from_str::<SyncRunTimings>(&raw))
                 .transpose()
                 .map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(error))
+                    rusqlite::Error::FromSqlConversionFailure(
+                        12,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
                 })?
                 .unwrap_or_default(),
         })
@@ -480,7 +505,10 @@ impl Database {
 
     pub fn clear_persisted_linkedin_session(&self) -> Result<(), AppError> {
         let conn = self.connect()?;
-        conn.execute("DELETE FROM app_meta WHERE key = 'linkedin_session_restore'", [])?;
+        conn.execute(
+            "DELETE FROM app_meta WHERE key = 'linkedin_session_restore'",
+            [],
+        )?;
         Ok(())
     }
 
@@ -516,7 +544,10 @@ impl Database {
 
     pub fn clear_persisted_reddit_session(&self) -> Result<(), AppError> {
         let conn = self.connect()?;
-        conn.execute("DELETE FROM app_meta WHERE key = 'reddit_session_restore'", [])?;
+        conn.execute(
+            "DELETE FROM app_meta WHERE key = 'reddit_session_restore'",
+            [],
+        )?;
         Ok(())
     }
 
@@ -769,8 +800,14 @@ impl Database {
     pub fn delete_run(&self, run_id: &str) -> Result<(), AppError> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM item_decisions WHERE run_id = ?1", params![run_id])?;
-        tx.execute("DELETE FROM editions WHERE sync_run_id = ?1", params![run_id])?;
+        tx.execute(
+            "DELETE FROM item_decisions WHERE run_id = ?1",
+            params![run_id],
+        )?;
+        tx.execute(
+            "DELETE FROM editions WHERE sync_run_id = ?1",
+            params![run_id],
+        )?;
         tx.execute("DELETE FROM sync_runs WHERE id = ?1", params![run_id])?;
         tx.commit()?;
         Ok(())
@@ -794,8 +831,8 @@ mod tests {
 
     use super::Database;
     use crate::models::{
-        Edition, EditionSection, EditionView, FeedItem, PersistedBrowserSession, SyncReason,
-        SyncRun, SyncRunTimings, SyncStatus, UserSettings,
+        CodexSettings, Edition, EditionSection, EditionView, FeedItem, ModelBackend,
+        PersistedBrowserSession, SyncReason, SyncRun, SyncRunTimings, SyncStatus, UserSettings,
     };
 
     fn sample_sync_run(id: &str) -> SyncRun {
@@ -931,6 +968,64 @@ mod tests {
         assert_eq!(loaded.schedule.rules.len(), 1);
         assert_eq!(loaded.schedule.rules[0].time_of_day, "07:30");
         assert!(loaded.capture.sources.x);
+    }
+
+    #[test]
+    fn legacy_settings_default_to_lm_studio_backend_and_codex_defaults() {
+        let temp_dir = tempdir().expect("temporary database directory");
+        let db = Database::new(temp_dir.path().join("sift.sqlite")).expect("database");
+        let conn =
+            Connection::open(temp_dir.path().join("sift.sqlite")).expect("sqlite connection");
+
+        conn.execute(
+            "INSERT INTO app_meta(key, value) VALUES('settings', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![r#"{"schedule":{"enabled":true,"timeOfDay":"07:30","timezone":"UTC"},"cleanup":{"hideReplies":true,"hideRetweets":true,"removeBait":true,"mutedKeywords":[],"mutedAuthors":[]},"lmStudio":{"baseUrl":"http://127.0.0.1:1234","authToken":null,"selectedModel":"vision-model"}}"#],
+        )
+        .expect("insert legacy settings");
+
+        let loaded = db.load_settings().expect("load legacy settings");
+
+        assert_eq!(loaded.model_backend, ModelBackend::LmStudio);
+        assert_eq!(loaded.codex.command, "codex");
+        assert_eq!(loaded.codex.model, None);
+        assert_eq!(loaded.codex.profile, None);
+    }
+
+    #[test]
+    fn settings_preserve_codex_backend_settings() {
+        let temp_dir = tempdir().expect("temporary database directory");
+        let db = Database::new(temp_dir.path().join("sift.sqlite")).expect("database");
+        let settings = UserSettings {
+            model_backend: ModelBackend::Codex,
+            codex: CodexSettings {
+                command: "codex-dev".into(),
+                model: Some("gpt-5.2".into()),
+                profile: Some("sift".into()),
+                include_images: true,
+                input_cost_per_million_tokens: Some(1.25),
+                output_cost_per_million_tokens: Some(10.0),
+            },
+            ..UserSettings::default()
+        };
+
+        let saved = db.save_settings(&settings).expect("save settings");
+        assert_eq!(saved.model_backend, ModelBackend::Codex);
+        assert_eq!(saved.codex.command, "codex-dev");
+        assert_eq!(saved.codex.model.as_deref(), Some("gpt-5.2"));
+        assert_eq!(saved.codex.profile.as_deref(), Some("sift"));
+        assert!(saved.codex.include_images);
+        assert_eq!(saved.codex.input_cost_per_million_tokens, Some(1.25));
+        assert_eq!(saved.codex.output_cost_per_million_tokens, Some(10.0));
+
+        let loaded = db.load_settings().expect("load settings");
+        assert_eq!(loaded.model_backend, ModelBackend::Codex);
+        assert_eq!(loaded.codex.command, "codex-dev");
+        assert_eq!(loaded.codex.model.as_deref(), Some("gpt-5.2"));
+        assert_eq!(loaded.codex.profile.as_deref(), Some("sift"));
+        assert!(loaded.codex.include_images);
+        assert_eq!(loaded.codex.input_cost_per_million_tokens, Some(1.25));
+        assert_eq!(loaded.codex.output_cost_per_million_tokens, Some(10.0));
     }
 
     #[test]
@@ -1178,7 +1273,7 @@ mod tests {
         stale_run.status = SyncStatus::Running;
         stale_run.edition_id = None;
         db.insert_sync_run(&stale_run)
-        .expect("insert stale running run");
+            .expect("insert stale running run");
 
         let bootstrap = db.load_bootstrap().expect("load bootstrap");
         let latest_run = bootstrap.latest_run.expect("latest run");

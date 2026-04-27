@@ -17,7 +17,7 @@ use models::{
 use services::{
     FeedSource, LmStudioClient, LocalModelProvider, XClient, XSessionCapturePayload,
     XSessionCaptureProgressPayload, XSessionCaptureRequest, emit_capture_progress, generate_paper,
-    maybe_run_scheduled_sync, run_scheduler,
+    maybe_run_scheduled_sync, run_scheduler, verify_codex_command,
 };
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -521,11 +521,8 @@ if (
         if (url.hostname !== "pbs.twimg.com") {
           return;
         }
-        if (
-          /profile_images|profile_banners|emoji|ext_tw_video_thumb|amplify_video_thumb|semantic_core_img/i.test(
-            url.pathname,
-          )
-        ) {
+        const isVideoThumbnail = /ext_tw_video_thumb|amplify_video_thumb/i.test(url.pathname);
+        if (/profile_images|profile_banners|emoji|semantic_core_img/i.test(url.pathname)) {
           return;
         }
 
@@ -534,6 +531,7 @@ if (
           !photoHref.includes("/photo/")
           && !img.closest('[data-testid="tweetPhoto"]')
           && !url.pathname.includes("/media/")
+          && !isVideoThumbnail
         ) {
           return;
         }
@@ -546,7 +544,7 @@ if (
         seen.add(normalized);
         media.push({
           url: normalized,
-          kind: "photo",
+          kind: isVideoThumbnail ? "video" : "photo",
         });
       } catch {
         // Ignore malformed media URLs while scraping.
@@ -1675,9 +1673,10 @@ if (
           return;
         }
         seen.add(normalized);
+        const isVideoThumbnail = !!img.closest("video, [data-test-video-player], .update-components-linkedin-video, .feed-shared-update-v2__content--video");
         media.push({
           url: normalized,
-          kind: "photo",
+          kind: isVideoThumbnail ? "video" : "photo",
         });
       } catch {
         // Ignore malformed media URLs while scraping.
@@ -2475,28 +2474,33 @@ if (
     const media = [];
     const seen = new Set();
     const candidates = [];
-    const pushCandidate = (value) => {
+    const pushCandidate = (value, kind = "photo") => {
       if (value) {
-        candidates.push(value);
+        candidates.push({ value, kind });
       }
     };
 
-    pushCandidate(article.getAttribute("content-href"));
+    const contentHref = article.getAttribute("content-href");
+    const contentKind = /v\.redd\.it|\/video\//i.test(contentHref || "") ? "video" : "photo";
+    if (contentKind === "photo") {
+      pushCandidate(contentHref, contentKind);
+    }
     pushCandidate(article.getAttribute("thumbnail"));
     pushCandidate(article.getAttribute("preview"));
     Array.from(article.querySelectorAll("img")).forEach((img) => {
-      pushCandidate(img.currentSrc);
-      pushCandidate(img.getAttribute("src"));
+      const imageKind = img.closest("video, shreddit-player, [data-testid*='video' i], [slot*='video' i]") ? "video" : contentKind;
+      pushCandidate(img.currentSrc, imageKind);
+      pushCandidate(img.getAttribute("src"), imageKind);
       (img.getAttribute("srcset") || "")
         .split(",")
         .map((part) => part.trim().split(/\s+/)[0])
         .filter(Boolean)
-        .forEach(pushCandidate);
+        .forEach((value) => pushCandidate(value, imageKind));
     });
 
-    for (const candidate of candidates) {
+    for (const { value, kind } of candidates) {
       try {
-        const url = new URL(candidate, window.location.origin);
+        const url = new URL(value, window.location.origin);
         if (!["http:", "https:"].includes(url.protocol)) {
           continue;
         }
@@ -2523,7 +2527,7 @@ if (
         seen.add(normalized);
         media.push({
           url: normalized,
-          kind: "photo",
+          kind,
         });
       } catch {
         // Ignore malformed media URLs while scraping.
@@ -3658,6 +3662,13 @@ async fn verify_lm_studio(
 }
 
 #[tauri::command]
+async fn verify_codex(command: String) -> Result<models::CodexHealth, String> {
+    verify_codex_command(&command)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn start_x_connect(
     state: tauri::State<'_, AppState>,
     client_config: XClientConfigDraft,
@@ -4083,6 +4094,7 @@ pub fn run() {
             logout_linkedin_session_window,
             logout_reddit_session_window,
             verify_lm_studio,
+            verify_codex,
             start_x_connect,
             poll_x_connect,
             submit_x_feed_capture,

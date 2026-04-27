@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 use std::fs;
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
@@ -16,6 +17,8 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{Emitter, Manager};
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep, timeout};
@@ -23,10 +26,11 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::models::{
-    CaptureBrowsePageCount, CleanedItem, Edition, EditionCard, EditionImage, EditionSection,
-    EditionView, FeedItem, LmStudioHealth, ModelDescriptor, OAuthSession, PollStatus,
-    ScheduleCadence, ScheduleRule, SyncReason, SyncRun, SyncRunTimings, SyncStatus, UserSettings,
-    XClientConfigDraft, XConnectLaunch, XConnectPayload, XConnectPollResult,
+    CaptureBrowsePageCount, CleanedItem, CodexHealth, CodexSettings, CodexUsage, Edition,
+    EditionCard, EditionImage, EditionSection, EditionView, FeedItem, LmStudioHealth, ModelBackend,
+    ModelDescriptor, OAuthSession, PollStatus, ScheduleCadence, ScheduleRule, SyncReason, SyncRun,
+    SyncRunTimings, SyncStatus, UserSettings, XClientConfigDraft, XConnectLaunch, XConnectPayload,
+    XConnectPollResult,
 };
 use crate::{AppError, AppState, is_linkedin_domain, is_reddit_domain, is_x_domain};
 
@@ -137,6 +141,8 @@ const LM_BATCH_MAX_ATTEMPTS: usize = 3;
 const LM_STUDIO_REQUEST_TIMEOUT_SECS: u64 = 15;
 const LM_STUDIO_COMPLETION_TIMEOUT_SECS: u64 = 600;
 const LM_STUDIO_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
+const CODEX_VERIFY_TIMEOUT_SECS: u64 = 15;
+const CODEX_COMPLETION_TIMEOUT_SECS: u64 = 900;
 const MAX_DIGEST_ITEMS: usize = 12;
 
 fn default_capture_media_kind() -> String {
@@ -185,6 +191,7 @@ struct BuiltView {
     edition: Edition,
     ranking_ms: u64,
     front_page_ms: u64,
+    codex_usage: CodexUsage,
 }
 
 #[derive(Debug, Clone)]
@@ -358,6 +365,13 @@ impl SyncImageCache {
 pub(crate) struct StructuredGenerationOutcome {
     decisions: Vec<ClusterDecision>,
     fell_back_to_text: bool,
+    usage: CodexUsage,
+}
+
+#[derive(Debug)]
+pub(crate) struct TextGenerationOutcome {
+    text: String,
+    usage: CodexUsage,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -523,6 +537,7 @@ pub(crate) trait FeedSource {
 
 #[async_trait]
 pub(crate) trait LocalModelProvider {
+    fn label(&self) -> &'static str;
     async fn health_check(
         &self,
         base_url: &str,
@@ -545,7 +560,7 @@ pub(crate) trait LocalModelProvider {
         settings: &UserSettings,
         auth_token: Option<&str>,
         prompt: &str,
-    ) -> Result<String, AppError>;
+    ) -> Result<TextGenerationOutcome, AppError>;
 }
 
 #[derive(Clone)]
@@ -831,6 +846,10 @@ impl Default for LmStudioClient {
 
 #[async_trait]
 impl LocalModelProvider for LmStudioClient {
+    fn label(&self) -> &'static str {
+        "LM Studio"
+    }
+
     async fn health_check(
         &self,
         base_url: &str,
@@ -905,6 +924,7 @@ impl LocalModelProvider for LmStudioClient {
                         return Ok(StructuredGenerationOutcome {
                             decisions: parse_cluster_decisions(&content, clusters)?,
                             fell_back_to_text: false,
+                            usage: CodexUsage::default(),
                         });
                     }
                     Err(error) => {
@@ -923,6 +943,7 @@ impl LocalModelProvider for LmStudioClient {
                         return Ok(StructuredGenerationOutcome {
                             decisions: parse_cluster_decisions(&fallback, clusters)?,
                             fell_back_to_text: true,
+                            usage: CodexUsage::default(),
                         });
                     }
                 }
@@ -942,6 +963,7 @@ impl LocalModelProvider for LmStudioClient {
         Ok(StructuredGenerationOutcome {
             decisions: parse_cluster_decisions(&content, clusters)?,
             fell_back_to_text: false,
+            usage: CodexUsage::default(),
         })
     }
 
@@ -950,21 +972,479 @@ impl LocalModelProvider for LmStudioClient {
         settings: &UserSettings,
         auth_token: Option<&str>,
         prompt: &str,
-    ) -> Result<String, AppError> {
+    ) -> Result<TextGenerationOutcome, AppError> {
         let model =
             settings.lm_studio.selected_model.clone().ok_or_else(|| {
                 AppError::Message("Select an LM Studio model before syncing.".into())
             })?;
 
-        self.chat_completion(
-            &settings.lm_studio.base_url,
-            auth_token,
-            &model,
-            prompt,
-            0.3,
-        )
-        .await
+        let text = self
+            .chat_completion(
+                &settings.lm_studio.base_url,
+                auth_token,
+                &model,
+                prompt,
+                0.3,
+            )
+            .await?;
+        Ok(TextGenerationOutcome {
+            text,
+            usage: CodexUsage::default(),
+        })
     }
+}
+
+#[derive(Clone, Default)]
+pub struct CodexCliProvider;
+
+#[async_trait]
+impl LocalModelProvider for CodexCliProvider {
+    fn label(&self) -> &'static str {
+        "Codex"
+    }
+
+    async fn health_check(
+        &self,
+        base_url: &str,
+        _auth_token: Option<&str>,
+    ) -> Result<LmStudioHealth, AppError> {
+        let health = verify_codex_command(base_url).await?;
+        Ok(LmStudioHealth {
+            ok: true,
+            server_label: health.server_label,
+            message: health.message,
+            models: vec![ModelDescriptor {
+                id: health.version.clone(),
+                display_name: health.version,
+                loaded: true,
+            }],
+        })
+    }
+
+    async fn list_models(
+        &self,
+        base_url: &str,
+        _auth_token: Option<&str>,
+    ) -> Result<Vec<ModelDescriptor>, AppError> {
+        let health = verify_codex_command(base_url).await?;
+        Ok(vec![ModelDescriptor {
+            id: health.version.clone(),
+            display_name: health.version,
+            loaded: true,
+        }])
+    }
+
+    async fn generate_structured(
+        &self,
+        settings: &UserSettings,
+        _auth_token: Option<&str>,
+        clusters: &[TweetCluster],
+        image_cache: &mut SyncImageCache,
+    ) -> Result<StructuredGenerationOutcome, AppError> {
+        let prompt = build_structured_prompt(clusters);
+        let schema_path = write_codex_ranking_schema()?;
+        let mut image_paths = Vec::new();
+        if settings.codex.include_images {
+            image_paths = write_codex_image_attachments(clusters, image_cache).await?;
+        }
+        let output =
+            run_codex_exec(&settings.codex, &prompt, Some(&schema_path), &image_paths).await;
+        let _ = fs::remove_file(&schema_path);
+        cleanup_codex_image_attachments(&image_paths);
+        let output = output?;
+        Ok(StructuredGenerationOutcome {
+            decisions: parse_cluster_decisions(&output.content, clusters)?,
+            fell_back_to_text: false,
+            usage: output.usage,
+        })
+    }
+
+    async fn generate_text(
+        &self,
+        settings: &UserSettings,
+        _auth_token: Option<&str>,
+        prompt: &str,
+    ) -> Result<TextGenerationOutcome, AppError> {
+        let output = run_codex_exec(&settings.codex, prompt, None, &[]).await?;
+        Ok(TextGenerationOutcome {
+            text: output.content,
+            usage: output.usage,
+        })
+    }
+}
+
+pub async fn verify_codex_command(command: &str) -> Result<CodexHealth, AppError> {
+    let command = resolve_codex_command(command)?;
+    let output = timeout(
+        Duration::from_secs(CODEX_VERIFY_TIMEOUT_SECS),
+        command.command().arg("--version").output(),
+    )
+    .await
+    .map_err(|_| {
+        AppError::Message(format!(
+            "Codex CLI check timed out after {CODEX_VERIFY_TIMEOUT_SECS} seconds."
+        ))
+    })?
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AppError::Message(format!("Codex command not found: {}", command.label))
+        } else {
+            AppError::Io(error)
+        }
+    })?;
+
+    if !output.status.success() {
+        return Err(AppError::Message(format!(
+            "Codex CLI check failed with status {}: {}",
+            output.status,
+            truncate_chars(&String::from_utf8_lossy(&output.stderr), 240)
+        )));
+    }
+
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let version = if version.is_empty() {
+        "codex".into()
+    } else {
+        version
+    };
+
+    Ok(CodexHealth {
+        ok: true,
+        server_label: format!("Codex CLI @ {}", command.label),
+        message: format!("Codex CLI is ready ({version})."),
+        version,
+    })
+}
+
+fn normalized_codex_command(command: &str) -> Result<String, AppError> {
+    let command = command.trim();
+    if command.is_empty() {
+        return Err(AppError::Message(
+            "Enter a Codex command before verifying.".into(),
+        ));
+    }
+    Ok(command.into())
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedCodexCommand {
+    program: String,
+    prefix_args: Vec<String>,
+    label: String,
+}
+
+impl ResolvedCodexCommand {
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        command.args(&self.prefix_args);
+        command
+    }
+}
+
+fn resolve_codex_command(command: &str) -> Result<ResolvedCodexCommand, AppError> {
+    let command = normalized_codex_command(command)?;
+    let path = Path::new(&command);
+    let candidates = if path.is_absolute() || command.contains('\\') || command.contains('/') {
+        command_path_candidates(path)
+    } else {
+        codex_search_dirs()
+            .into_iter()
+            .flat_map(|dir| command_path_candidates(&dir.join(&command)))
+            .collect::<Vec<_>>()
+    };
+
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Ok(resolved_codex_command_from_path(candidate));
+        }
+    }
+
+    Err(AppError::Message(format!(
+        "Codex command not found: {command}"
+    )))
+}
+
+fn codex_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    #[cfg(windows)]
+    {
+        if let Some(app_data) = std::env::var_os("APPDATA") {
+            dirs.push(PathBuf::from(app_data).join("npm"));
+        }
+    }
+
+    dirs
+}
+
+fn command_path_candidates(path: &Path) -> Vec<PathBuf> {
+    if path.extension().is_some() {
+        return vec![path.to_path_buf()];
+    }
+
+    #[cfg(windows)]
+    {
+        return ["cmd", "exe", "bat", "ps1", ""]
+            .into_iter()
+            .map(|extension| {
+                if extension.is_empty() {
+                    path.to_path_buf()
+                } else {
+                    path.with_extension(extension)
+                }
+            })
+            .collect();
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec![path.to_path_buf()]
+    }
+}
+
+fn resolved_codex_command_from_path(path: PathBuf) -> ResolvedCodexCommand {
+    let label = path.to_string_lossy().to_string();
+    #[cfg(windows)]
+    {
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("ps1"))
+        {
+            return ResolvedCodexCommand {
+                program: "powershell".into(),
+                prefix_args: vec![
+                    "-NoProfile".into(),
+                    "-ExecutionPolicy".into(),
+                    "Bypass".into(),
+                    "-File".into(),
+                    label.clone(),
+                ],
+                label,
+            };
+        }
+    }
+
+    ResolvedCodexCommand {
+        program: label.clone(),
+        prefix_args: Vec::new(),
+        label,
+    }
+}
+
+fn codex_exec_args(
+    settings: &CodexSettings,
+    schema_path: Option<&Path>,
+    image_paths: &[PathBuf],
+) -> Vec<String> {
+    let mut args = vec![
+        "exec".into(),
+        "--ephemeral".into(),
+        "--sandbox".into(),
+        "read-only".into(),
+    ];
+
+    if let Some(model) = settings
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        args.push("--model".into());
+        args.push(model.into());
+    }
+
+    if let Some(profile) = settings
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        args.push("--profile".into());
+        args.push(profile.into());
+    }
+
+    if let Some(schema_path) = schema_path {
+        args.push("--output-schema".into());
+        args.push(schema_path.to_string_lossy().to_string());
+    }
+
+    for image_path in image_paths {
+        args.push("--image".into());
+        args.push(image_path.to_string_lossy().to_string());
+    }
+
+    args.push("-".into());
+    args
+}
+
+async fn run_codex_exec(
+    settings: &CodexSettings,
+    prompt: &str,
+    schema_path: Option<&Path>,
+    image_paths: &[PathBuf],
+) -> Result<CodexExecOutput, AppError> {
+    let command = resolve_codex_command(&settings.command)?;
+    let args = codex_exec_args(settings, schema_path, image_paths);
+    let mut child = command
+        .command()
+        .args(&args)
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                AppError::Message(format!("Codex command not found: {}", command.label))
+            } else {
+                AppError::Io(error)
+            }
+        })?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(prompt.as_bytes()).await?;
+    }
+
+    let output = timeout(
+        Duration::from_secs(CODEX_COMPLETION_TIMEOUT_SECS),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| {
+        AppError::Message(format!(
+            "Codex is still generating after {CODEX_COMPLETION_TIMEOUT_SECS} seconds."
+        ))
+    })??;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() {
+        return Err(AppError::Message(format!(
+            "Codex request failed with status {}: {}",
+            output.status,
+            truncate_chars(&String::from_utf8_lossy(&output.stderr), 240)
+        )));
+    }
+
+    if stdout.is_empty() {
+        return Err(AppError::Message(
+            "Codex returned an empty response.".into(),
+        ));
+    }
+
+    Ok(CodexExecOutput {
+        usage: codex_usage_for_call(settings, prompt, &stdout),
+        content: stdout,
+    })
+}
+
+#[derive(Debug)]
+struct CodexExecOutput {
+    content: String,
+    usage: CodexUsage,
+}
+
+fn codex_usage_for_call(settings: &CodexSettings, prompt: &str, output: &str) -> CodexUsage {
+    let input_tokens = estimate_tokens_from_chars(prompt.chars().count());
+    let output_tokens = estimate_tokens_from_chars(output.chars().count());
+    let estimated_cost_usd = match (
+        settings.input_cost_per_million_tokens,
+        settings.output_cost_per_million_tokens,
+    ) {
+        (Some(input_rate), Some(output_rate)) => Some(
+            ((input_tokens as f64 / 1_000_000.0) * input_rate)
+                + ((output_tokens as f64 / 1_000_000.0) * output_rate),
+        ),
+        _ => None,
+    };
+
+    CodexUsage {
+        call_count: 1,
+        prompt_chars: prompt.chars().count() as u64,
+        output_chars: output.chars().count() as u64,
+        estimated_input_tokens: input_tokens,
+        estimated_output_tokens: output_tokens,
+        estimated_cost_usd,
+    }
+}
+
+fn estimate_tokens_from_chars(char_count: usize) -> u64 {
+    char_count.div_ceil(4) as u64
+}
+
+async fn write_codex_image_attachments(
+    clusters: &[TweetCluster],
+    image_cache: &mut SyncImageCache,
+) -> Result<Vec<PathBuf>, AppError> {
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(LM_STUDIO_REQUEST_TIMEOUT_SECS))
+        .build()
+        .expect("codex image client");
+    let mut paths = Vec::new();
+
+    for cluster in clusters {
+        let Some(media_url) = first_photo_url(&cluster.representative) else {
+            continue;
+        };
+        let Some(image) = image_cache.get_or_fetch(&http, &media_url).await else {
+            continue;
+        };
+
+        let path = std::env::temp_dir().join(format!(
+            "sift-codex-image-{}-{}.{}",
+            cluster.id,
+            Uuid::new_v4(),
+            image.extension()
+        ));
+        fs::write(&path, &image.bytes)?;
+        paths.push(path);
+    }
+
+    Ok(paths)
+}
+
+fn cleanup_codex_image_attachments(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn write_codex_ranking_schema() -> Result<PathBuf, AppError> {
+    let path =
+        std::env::temp_dir().join(format!("sift-codex-ranking-{}.schema.json", Uuid::new_v4()));
+    fs::write(&path, codex_ranking_schema())?;
+    Ok(path)
+}
+
+fn codex_ranking_schema() -> &'static str {
+    r#"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["items"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["clusterId", "keep", "category", "headline", "summary", "whyItMatters", "reasons", "imageImportant", "imageAlt"],
+        "properties": {
+          "clusterId": { "type": "string" },
+          "keep": { "type": "boolean" },
+          "category": { "type": "string", "enum": ["Releases", "Tools", "Infrastructure", "Ideas", "People"] },
+          "headline": { "type": "string" },
+          "summary": { "type": "string" },
+          "whyItMatters": { "type": "string" },
+          "reasons": { "type": "array", "items": { "type": "string" } },
+          "imageImportant": { "type": "boolean" },
+          "imageAlt": { "type": ["string", "null"] }
+        }
+      }
+    }
+  }
+}"#
 }
 
 impl LmStudioClient {
@@ -1195,6 +1675,7 @@ pub async fn generate_paper(
         for built_view in built_views {
             run.timings.ranking_ms += built_view.ranking_ms;
             run.timings.front_page_ms += built_view.front_page_ms;
+            run.timings.codex_usage.add(&built_view.codex_usage);
             let decision_items = built_view
                 .decisions
                 .iter()
@@ -1397,7 +1878,11 @@ async fn build_view(
     brand_new_count: usize,
     resurfaced_count: usize,
 ) -> Result<BuiltView, AppError> {
-    let provider = LmStudioClient::default();
+    let provider = selected_model_provider(&settings);
+    let image_http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(LM_STUDIO_REQUEST_TIMEOUT_SECS))
+        .build()
+        .expect("image client");
     let mut image_cache = SyncImageCache::default();
     let fresh_breakdown = format_fresh_post_breakdown(
         spec.items.len(),
@@ -1412,9 +1897,10 @@ async fn build_view(
         SyncStatus::Running,
         "ranking-items",
         format!(
-            "Prepared {fresh_breakdown} in the {} view into {} topic clusters. Sending them to LM Studio for ranking.",
+            "Prepared {fresh_breakdown} in the {} view into {} topic clusters. Sending them to {} for ranking.",
             spec.label,
-            clusters.len()
+            clusters.len(),
+            provider.label()
         ),
         Some(total_item_count),
         Some(brand_new_count),
@@ -1423,11 +1909,11 @@ async fn build_view(
     );
 
     let ranking_started = Instant::now();
-    let decisions = batch_decide(
+    let (decisions, mut codex_usage) = batch_decide(
         &state,
         &run_id,
         &reason,
-        &provider,
+        provider.as_ref(),
         &settings,
         auth_token.as_deref(),
         &clusters,
@@ -1437,11 +1923,12 @@ async fn build_view(
     let ranking_ms = ranking_started.elapsed().as_millis() as u64;
     let kept = keep_useful(&decisions);
     let kept_count = kept.len();
-    let (_edition_date, edition, front_page_ms) = build_edition(
+    let (_edition_date, edition, front_page_ms, front_page_usage) = build_edition(
         &state,
         &run_id,
         &reason,
-        &provider,
+        provider.as_ref(),
+        &image_http,
         &settings,
         auth_token.as_deref(),
         &kept,
@@ -1450,6 +1937,7 @@ async fn build_view(
         &run_id,
     )
     .await?;
+    codex_usage.add(&front_page_usage);
 
     Ok(BuiltView {
         index,
@@ -1459,20 +1947,29 @@ async fn build_view(
         edition,
         ranking_ms,
         front_page_ms,
+        codex_usage,
     })
+}
+
+fn selected_model_provider(settings: &UserSettings) -> Box<dyn LocalModelProvider + Send + Sync> {
+    match settings.model_backend {
+        ModelBackend::LmStudio => Box::new(LmStudioClient::default()),
+        ModelBackend::Codex => Box::new(CodexCliProvider),
+    }
 }
 
 async fn batch_decide(
     state: &AppState,
     run_id: &str,
     reason: &SyncReason,
-    provider: &LmStudioClient,
+    provider: &(dyn LocalModelProvider + Send + Sync),
     settings: &UserSettings,
     auth_token: Option<&str>,
     clusters: &[TweetCluster],
     image_cache: &mut SyncImageCache,
-) -> Result<Vec<ClusterEditorialRecord>, AppError> {
+) -> Result<(Vec<ClusterEditorialRecord>, CodexUsage), AppError> {
     let mut decisions = Vec::new();
+    let mut codex_usage = CodexUsage::default();
     let total_batches = clusters.chunks(LM_BATCH_SIZE).len();
 
     for (index, batch) in clusters.chunks(LM_BATCH_SIZE).enumerate() {
@@ -1484,7 +1981,8 @@ async fn batch_decide(
             SyncStatus::Running,
             "ranking-items",
             format!(
-                "Ranking batch {batch_number}/{total_batches} in LM Studio ({} topic clusters).",
+                "Ranking batch {batch_number}/{total_batches} in {} ({} topic clusters).",
+                provider.label(),
                 batch.len()
             ),
             None,
@@ -1501,6 +1999,7 @@ async fn batch_decide(
                 .await
             {
                 Ok(mut outcome) => {
+                    codex_usage.add(&outcome.usage);
                     println!(
                         "[sift-sync:{run_id}] ranking batch {batch_number}/{total_batches} succeeded on attempt {attempt}"
                     );
@@ -1512,7 +2011,8 @@ async fn batch_decide(
                             SyncStatus::Running,
                             "ranking-items",
                             format!(
-                                "LM Studio refused image input for batch {batch_number}/{total_batches}. Continued with text-only ranking for these {} topic clusters.",
+                                "{} refused image input for batch {batch_number}/{total_batches}. Continued with text-only ranking for these {} topic clusters.",
+                                provider.label(),
                                 batch.len()
                             ),
                             None,
@@ -1542,7 +2042,8 @@ async fn batch_decide(
                         SyncStatus::Running,
                         "ranking-items",
                         format!(
-                            "LM Studio batch {batch_number}/{total_batches} failed on attempt {attempt}/{LM_BATCH_MAX_ATTEMPTS}. Retrying in {wait_seconds}s."
+                            "{} batch {batch_number}/{total_batches} failed on attempt {attempt}/{LM_BATCH_MAX_ATTEMPTS}. Retrying in {wait_seconds}s.",
+                            provider.label()
                         ),
                         None,
                         None,
@@ -1562,7 +2063,8 @@ async fn batch_decide(
                         SyncStatus::Running,
                         "ranking-items",
                         format!(
-                            "LM Studio batch {batch_number}/{total_batches} failed after {attempt} attempts. Falling back to local heuristics for these {} topic clusters.",
+                            "{} batch {batch_number}/{total_batches} failed after {attempt} attempts. Falling back to local heuristics for these {} topic clusters.",
+                            provider.label(),
                             batch.len()
                         ),
                         None,
@@ -1580,7 +2082,7 @@ async fn batch_decide(
         }
     }
 
-    Ok(decisions)
+    Ok((decisions, codex_usage))
 }
 
 fn keep_useful(decisions: &[ClusterEditorialRecord]) -> Vec<ClusterEditorialRecord> {
@@ -1606,14 +2108,15 @@ async fn build_edition(
     state: &AppState,
     run_id: &str,
     reason: &SyncReason,
-    provider: &LmStudioClient,
+    provider: &(dyn LocalModelProvider + Send + Sync),
+    image_http: &reqwest::Client,
     settings: &UserSettings,
     auth_token: Option<&str>,
     records: &[ClusterEditorialRecord],
     image_cache: &mut SyncImageCache,
     view: EditionView,
     edition_run_id: &str,
-) -> Result<(String, Edition, u64), AppError> {
+) -> Result<(String, Edition, u64, CodexUsage), AppError> {
     let edition_date = current_edition_date(settings)?;
     let edition_id = Uuid::new_v4().to_string();
     let mut sections = BTreeMap::<String, Vec<EditionCard>>::new();
@@ -1622,7 +2125,7 @@ async fn build_edition(
     for record in records {
         let item = record.to_cleaned_item();
         let lead_image =
-            maybe_persist_lead_image(state, &edition_id, provider, image_cache, record).await?;
+            maybe_persist_lead_image(state, &edition_id, image_http, image_cache, record).await?;
         sections
             .entry(normalize_category(&item.category))
             .or_default()
@@ -1682,11 +2185,15 @@ async fn build_edition(
     );
 
     let front_page_started = Instant::now();
+    let mut codex_usage = CodexUsage::default();
     let front_page_summary = match provider
         .generate_text(settings, auth_token, &front_page_prompt)
         .await
     {
-        Ok(summary) => summary,
+        Ok(outcome) => {
+            codex_usage.add(&outcome.usage);
+            outcome.text
+        }
         Err(error) => {
             eprintln!("[sift-sync:{run_id}] front-page draft fallback: {error}");
             emit_sync_progress(
@@ -1695,7 +2202,10 @@ async fn build_edition(
                 reason,
                 SyncStatus::Running,
                 "building-edition",
-                "LM Studio could not draft the front page. Using a local fallback summary.",
+                format!(
+                    "{} could not draft the front page. Using a local fallback summary.",
+                    provider.label()
+                ),
                 None,
                 None,
                 Some(records.len()),
@@ -1730,6 +2240,7 @@ async fn build_edition(
             sections: section_list,
         },
         front_page_ms,
+        codex_usage,
     ))
 }
 
@@ -1842,6 +2353,10 @@ fn heuristically_clean_items(items: Vec<FeedItem>, settings: &UserSettings) -> V
             continue;
         }
 
+        if is_video_only_item(&item) {
+            continue;
+        }
+
         if is_sponsored_item(&item) {
             continue;
         }
@@ -1854,6 +2369,13 @@ fn heuristically_clean_items(items: Vec<FeedItem>, settings: &UserSettings) -> V
     }
 
     cleaned
+}
+
+fn is_video_only_item(item: &FeedItem) -> bool {
+    let media = media_from_item(item);
+    !media.is_empty()
+        && media.iter().any(|media| media.kind == "video")
+        && !media.iter().any(|media| media.kind == "photo")
 }
 
 fn is_sponsored_label(value: &str) -> bool {
@@ -2983,13 +3505,13 @@ fn normalize_capture_media(media: &[XSessionCaptureMedia]) -> Vec<FeedMedia> {
 
     for item in media {
         let kind = item.kind.trim().to_lowercase();
-        if kind != "photo" {
+        if kind != "photo" && kind != "video" {
             continue;
         }
         let Some(url) = normalize_media_url(&item.url) else {
             continue;
         };
-        if !is_supported_story_photo_url(&url) {
+        if !is_supported_story_media_url(&url, &kind) {
             continue;
         }
         if seen.insert(url.clone()) {
@@ -3150,7 +3672,7 @@ fn normalize_media_url(value: &str) -> Option<String> {
     Some(parsed.to_string())
 }
 
-fn is_supported_story_photo_url(value: &str) -> bool {
+fn is_supported_story_media_url(value: &str, kind: &str) -> bool {
     let Ok(parsed) = Url::parse(value) else {
         return false;
     };
@@ -3160,8 +3682,6 @@ fn is_supported_story_photo_url(value: &str) -> bool {
     if [
         "profile_images",
         "profile_banners",
-        "ext_tw_video_thumb",
-        "amplify_video_thumb",
         "media_emoji",
         "semantic_core_img",
         "profile",
@@ -3176,6 +3696,12 @@ fn is_supported_story_photo_url(value: &str) -> bool {
     ]
     .iter()
     .any(|fragment| path.contains(fragment))
+    {
+        return false;
+    }
+
+    if kind == "photo"
+        && (path.contains("ext_tw_video_thumb") || path.contains("amplify_video_thumb"))
     {
         return false;
     }
@@ -3568,7 +4094,7 @@ fn parse_cluster_decisions(
 async fn maybe_persist_lead_image(
     state: &AppState,
     edition_id: &str,
-    provider: &LmStudioClient,
+    http: &reqwest::Client,
     image_cache: &mut SyncImageCache,
     record: &ClusterEditorialRecord,
 ) -> Result<Option<EditionImage>, AppError> {
@@ -3577,7 +4103,7 @@ async fn maybe_persist_lead_image(
         .path()
         .app_local_data_dir()
         .map_err(|error| AppError::Message(error.to_string()))?;
-    persist_record_lead_image(&base_dir, &provider.http, edition_id, image_cache, record).await
+    persist_record_lead_image(&base_dir, http, edition_id, image_cache, record).await
 }
 
 async fn persist_record_lead_image(
@@ -3963,6 +4489,92 @@ mod tests {
     }
 
     #[test]
+    fn codex_exec_args_include_fixed_policy_and_optional_schema() {
+        let settings = CodexSettings {
+            command: "codex".into(),
+            model: Some("gpt-5.2".into()),
+            profile: Some("sift".into()),
+            ..CodexSettings::default()
+        };
+        let schema_path = Path::new("ranking.schema.json");
+
+        let image_path = PathBuf::from("story.jpg");
+        let args = codex_exec_args(
+            &settings,
+            Some(schema_path),
+            std::slice::from_ref(&image_path),
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "--ephemeral",
+                "--sandbox",
+                "read-only",
+                "--model",
+                "gpt-5.2",
+                "--profile",
+                "sift",
+                "--output-schema",
+                "ranking.schema.json",
+                "--image",
+                "story.jpg",
+                "-"
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_ranking_json_parses_to_cluster_decisions() {
+        let cluster = sample_cluster(Vec::new());
+        let content = r#"{"items":[{"clusterId":"cluster-1","keep":true,"category":"Tools","headline":"Local release ships","summary":"A local-first release shipped with screenshots.","whyItMatters":"It improves the workflow.","reasons":["Concrete release"],"imageImportant":false,"imageAlt":null}]}"#;
+
+        let decisions =
+            parse_cluster_decisions(content, std::slice::from_ref(&cluster)).expect("decisions");
+
+        assert_eq!(decisions.len(), 1);
+        assert!(decisions[0].keep);
+        assert_eq!(decisions[0].category, "Tools");
+        assert_eq!(decisions[0].headline, "Local release ships");
+    }
+
+    #[tokio::test]
+    async fn codex_provider_reports_missing_command() {
+        let mut settings = UserSettings::default();
+        settings.model_backend = ModelBackend::Codex;
+        settings.codex.command = "definitely-not-a-real-codex-command-for-sift".into();
+        let provider = CodexCliProvider;
+
+        let error = provider
+            .generate_text(&settings, None, "Write one sentence.")
+            .await
+            .expect_err("missing command should fail");
+
+        assert!(error.to_string().contains("Codex command not found"));
+    }
+
+    #[test]
+    fn codex_usage_estimates_tokens_and_cost_when_rates_are_configured() {
+        let settings = CodexSettings {
+            input_cost_per_million_tokens: Some(1.0),
+            output_cost_per_million_tokens: Some(10.0),
+            ..CodexSettings::default()
+        };
+
+        let usage = codex_usage_for_call(&settings, "12345678", "1234");
+
+        assert_eq!(usage.call_count, 1);
+        assert_eq!(usage.prompt_chars, 8);
+        assert_eq!(usage.output_chars, 4);
+        assert_eq!(usage.estimated_input_tokens, 2);
+        assert_eq!(usage.estimated_output_tokens, 1);
+        assert!(
+            (usage.estimated_cost_usd.expect("estimated cost") - 0.000012).abs() < f64::EPSILON
+        );
+    }
+
+    #[test]
     fn engagement_bait_patterns_are_detected() {
         assert!(is_engagement_bait(
             "Reply BLUEPRINT and I'll DM you the exact playbook"
@@ -4226,7 +4838,7 @@ mod tests {
                 .as_array()
                 .expect("media array")
                 .len(),
-            1
+            2
         );
         assert_eq!(
             first_photo_url(&cleaned[0]).as_deref(),
@@ -4246,12 +4858,16 @@ mod tests {
                 kind: "photo".into(),
             },
             XSessionCaptureMedia {
+                url: "https://pbs.twimg.com/ext_tw_video_thumb/123/pu/img/thumb.jpg".into(),
+                kind: "video".into(),
+            },
+            XSessionCaptureMedia {
                 url: "https://styles.redditmedia.com/avatar.png".into(),
                 kind: "photo".into(),
             },
         ]);
 
-        assert_eq!(media.len(), 2);
+        assert_eq!(media.len(), 3);
         assert_eq!(
             media[0].url,
             "https://media.licdn.com/dms/image/v2/D4E22AQ/story-image/feedshare-shrink_800/B4EZ.jpg"
@@ -4260,6 +4876,32 @@ mod tests {
             media[1].url,
             "https://preview.redd.it/story-image.jpg?width=1080&crop=smart&auto=webp&s=abc"
         );
+        assert_eq!(media[2].kind, "video");
+    }
+
+    #[test]
+    fn live_session_capture_drops_video_only_posts() {
+        let settings = UserSettings::default();
+        let items = vec![XSessionCaptureItem {
+            id: "video-1".into(),
+            author_name: "Builder".into(),
+            author_handle: "builder".into(),
+            text: "A launch video without enough context to summarize safely".into(),
+            source_url: "https://x.com/builder/status/4".into(),
+            posted_at: "2026-04-16T12:03:00Z".into(),
+            is_repost: false,
+            is_reply: false,
+            is_promoted: false,
+            social_context: None,
+            shared_urls: Vec::new(),
+            media: vec![XSessionCaptureMedia {
+                url: "https://pbs.twimg.com/ext_tw_video_thumb/123/pu/img/thumb.jpg".into(),
+                kind: "video".into(),
+            }],
+        }];
+
+        let cleaned = normalize_session_capture(items, &settings, CaptureSourceKind::X);
+        assert!(cleaned.is_empty());
     }
 
     #[test]

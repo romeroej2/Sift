@@ -26,6 +26,48 @@ pub struct LmStudioSettings {
     pub include_images: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelBackend {
+    #[default]
+    LmStudio,
+    Codex,
+}
+
+fn default_codex_command() -> String {
+    "codex".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSettings {
+    #[serde(default = "default_codex_command")]
+    pub command: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub include_images: bool,
+    #[serde(default)]
+    pub input_cost_per_million_tokens: Option<f64>,
+    #[serde(default)]
+    pub output_cost_per_million_tokens: Option<f64>,
+}
+
+impl Default for CodexSettings {
+    fn default() -> Self {
+        Self {
+            command: default_codex_command(),
+            model: None,
+            profile: None,
+            include_images: false,
+            input_cost_per_million_tokens: None,
+            output_cost_per_million_tokens: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureSourcesSettings {
@@ -235,7 +277,11 @@ impl<'de> Deserialize<'de> for ScheduleSettings {
 pub struct UserSettings {
     pub schedule: ScheduleSettings,
     pub cleanup: CleanupSettings,
+    #[serde(default)]
+    pub model_backend: ModelBackend,
     pub lm_studio: LmStudioSettings,
+    #[serde(default)]
+    pub codex: CodexSettings,
     #[serde(default)]
     pub capture: CaptureSettings,
 }
@@ -262,12 +308,14 @@ impl Default for UserSettings {
                 muted_keywords: Vec::new(),
                 muted_authors: Vec::new(),
             },
+            model_backend: ModelBackend::LmStudio,
             lm_studio: LmStudioSettings {
                 base_url: "http://127.0.0.1:1234".into(),
                 auth_token: None,
                 selected_model: None,
                 include_images: false,
             },
+            codex: CodexSettings::default(),
             capture: CaptureSettings::default(),
         }
     }
@@ -399,6 +447,8 @@ pub struct SyncRunTimings {
     pub saving_ms: u64,
     #[serde(default)]
     pub total_ms: u64,
+    #[serde(default)]
+    pub codex_usage: CodexUsage,
 }
 
 impl Default for SyncRunTimings {
@@ -409,7 +459,40 @@ impl Default for SyncRunTimings {
             front_page_ms: 0,
             saving_ms: 0,
             total_ms: 0,
+            codex_usage: CodexUsage::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexUsage {
+    #[serde(default)]
+    pub call_count: u64,
+    #[serde(default)]
+    pub prompt_chars: u64,
+    #[serde(default)]
+    pub output_chars: u64,
+    #[serde(default)]
+    pub estimated_input_tokens: u64,
+    #[serde(default)]
+    pub estimated_output_tokens: u64,
+    #[serde(default)]
+    pub estimated_cost_usd: Option<f64>,
+}
+
+impl CodexUsage {
+    pub fn add(&mut self, other: &CodexUsage) {
+        self.call_count += other.call_count;
+        self.prompt_chars += other.prompt_chars;
+        self.output_chars += other.output_chars;
+        self.estimated_input_tokens += other.estimated_input_tokens;
+        self.estimated_output_tokens += other.estimated_output_tokens;
+        self.estimated_cost_usd = match (self.estimated_cost_usd, other.estimated_cost_usd) {
+            (Some(left), Some(right)) => Some(left + right),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
+        };
     }
 }
 
@@ -536,6 +619,15 @@ pub struct LmStudioHealth {
     pub ok: bool,
     pub server_label: String,
     pub models: Vec<ModelDescriptor>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexHealth {
+    pub ok: bool,
+    pub server_label: String,
+    pub version: String,
     pub message: String,
 }
 

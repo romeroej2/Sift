@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { BootstrapState, BrowserSessionState, LmStudioHealth, UserSettings } from "./types";
+import type { BootstrapState, BrowserSessionState, CodexHealth, LmStudioHealth, UserSettings } from "./types";
 
 export function getBootstrapState() {
   return invoke<BootstrapState>("get_bootstrap_state");
@@ -59,6 +59,10 @@ export function logoutRedditSessionWindow() {
 
 export function verifyLmStudio(baseUrl: string, authToken: string | null) {
   return invoke<LmStudioHealth>("verify_lm_studio", { baseUrl, authToken });
+}
+
+export function verifyCodex(command: string) {
+  return invoke<CodexHealth>("verify_codex", { command });
 }
 
 export function runSync(reason: "manual" | "scheduled" = "manual") {

@@ -1,4 +1,4 @@
-import type { BrowserSource, LmStudioHealth, ScheduleRule, UserSettings } from "../lib/types";
+import type { BrowserSource, CodexHealth, LmStudioHealth, ScheduleRule, UserSettings } from "../lib/types";
 import { createScheduleRule, DEFAULT_SHORT_BROWSE_PAGE_COUNT } from "../lib/defaults";
 import {
   getLmStudioSummary,
@@ -66,10 +66,14 @@ export function SettingsPanel({
   setIsModelDeskExpanded,
   lmStudioDraft,
   setLmStudioDraft,
+  codexDraft,
+  setCodexDraft,
   lmHealth,
+  codexHealth,
   selectedModelId,
   availableModels,
   onVerifyLmStudio,
+  onVerifyCodex,
   onSaveModelDesk,
   isSettingsDirty,
   lastSettingsSavedAt,
@@ -82,10 +86,14 @@ export function SettingsPanel({
   setIsModelDeskExpanded: React.Dispatch<React.SetStateAction<boolean>>;
   lmStudioDraft: UserSettings["lmStudio"];
   setLmStudioDraft: React.Dispatch<React.SetStateAction<UserSettings["lmStudio"]>>;
+  codexDraft: UserSettings["codex"];
+  setCodexDraft: React.Dispatch<React.SetStateAction<UserSettings["codex"]>>;
   lmHealth: LmStudioHealth | null;
+  codexHealth: CodexHealth | null;
   selectedModelId: string | null;
   availableModels: LmStudioHealth["models"];
   onVerifyLmStudio: () => void;
+  onVerifyCodex: () => void;
   onSaveModelDesk: () => void;
   isSettingsDirty: boolean;
   lastSettingsSavedAt: number | null;
@@ -151,7 +159,7 @@ export function SettingsPanel({
               <h3>Model desk</h3>
             </div>
             <p className="settings-card__copy">
-              Verify the local LM Studio endpoint, choose the active model, and decide whether image attachments should be sent during ranking.
+              Choose the editorial backend, verify the connection, and configure the model used for ranking and drafting.
             </p>
           </div>
 
@@ -173,12 +181,20 @@ export function SettingsPanel({
                 </span>
                 <span className="model-desk__summary-copy">
                   <strong>Model desk</strong>
-                  <span>{getModelDeskSummary(selectedModelId, lmHealth)}</span>
+                  <span>
+                    {getModelDeskSummary(
+                      selectedModelId,
+                      lmHealth,
+                      settings.modelBackend,
+                      codexHealth,
+                      codexDraft.model
+                    )}
+                  </span>
                 </span>
               </span>
               <span className="model-desk__summary-meta">
-                <span className={lmHealth ? "status-badge status-badge--ready" : "status-badge"}>
-                  {getModelDeskStatusLabel(selectedModelId, lmHealth)}
+                <span className={lmHealth || codexHealth ? "status-badge status-badge--ready" : "status-badge"}>
+                  {getModelDeskStatusLabel(selectedModelId, lmHealth, settings.modelBackend, codexHealth)}
                 </span>
                 <span className="model-desk__chevron" aria-hidden="true">
                   {isModelDeskExpanded ? "\u2212" : "+"}
@@ -188,6 +204,26 @@ export function SettingsPanel({
 
             {isModelDeskExpanded ? (
               <div className="model-desk__panel">
+                <div className="model-desk__group">
+                  <label className="field">
+                    <span>Backend</span>
+                    <select
+                      value={settings.modelBackend}
+                      onChange={(event) =>
+                        onChange({
+                          ...settings,
+                          modelBackend: event.target.value as UserSettings["modelBackend"]
+                        })
+                      }
+                    >
+                      <option value="lmStudio">LM Studio</option>
+                      <option value="codex">Codex CLI</option>
+                    </select>
+                  </label>
+                </div>
+
+                {settings.modelBackend === "lmStudio" ? (
+                <>
                 <div className="model-desk__group">
                   <label className="field">
                     <span>LM Studio URL</span>
@@ -218,10 +254,10 @@ export function SettingsPanel({
                   </label>
                   <div className="button-row model-desk__actions">
                     <button className="primary-button" onClick={onVerifyLmStudio}>
-                      Update
+                      Verify LM Studio
                     </button>
                     <button className="secondary-button" onClick={onSaveModelDesk}>
-                      Save
+                      Save settings
                     </button>
                   </div>
                 </div>
@@ -289,6 +325,122 @@ export function SettingsPanel({
                     Enable this only for vision-capable local models. SIFT will download attached post photos and send them to LM Studio when ranking digest topics.
                   </p>
                 </div>
+                </>
+                ) : (
+                <div className="model-desk__group">
+                  <label className="field">
+                    <span>Codex command</span>
+                    <input
+                      value={codexDraft.command}
+                      onChange={(event) =>
+                        setCodexDraft((current) => ({
+                          ...current,
+                          command: event.target.value
+                        }))
+                      }
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Codex model</span>
+                    <input
+                      value={codexDraft.model ?? ""}
+                      onChange={(event) =>
+                        setCodexDraft((current) => ({
+                          ...current,
+                          model: event.target.value || null
+                        }))
+                      }
+                      placeholder="Optional"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Codex profile</span>
+                    <input
+                      value={codexDraft.profile ?? ""}
+                      onChange={(event) =>
+                        setCodexDraft((current) => ({
+                          ...current,
+                          profile: event.target.value || null
+                        }))
+                      }
+                      placeholder="Optional"
+                    />
+                  </label>
+                  <label className="field field--checkbox">
+                    <input
+                      type="checkbox"
+                      checked={codexDraft.includeImages}
+                      onChange={(event) =>
+                        setCodexDraft((current) => ({
+                          ...current,
+                          includeImages: event.target.checked
+                        }))
+                      }
+                    />
+                    <span>Use attached post images during ranking</span>
+                  </label>
+                  <label className="field">
+                    <span>Input cost per 1M tokens</span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      value={codexDraft.inputCostPerMillionTokens ?? ""}
+                      onChange={(event) =>
+                        setCodexDraft((current) => ({
+                          ...current,
+                          inputCostPerMillionTokens: event.target.value
+                            ? Number(event.target.value)
+                            : null
+                        }))
+                      }
+                      placeholder="Optional"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Output cost per 1M tokens</span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      value={codexDraft.outputCostPerMillionTokens ?? ""}
+                      onChange={(event) =>
+                        setCodexDraft((current) => ({
+                          ...current,
+                          outputCostPerMillionTokens: event.target.value
+                            ? Number(event.target.value)
+                            : null
+                        }))
+                      }
+                      placeholder="Optional"
+                    />
+                  </label>
+                  <div className="button-row model-desk__actions">
+                    <button className="primary-button" onClick={onVerifyCodex}>
+                      Verify Codex
+                    </button>
+                    <button className="secondary-button" onClick={onSaveModelDesk}>
+                      Save settings
+                    </button>
+                  </div>
+                  <div className={codexHealth ? "model-status model-status--verified" : "model-status"}>
+                    <strong>{codexHealth ? "Codex CLI verified" : "Not verified yet"}</strong>
+                    <span>
+                      {codexHealth
+                        ? codexHealth.message
+                        : "Verify the Codex CLI before using it as the editorial backend."}
+                    </span>
+                    {codexHealth ? (
+                      <span className="model-status__selected">
+                        Active: <strong>{codexHealth.version}</strong>
+                      </span>
+                    ) : null}
+                  </div>
+                  <p className="field-help">
+                    SIFT estimates Codex tokens from text length and calculates cost only when both rates are set. Image ranking passes downloaded post photos to codex exec with image attachments.
+                  </p>
+                </div>
+                )}
               </div>
             ) : null}
           </section>

@@ -1,6 +1,6 @@
 [package]
 name = "sift"
-version = "0.1.1"
+version = "0.2.0"
 description = "A local-first X feed paper built with Tauri"
 authors = ["romeroej"]
 license = "MIT"
@@ -30,7 +30,7 @@ tauri = { version = "2.10", features = ["protocol-asset", "tray-icon"] }
 tauri-plugin-log = "2.6"
 tauri-plugin-notification = "2.3"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 webbrowser = "1"

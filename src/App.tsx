@@ -10,6 +10,7 @@ import type {
   BrowserSessionState,
   BrowserSource,
   BootstrapState,
+  CodexHealth,
   Edition,
   EditionView,
   LmStudioHealth,
@@ -56,6 +57,7 @@ import {
   openXSessionWindow,
   runSync,
   saveSettings,
+  verifyCodex,
   verifyLmStudio
 } from "./lib/api";
 import { SettingsPanel } from "./components/SettingsPanel";
@@ -176,7 +178,6 @@ function SourceBrandIcon({ source }: { source: BrowserSource }) {
       </span>
     );
   }
-
   return (
     <span className="session-pill__brand session-pill__brand--x" aria-hidden="true">
       <svg viewBox="0 0 24 24" fill="currentColor">
@@ -332,6 +333,20 @@ function getEditionImageSrc(path: string) {
   return path;
 }
 
+function formatCodexUsage(run: SyncRun) {
+  const usage = run.timings.codexUsage;
+  if (!usage || usage.callCount === 0) {
+    return null;
+  }
+
+  const tokenCopy = `${usage.estimatedInputTokens + usage.estimatedOutputTokens} est. tokens`;
+  const costCopy =
+    usage.estimatedCostUsd === null || usage.estimatedCostUsd === undefined
+      ? "cost not configured"
+      : `$${usage.estimatedCostUsd.toFixed(4)} est.`;
+  return `Codex ${usage.callCount} call${usage.callCount === 1 ? "" : "s"} · ${tokenCopy} · ${costCopy}`;
+}
+
 export default function App() {
   const [screen, setScreen] = useState<Screen>("today");
   const [bootstrap, setBootstrap] = useState<BootstrapState>(EMPTY_BOOTSTRAP);
@@ -340,12 +355,14 @@ export default function App() {
   const [message, setMessage] = useState("Opening today\'s desk...");
   const [isArchiveDeleteArmed, setIsArchiveDeleteArmed] = useState(false);
   const [lmStudioDraft, setLmStudioDraft] = useState(DEFAULT_SETTINGS.lmStudio);
+  const [codexDraft, setCodexDraft] = useState(DEFAULT_SETTINGS.codex);
   const [sessionStates, setSessionStates] = useState<Record<BrowserSource, BrowserSessionState>>({
     x: EMPTY_BROWSER_SESSION,
     linkedin: EMPTY_BROWSER_SESSION,
     reddit: EMPTY_BROWSER_SESSION
   });
   const [lmHealth, setLmHealth] = useState<LmStudioHealth | null>(null);
+  const [codexHealth, setCodexHealth] = useState<CodexHealth | null>(null);
   const [isModelDeskExpanded, setIsModelDeskExpanded] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [syncProgress, setSyncProgress] = useState<SyncProgressEvent | null>(null);
@@ -475,6 +492,10 @@ export default function App() {
   }, [bootstrap.settings.lmStudio]);
 
   useEffect(() => {
+    setCodexDraft(bootstrap.settings.codex);
+  }, [bootstrap.settings.codex]);
+
+  useEffect(() => {
     let isCancelled = false;
 
     async function loadApp() {
@@ -496,7 +517,7 @@ export default function App() {
           linkedin: linkedinSessionState,
           reddit: redditSessionState
         });
-        void hydrateSavedLmStudio(state.settings);
+        void hydrateSavedBackend(state.settings);
         setMessage(
           "SIFT is ready. Your enabled browser sessions are standing by."
         );
@@ -681,6 +702,25 @@ export default function App() {
     }
   }
 
+  async function hydrateSavedBackend(settings: UserSettings) {
+    if (settings.modelBackend === "codex") {
+      if (!settings.codex.command.trim()) {
+        setCodexHealth(null);
+        return;
+      }
+
+      try {
+        const health = await verifyCodex(settings.codex.command);
+        setCodexHealth(health);
+      } catch {
+        setCodexHealth(null);
+      }
+      return;
+    }
+
+    await hydrateSavedLmStudio(settings);
+  }
+
   async function handleVerifyLmStudio() {
     try {
       const health = await verifyLmStudio(
@@ -713,6 +753,26 @@ export default function App() {
     }
   }
 
+  async function handleVerifyCodex() {
+    try {
+      const health = await verifyCodex(codexDraft.command);
+      setCodexHealth(health);
+
+      const nextSettings: UserSettings = {
+        ...bootstrap.settings,
+        modelBackend: "codex",
+        codex: codexDraft
+      };
+
+      const saved = await saveSettings(nextSettings);
+      setBootstrap((current) => ({ ...current, settings: saved }));
+      setCodexDraft(saved.codex);
+      setMessage("Codex CLI verified.");
+    } catch (error) {
+      setMessage(getErrorMessage(error, "Codex CLI check failed."));
+    }
+  }
+
   async function handleSaveSettings() {
     await persistModelDeskSettings("Settings saved locally.");
   }
@@ -735,7 +795,9 @@ export default function App() {
     try {
       const saved = await saveSettings({
         ...bootstrap.settings,
-        lmStudio: lmStudioDraft
+        modelBackend: bootstrap.settings.modelBackend,
+        lmStudio: lmStudioDraft,
+        codex: codexDraft
       });
       setBootstrap((current) => ({ ...current, settings: saved }));
       setLmStudioDraft((current) => ({
@@ -751,6 +813,9 @@ export default function App() {
           authToken: lmStudioDraft.authToken
         }
       });
+      if (saved.modelBackend === "codex") {
+        void hydrateSavedBackend(saved);
+      }
       setIsModelDeskExpanded(false);
       setMessage(successMessage);
     } catch (error) {
@@ -783,7 +848,8 @@ export default function App() {
         lmStudio: {
           ...settings.lmStudio,
           authToken: lmStudioDraft.authToken
-        }
+        },
+        codex: settings.codex
       });
       setBootstrap((current) => ({ ...current, settings: saved }));
       setIsSettingsDirty(false);
@@ -1148,10 +1214,14 @@ export default function App() {
               setIsModelDeskExpanded={setIsModelDeskExpanded}
               lmStudioDraft={lmStudioDraft}
               setLmStudioDraft={setLmStudioDraft}
+              codexDraft={codexDraft}
+              setCodexDraft={setCodexDraft}
               lmHealth={lmHealth}
+              codexHealth={codexHealth}
               selectedModelId={selectedModelId}
               availableModels={availableModels}
               onVerifyLmStudio={handleVerifyLmStudio}
+              onVerifyCodex={handleVerifyCodex}
               onSaveModelDesk={handleSaveSettings}
               isSettingsDirty={isSettingsDirty}
               lastSettingsSavedAt={lastSettingsSavedAt}
@@ -1392,6 +1462,8 @@ function EditionPanel({
     );
   }
 
+  const codexUsage = run ? formatCodexUsage(run) : null;
+
   return (
     <section className="panel content-panel paper-panel">
       {tabs}
@@ -1402,10 +1474,13 @@ function EditionPanel({
           {formatEditionDate(edition.editionDate)} · Saved {formatTime(edition.createdAt)}
         </p>
         {run ? (
-          <p className="paper-date">
-            {run.scheduleRuleLabel ? `${run.scheduleRuleLabel} · ` : ""}
-            Total {formatDuration(run.timings.totalMs)} · Read {formatDuration(run.timings.captureMs)} · Summaries {formatDuration(run.timings.rankingMs)} · Front page {formatDuration(run.timings.frontPageMs)}
-          </p>
+          <>
+            <p className="paper-date">
+              {run.scheduleRuleLabel ? `${run.scheduleRuleLabel} · ` : ""}
+              Total {formatDuration(run.timings.totalMs)} · Read {formatDuration(run.timings.captureMs)} · Summaries {formatDuration(run.timings.rankingMs)} · Front page {formatDuration(run.timings.frontPageMs)}
+            </p>
+            {codexUsage ? <p className="paper-date">{codexUsage}</p> : null}
+          </>
         ) : null}
       </div>
 

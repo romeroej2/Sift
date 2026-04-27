@@ -4,6 +4,7 @@ import { DEFAULT_MODEL, DEFAULT_SETTINGS } from "./lib/defaults";
 import type {
   BrowserSessionState,
   BootstrapState,
+  CodexHealth,
   Edition,
   LmStudioHealth,
   SyncRun,
@@ -17,6 +18,7 @@ const {
   getLinkedInSessionStateMock,
   getRedditSessionStateMock,
   verifyLmStudioMock,
+  verifyCodexMock,
   saveSettingsMock,
   runSyncMock,
   openXSessionWindowMock,
@@ -43,6 +45,7 @@ const {
   verifyLmStudioMock: vi.fn<
     (baseUrl: string, authToken: string | null) => Promise<LmStudioHealth>
   >(),
+  verifyCodexMock: vi.fn<(command: string) => Promise<CodexHealth>>(),
   saveSettingsMock: vi.fn<(settings: UserSettings) => Promise<UserSettings>>(),
   runSyncMock: vi.fn(),
   openXSessionWindowMock: vi.fn(),
@@ -83,6 +86,7 @@ vi.mock("./lib/api", () => ({
   openXSessionWindow: openXSessionWindowMock,
   runSync: runSyncMock,
   saveSettings: saveSettingsMock,
+  verifyCodex: verifyCodexMock,
   verifyLmStudio: verifyLmStudioMock
 }));
 
@@ -233,6 +237,12 @@ beforeEach(() => {
   deleteRunMock.mockResolvedValue(createBootstrapState());
   deleteAllEditionsMock.mockResolvedValue(createBootstrapState());
   openExternalUrlMock.mockResolvedValue(undefined);
+  verifyCodexMock.mockResolvedValue({
+    ok: true,
+    serverLabel: "Codex CLI",
+    version: "codex-cli 0.125.0",
+    message: "Codex CLI is ready (codex-cli 0.125.0)."
+  });
   vi.spyOn(console, "info").mockImplementation(() => undefined);
   vi.spyOn(console, "error").mockImplementation(() => undefined);
 });
@@ -322,7 +332,7 @@ describe("App", () => {
     await renderLoadedApp();
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
     fireEvent.click(screen.getByRole("button", { name: /Model desk/i }));
-    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+    fireEvent.click(screen.getByRole("button", { name: "Verify LM Studio" }));
 
     await waitFor(() => {
       expect(verifyLmStudioMock).toHaveBeenCalledWith("http://127.0.0.1:1234", null);
@@ -341,6 +351,52 @@ describe("App", () => {
         selector: ".model-status__selected strong"
       })
     ).toBeInTheDocument();
+  });
+
+  it("switches to Codex CLI and saves verified backend settings", async () => {
+    await renderLoadedApp();
+
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    fireEvent.click(screen.getByRole("button", { name: /Model desk/i }));
+    fireEvent.change(screen.getByLabelText("Backend"), {
+      target: { value: "codex" }
+    });
+    fireEvent.change(screen.getByLabelText("Codex command"), {
+      target: { value: "codex-dev" }
+    });
+    fireEvent.change(screen.getByLabelText("Codex model"), {
+      target: { value: "gpt-5.2" }
+    });
+    fireEvent.change(screen.getByLabelText("Codex profile"), {
+      target: { value: "sift" }
+    });
+    fireEvent.change(screen.getByLabelText("Input cost per 1M tokens"), {
+      target: { value: "1.25" }
+    });
+    fireEvent.change(screen.getByLabelText("Output cost per 1M tokens"), {
+      target: { value: "10" }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Verify Codex" }));
+
+    await waitFor(() => {
+      expect(verifyCodexMock).toHaveBeenCalledWith("codex-dev");
+      expect(saveSettingsMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          modelBackend: "codex",
+          codex: {
+            command: "codex-dev",
+            model: "gpt-5.2",
+            profile: "sift",
+            includeImages: false,
+            inputCostPerMillionTokens: 1.25,
+            outputCostPerMillionTokens: 10
+          }
+        })
+      );
+    });
+
+    expect(await screen.findByText("Codex CLI verified.")).toBeInTheDocument();
+    expect(screen.getByText("codex-cli 0.125.0")).toBeInTheDocument();
   });
 
   it("autosaves newsroom settings when several fields change", async () => {
@@ -860,13 +916,13 @@ describe("App", () => {
       target: { value: "secret-token" }
     });
     fireEvent.click(screen.getByLabelText("Use attached post images during ranking"));
-    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+    fireEvent.click(screen.getByRole("button", { name: "Verify LM Studio" }));
 
     await waitFor(() => {
       expect(verifyLmStudioMock).toHaveBeenCalledWith("http://127.0.0.1:4321", "secret-token");
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
 
     await waitFor(() => {
       expect(saveSettingsMock).toHaveBeenLastCalledWith(

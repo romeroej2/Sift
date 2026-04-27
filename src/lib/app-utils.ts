@@ -3,6 +3,7 @@ import type {
   BrowserSessionState,
   BrowserSource,
   BootstrapState,
+  CodexHealth,
   Edition,
   EditionView,
   LmStudioHealth,
@@ -69,8 +70,21 @@ export function getLmStudioSummary(health: LmStudioHealth) {
 
 export function getModelDeskSummary(
   selectedModelId: string | null,
-  health: LmStudioHealth | null
+  health: LmStudioHealth | null,
+  modelBackend: UserSettings["modelBackend"] = "lmStudio",
+  codexHealth: CodexHealth | null = null,
+  codexModel: string | null = null
 ) {
+  if (modelBackend === "codex") {
+    if (codexModel) {
+      return `Codex · ${codexModel}`;
+    }
+    if (codexHealth) {
+      return codexHealth.version;
+    }
+    return "Connect Codex CLI";
+  }
+
   if (selectedModelId) {
     return selectedModelId;
   }
@@ -84,8 +98,14 @@ export function getModelDeskSummary(
 
 export function getModelDeskStatusLabel(
   selectedModelId: string | null,
-  health: LmStudioHealth | null
+  health: LmStudioHealth | null,
+  modelBackend: UserSettings["modelBackend"] = "lmStudio",
+  codexHealth: CodexHealth | null = null
 ) {
+  if (modelBackend === "codex") {
+    return codexHealth ? "Ready" : "Setup";
+  }
+
   if (health) {
     return "Ready";
   }

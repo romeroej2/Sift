@@ -52,11 +52,20 @@ export const DEFAULT_SETTINGS: UserSettings = {
     mutedKeywords: [],
     mutedAuthors: []
   },
+  modelBackend: "lmStudio",
   lmStudio: {
     baseUrl: "http://127.0.0.1:1234",
     authToken: null,
     selectedModel: null,
     includeImages: false
+  },
+  codex: {
+    command: "codex",
+    model: null,
+    profile: null,
+    includeImages: false,
+    inputCostPerMillionTokens: null,
+    outputCostPerMillionTokens: null
   },
   capture: {
     sources: {

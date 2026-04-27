@@ -4,7 +4,7 @@
 
 # SIFT
 
-SIFT is a local-first desktop newsroom for your social feeds. It turns posts flowing through dedicated SIFT-managed X, LinkedIn, and Reddit sessions into concise daily editions, ranks the most relevant stories with LM Studio, and keeps a searchable local archive on your machine.
+SIFT is a local-first desktop newsroom for your social feeds. It turns posts flowing through dedicated SIFT-managed X, LinkedIn, and Reddit sessions into concise daily editions, ranks the most relevant stories with LM Studio or Codex CLI, and keeps a searchable local archive on your machine.
 
 <p align="center">
   <img src="https://img.shields.io/badge/X-111111?style=for-the-badge&logo=x&logoColor=white" alt="X support badge" />
@@ -23,7 +23,8 @@ SIFT is a local-first desktop newsroom for your social feeds. It turns posts flo
 - Lets you choose whether each refresh should use X, LinkedIn, Reddit, or any supported combination together.
 - Lets you control how many feed pages SIFT browses per enabled source before it starts drafting the digest.
 - Cleans the feed with local rules such as hiding replies, hiding reposts, removing engagement bait, and muting authors or keywords.
-- Groups related posts into topic clusters, asks LM Studio to rank them, and writes a newspaper-style edition.
+- Groups related posts into topic clusters, asks the selected model backend to rank them, and writes a newspaper-style edition.
+- Supports LM Studio or Codex CLI as the editorial backend, including Codex usage/cost estimates when pricing rates are configured.
 - Produces source-aware desk views so you can switch between Consolidated, X-only, LinkedIn-only, and Reddit-only editions.
 - Stores editions, sync history, and feed metadata in a local SQLite database inside the Tauri app data directory.
 - Can refresh on demand or on a daily schedule and surfaces desktop notifications when an edition completes or fails.
@@ -32,10 +33,10 @@ SIFT is a local-first desktop newsroom for your social feeds. It turns posts flo
 
 1. Open the browser sessions you want SIFT to use, then sign in to X, LinkedIn, and/or Reddit there.
 2. In `Settings`, choose whether SIFT should capture from X, LinkedIn, Reddit, or any combination, and set how many pages it should browse per enabled source.
-3. Start LM Studio locally, load a model, and verify the connection in `Settings`.
+3. In `Settings`, choose a model backend. Use LM Studio for local inference or Codex CLI for Codex-backed ranking and drafting.
 4. When you refresh, SIFT drives each enabled session back to its home feed and captures fresh posts from those live sessions.
 5. The Rust backend filters and deduplicates posts, then groups them into clusters.
-6. LM Studio ranks the clusters and helps draft headlines, summaries, and the front-page brief.
+6. The selected model backend ranks the clusters and helps draft headlines, summaries, and the front-page brief.
 7. SIFT saves the finished edition views locally and shows them in the `Today` and `Archive` tabs as `Consolidated`, `X`, `LinkedIn`, and `Reddit`.
 
 ## Multi-source capability
@@ -50,7 +51,7 @@ SIFT now supports a shared multi-source capture workflow:
 The processing pipeline after capture stays shared across sources:
 
 - cleanup filters still apply before ranking
-- clustering and LM Studio ranking still happen in Rust
+- clustering and model-backed ranking still happen in Rust
 - saved editions are still local-first and archived on disk
 
 When both sources are enabled, one refresh produces:
@@ -66,7 +67,7 @@ When both sources are enabled, one refresh produces:
 - React 19 + Vite 8 for the UI
 - Rust for capture orchestration, scheduling, notifications, and persistence
 - SQLite for local storage
-- LM Studio for local model inference
+- LM Studio for local model inference, or Codex CLI for Codex-backed editorial ranking and drafting
 
 ## Install locally
 
@@ -101,12 +102,18 @@ cd Sift
 npm ci
 ```
 
-### 3. Start LM Studio
+### 3. Configure a model backend
 
-SIFT expects a local LM Studio server and a loaded model before sync can complete.
+SIFT supports two editorial model backends. Pick one in `Settings` > `Model desk`.
 
-- Default base URL: `http://127.0.0.1:1234`
-- Default preferred model in the UI: `google/gemma-4-26b-a4b`
+- LM Studio: start the local server, load a model, then click `Verify LM Studio`.
+  - Default base URL: `http://127.0.0.1:1234`
+  - Default preferred model in the UI: `google/gemma-4-26b-a4b`
+- Codex CLI: install and sign in to Codex, then click `Verify Codex`.
+  - Default command: `codex`
+  - Optional model/profile fields are passed through to `codex exec`.
+  - Optional image ranking writes temporary post image files and passes them with `--image`.
+  - Optional input/output prices per 1M tokens let SIFT estimate run cost in saved edition metadata.
 
 ### 4. Run the app in development
 
@@ -137,9 +144,9 @@ npm run tauri:build
 1. Install Node.js LTS and Rust stable.
 2. Install the Tauri OS dependencies for your platform.
 3. Run `npm ci`.
-4. Start LM Studio and load a model.
+4. Configure and verify LM Studio or Codex CLI.
 5. Run `npm run tauri:dev`.
-6. Open the X, LinkedIn, and/or Reddit sessions you want to use, sign in, configure sources and browse depth in `Settings`, verify LM Studio, and refresh the edition.
+6. Open the X, LinkedIn, and/or Reddit sessions you want to use, sign in, configure sources and browse depth in `Settings`, verify your model backend, and refresh the edition.
 
 ## CI/CD
 
